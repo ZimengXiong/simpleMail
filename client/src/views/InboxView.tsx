@@ -70,9 +70,6 @@ const InboxView = () => {
   const effectiveConnectorId = isSendOnlyMode
     ? undefined
     : (connectorIdFromParams || firstConnectorId);
-  const activeConnector = isSendOnlyMode
-    ? null
-    : ((connectors ?? []).find((connector) => connector.id === effectiveConnectorId) ?? null);
   const activeMailboxForPriority = folder || 'INBOX';
 
   useEffect(() => {
@@ -134,8 +131,8 @@ const InboxView = () => {
     enabled: isSendOnlyMode ? Boolean(sendOnlyEmail) : !!effectiveConnectorId,
     placeholderData: keepPreviousData,
     refetchInterval: isTabVisible
-      ? (activeConnector?.provider === 'imap' ? 2_000 : 8_000)
-      : 30_000,
+      ? (isSendOnlyMode ? 20_000 : 45_000)
+      : 180_000,
     refetchIntervalInBackground: false,
   });
 
@@ -148,8 +145,8 @@ const InboxView = () => {
         enabled: Boolean(connector.id),
         refetchInterval: (syncQuery: any) =>
           hasActiveSyncStates(syncQuery.state.data?.states ?? [])
-            ? 2_000
-            : (isTabVisible ? 5_000 : 20_000),
+            ? 4_000
+            : (isTabVisible ? 15_000 : 45_000),
       })),
   });
 

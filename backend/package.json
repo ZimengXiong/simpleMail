@@ -7,7 +7,7 @@
     "dev": "npm run migrate && tsx watch server.ts",
     "start": "node dist/server.js",
     "build": "tsc -p tsconfig.json",
-    "test": "tsx src/services/__tests__/threadingUtils.test.ts && tsx tests/conversationThreading.test.ts && tsx src/services/__tests__/syncPriority.test.ts && tsx src/services/__tests__/search.test.ts",
+    "test": "tsx src/services/__tests__/threadingUtils.test.ts && tsx tests/conversationThreading.test.ts && tsx tests/clientThreadingAdditional.test.ts && tsx src/services/__tests__/syncPriority.test.ts && tsx src/services/__tests__/search.test.ts && tsx src/services/__tests__/searchQueryBuilder.test.ts && tsx src/services/__tests__/imapMailboxNormalization.test.ts && tsx src/services/__tests__/scanPolicy.test.ts && tsx src/services/__tests__/networkGuard.test.ts && tsx src/services/__tests__/googleOAuth.test.ts && tsx src/services/__tests__/imapProtocolBehavior.test.ts && tsx src/services/__tests__/smtpBehavior.test.ts && tsx tests/clientSyncState.test.ts && tsx tests/clientApi.test.ts",
     "worker": "tsx src/worker/run.ts",
     "migrate": "tsx scripts/migrate.ts",
     "worker:migrate": "tsx scripts/worker-migrate.ts",

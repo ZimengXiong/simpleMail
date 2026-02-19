@@ -4,7 +4,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { api } from '../services/api';
 import ComposeModal from '../components/ComposeModal';
 import { format } from 'date-fns';
-import { sanitizeEmailHtml } from '../services/htmlSanitizer';
+import { sanitizeEmailHtmlWithReport, type SanitizedEmailHtmlResult } from '../services/htmlSanitizer';
 import {
   ChevronLeft,
   Loader2,
@@ -16,6 +16,7 @@ import {
   ReplyAll,
   Forward,
   CornerUpLeft,
+  AlertTriangle,
 } from 'lucide-react';
 
 import type { MessageRecord } from '../types/index';
@@ -131,6 +132,56 @@ const makeInitialBodyText = (message: MessageRecord, mode: 'reply' | 'replyAll' 
   return `\n\nOn ${sentAt}, ${message.fromHeader || 'Unknown sender'} wrote:\n${quoted}`;
 };
 
+const buildSandboxedEmailDoc = (safeBodyHtml: string) => `<!DOCTYPE html>
+<html>
+  <head>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <style>
+      :root { color-scheme: only light; }
+      body {
+        margin: 0;
+        padding: 12px;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+        font-size: 14px;
+        color: #222;
+        line-height: 1.55;
+        background: #fff;
+        overflow-wrap: anywhere;
+      }
+      img, video, audio, iframe, table {
+        max-width: 100%;
+      }
+      pre, code {
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+      a {
+        color: #0b67d0;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="mail-root">${safeBodyHtml}</div>
+  </body>
+</html>`;
+
+const buildBlockedContentSummary = (
+  sanitizedBody: SanitizedEmailHtmlResult | null,
+  allowRichFormatting: boolean,
+) => {
+  if (!sanitizedBody?.hasBlockedContent || allowRichFormatting) {
+    return null;
+  }
+  const details: string[] = [];
+  if (sanitizedBody.blockedTagNames.length > 0) {
+    details.push(`tags: ${sanitizedBody.blockedTagNames.slice(0, 3).join(', ')}`);
+  }
+  if (sanitizedBody.blockedAttributeNames.length > 0) {
+    details.push(`attributes: ${sanitizedBody.blockedAttributeNames.slice(0, 3).join(', ')}`);
+  }
+  return details.length > 0 ? details.join(' · ') : null;
+};
+
 const ThreadView = () => {
   const { threadId } = useParams();
   const navigate = useNavigate();
@@ -149,6 +200,7 @@ const ThreadView = () => {
     inReplyTo?: string;
     references?: string;
   } | null>(null);
+  const [allowRichByMessageId, setAllowRichByMessageId] = useState<Record<string, boolean>>({});
 
   const { data: messages, isLoading } = useQuery({
     queryKey: ['thread', threadId, connectorId ?? 'all'],
@@ -290,7 +342,12 @@ const ThreadView = () => {
           {orderedThreadNodes.map((node) => {
             const msg = node.message;
             const depthOffsetPx = Math.min(node.depth, 6) * 20;
-            const safeBodyHtml = msg.bodyHtml ? sanitizeEmailHtml(msg.bodyHtml) : null;
+            const allowRichFormatting = allowRichByMessageId[msg.id] === true;
+            const sanitizedBody = msg.bodyHtml
+              ? sanitizeEmailHtmlWithReport(msg.bodyHtml, { allowStyles: allowRichFormatting })
+              : null;
+            const safeBodyHtml = sanitizedBody?.html ?? null;
+            const blockedContentSummary = buildBlockedContentSummary(sanitizedBody, allowRichFormatting);
             return (
             <div key={msg.id} className={`bg-white border border-border rounded-lg shadow-sm overflow-hidden ${msg.id === newestMessageId ? 'ring-1 ring-accent/15' : ''}`} style={depthOffsetPx > 0 ? { marginLeft: `${depthOffsetPx}px` } : undefined}>
               <div className="px-4 py-3 border-b border-border bg-sidebar/30 flex justify-between items-center">
@@ -331,8 +388,47 @@ const ThreadView = () => {
                 </div>
               </div>
               <div className="p-6 text-sm leading-relaxed whitespace-pre-wrap font-sans">
+                {sanitizedBody?.hasBlockedContent && !allowRichFormatting && (
+                  <div className="mb-3 rounded-md border border-amber-300/80 bg-amber-50 px-3 py-2 text-[12px] text-amber-900 flex items-start gap-2">
+                    <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
+                    <div className="min-w-0 flex-1">
+                      <div>Some content was blocked for safety.</div>
+                      {blockedContentSummary && (
+                        <div className="opacity-80 truncate">{blockedContentSummary}</div>
+                      )}
+                    </div>
+                    <button
+                      className="shrink-0 rounded border border-amber-400 bg-white px-2 py-0.5 text-[11px] font-semibold hover:bg-amber-100"
+                      onClick={() =>
+                        setAllowRichByMessageId((current) => ({ ...current, [msg.id]: true }))
+                      }
+                    >
+                      Allow richer formatting
+                    </button>
+                  </div>
+                )}
+                {sanitizedBody?.hasBlockedContent && allowRichFormatting && (
+                  <div className="mb-3 rounded-md border border-blue-300/80 bg-blue-50 px-3 py-2 text-[12px] text-blue-900 flex items-center justify-between gap-2">
+                    <span>Richer formatting enabled for this message. Active content is still blocked.</span>
+                    <button
+                      className="shrink-0 rounded border border-blue-400 bg-white px-2 py-0.5 text-[11px] font-semibold hover:bg-blue-100"
+                      onClick={() =>
+                        setAllowRichByMessageId((current) => ({ ...current, [msg.id]: false }))
+                      }
+                    >
+                      Use safer view
+                    </button>
+                  </div>
+                )}
                 {safeBodyHtml ? (
-                  <div dangerouslySetInnerHTML={{ __html: safeBodyHtml }} className="mail-content" />
+                  <iframe
+                    title={`msg-${msg.id}`}
+                    srcDoc={buildSandboxedEmailDoc(safeBodyHtml)}
+                    sandbox="allow-popups"
+                    referrerPolicy="no-referrer"
+                    loading="lazy"
+                    className="w-full h-[420px] max-h-[70vh] border border-border/50 rounded-md bg-white"
+                  />
                 ) : (
                   msg.bodyText
                 )}

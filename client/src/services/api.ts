@@ -10,10 +10,35 @@ import type {
 } from '../types/index';
 
 const API_BASE = '/api';
+const TOKEN_STORAGE_KEY = 'BETTERMAIL_USER_TOKEN';
+let runtimeToken: string | null = null;
 
 const resolveToken = () => {
-  const envToken = (import.meta.env.VITE_BETTERMAIL_USER_TOKEN as string | undefined)?.trim();
-  return localStorage.getItem('BETTERMAIL_USER_TOKEN') ?? envToken ?? null;
+  const envToken = ((import.meta as { env?: Record<string, string | undefined> }).env?.VITE_BETTERMAIL_USER_TOKEN ?? '').trim();
+  if (runtimeToken) {
+    return runtimeToken;
+  }
+
+  try {
+    const sessionToken = sessionStorage.getItem(TOKEN_STORAGE_KEY);
+    if (sessionToken) {
+      runtimeToken = sessionToken;
+      return sessionToken;
+    }
+
+    // One-time migration path for older clients that used localStorage.
+    const legacyLocalToken = localStorage.getItem(TOKEN_STORAGE_KEY);
+    if (legacyLocalToken) {
+      sessionStorage.setItem(TOKEN_STORAGE_KEY, legacyLocalToken);
+      localStorage.removeItem(TOKEN_STORAGE_KEY);
+      runtimeToken = legacyLocalToken;
+      return legacyLocalToken;
+    }
+  } catch {
+    // ignore browser storage availability issues and fall through to env token.
+  }
+
+  return envToken || null;
 };
 
 const getAuthToken = () => resolveToken();
@@ -71,7 +96,13 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   });
 
   if (response.status === 401) {
-    localStorage.removeItem('BETTERMAIL_USER_TOKEN');
+    runtimeToken = null;
+    try {
+      sessionStorage.removeItem(TOKEN_STORAGE_KEY);
+      localStorage.removeItem(TOKEN_STORAGE_KEY);
+    } catch {
+      // ignore storage failures
+    }
     window.location.href = '/login';
     throw new Error('Unauthorized');
   }
@@ -97,7 +128,13 @@ async function requestBlob(path: string, options?: RequestInit): Promise<{ blob:
   });
 
   if (response.status === 401) {
-    localStorage.removeItem('BETTERMAIL_USER_TOKEN');
+    runtimeToken = null;
+    try {
+      sessionStorage.removeItem(TOKEN_STORAGE_KEY);
+      localStorage.removeItem(TOKEN_STORAGE_KEY);
+    } catch {
+      // ignore storage failures
+    }
     window.location.href = '/login';
     throw new Error('Unauthorized');
   }
@@ -115,10 +152,22 @@ async function requestBlob(path: string, options?: RequestInit): Promise<{ blob:
 export const api = {
   auth: {
     login: (token: string) => {
-      localStorage.setItem('BETTERMAIL_USER_TOKEN', token);
+      runtimeToken = token;
+      try {
+        sessionStorage.setItem(TOKEN_STORAGE_KEY, token);
+        localStorage.removeItem(TOKEN_STORAGE_KEY);
+      } catch {
+        // ignore storage failures
+      }
     },
     logout: () => {
-      localStorage.removeItem('BETTERMAIL_USER_TOKEN');
+      runtimeToken = null;
+      try {
+        sessionStorage.removeItem(TOKEN_STORAGE_KEY);
+        localStorage.removeItem(TOKEN_STORAGE_KEY);
+      } catch {
+        // ignore storage failures
+      }
       window.location.href = '/login';
     },
     isAuthenticated: () => !!getAuthToken(),

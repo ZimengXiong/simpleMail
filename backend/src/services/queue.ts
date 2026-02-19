@@ -14,7 +14,7 @@ export const createQueue = async () => {
 
 const hasActiveWorkers = async () => {
   const heartbeatGraceSeconds = 30;
-  const countFrom = async (tableName: 'workers' | '_private_workers') => {
+  const safeWorkerCount = async (tableName: 'workers' | '_private_workers') => {
     const result = await query<{ count: number }>(
       `SELECT COUNT(*)::int as count
          FROM graphile_worker.${tableName}
@@ -25,23 +25,46 @@ const hasActiveWorkers = async () => {
     return Number(result.rows[0]?.count ?? 0);
   };
 
-  try {
-    return (await countFrom('workers')) > 0;
-  } catch (error) {
-    const pgError = error as { code?: string };
-    if (pgError?.code !== '42P01') {
-      return true;
+  const countRecentlyLockedJobs = async () => {
+    const result = await query<{ count: number }>(
+      `SELECT COUNT(*)::int as count
+         FROM graphile_worker.jobs
+        WHERE locked_at IS NOT NULL
+          AND locked_at > NOW() - ($1::double precision * INTERVAL '1 second')`,
+      [heartbeatGraceSeconds],
+    );
+    return Number(result.rows[0]?.count ?? 0);
+  };
+
+  const countFrom = async (tableName: 'workers' | '_private_workers') => {
+    try {
+      return await safeWorkerCount(tableName);
+    } catch (error) {
+      const pgError = error as { code?: string };
+      if (pgError?.code === '42P01') {
+        return null;
+      }
+      return null;
     }
+  };
+
+  const workersCount = await countFrom('workers');
+  if (typeof workersCount === 'number') {
+    return workersCount > 0;
   }
 
+  const privateWorkersCount = await countFrom('_private_workers');
+  if (typeof privateWorkersCount === 'number') {
+    return privateWorkersCount > 0;
+  }
+
+  // Some graphile-worker schemas do not expose worker heartbeat tables.
+  // In that case, fall back to recent lock activity; if unavailable, assume
+  // no active workers so sync can run immediately in-process.
   try {
-    return (await countFrom('_private_workers')) > 0;
-  } catch (error) {
-    const pgError = error as { code?: string };
-    if (pgError?.code === '42P01') {
-      return true;
-    }
-    return true;
+    return (await countRecentlyLockedJobs()) > 0;
+  } catch {
+    return false;
   }
 };
 

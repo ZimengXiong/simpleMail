@@ -11,7 +11,7 @@ const SyncStatus = () => {
     queryKey: ['connectors', 'incoming'],
     queryFn: () => api.connectors.listIncoming(),
     staleTime: 30_000,
-    refetchInterval: isTabFocused ? 30_000 : 120_000,
+    refetchInterval: isTabFocused ? 60_000 : 180_000,
   });
 
   const syncStateQueries = useQueries({
@@ -21,8 +21,8 @@ const SyncStatus = () => {
       enabled: Boolean(connector.id),
       refetchInterval: (query: any) =>
         hasActiveSyncStates(query.state.data?.states ?? [])
-          ? 2000
-          : (isTabFocused ? 5000 : 20000),
+          ? 4_000
+          : (isTabFocused ? 20_000 : 60_000),
     })),
   });
 

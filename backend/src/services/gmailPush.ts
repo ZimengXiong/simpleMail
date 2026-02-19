@@ -73,7 +73,7 @@ export const renewExpiringGmailPushWatches = async () => {
     const watchMailboxes = getConfiguredWatchMailboxes(syncSettings);
     try {
       const watchLabelIds = watchMailboxes
-        .map((mb) => mb.toUpperCase())
+        .map((mb) => normalizeGmailMailboxPath(mb))
         .filter((id) => id !== 'ALL');
       const watchResponse = await gmailApiRequest<{ historyId?: string | number; expiration?: string | number }>(
         'incoming',
@@ -175,4 +175,3 @@ export const renewExpiringGmailPushWatches = async () => {
 
   return { renewed, failed, skipped };
 };
-

@@ -7,6 +7,7 @@ import {
   setMessageStarredState,
 } from './imap.js';
 import { addLabelsToMessageByKey, removeLabelsFromMessageByKey } from './labels.js';
+import { emitSyncEvent } from './imapEvents.js';
 
 export interface RuleMatch {
   fromContains?: string;
@@ -212,16 +213,12 @@ export const evaluateRules = async (
         removeLabelKeys: rule.actions.removeLabelKeys,
       });
       if (rule.actions.notify) {
-        await query(
-          `INSERT INTO sync_events (incoming_connector_id, event_type, payload)
-           VALUES ($1, 'rule_triggered', $2::jsonb)`,
-          [incomingConnectorId, JSON.stringify({
-            messageId: messageRow.id,
-            ruleId: rule.id,
-            title: rule.actions.notify.title ?? rule.name,
-            body: rule.actions.notify.body ?? 'Rule matched',
-          })],
-        );
+        await emitSyncEvent(incomingConnectorId, 'rule_triggered', {
+          messageId: messageRow.id,
+          ruleId: rule.id,
+          title: rule.actions.notify.title ?? rule.name,
+          body: rule.actions.notify.body ?? 'Rule matched',
+        });
       }
       continue;
     }
@@ -323,16 +320,12 @@ export const evaluateRules = async (
     }
 
     if (rule.actions.notify) {
-      await query(
-        `INSERT INTO sync_events (incoming_connector_id, event_type, payload)
-         VALUES ($1, 'rule_triggered', $2::jsonb)`,
-        [incomingConnectorId, JSON.stringify({
-          messageId: messageRow.id,
-          ruleId: rule.id,
-          title: rule.actions.notify.title ?? rule.name,
-          body: rule.actions.notify.body ?? 'Rule matched',
-        })],
-      );
+      await emitSyncEvent(incomingConnectorId, 'rule_triggered', {
+        messageId: messageRow.id,
+        ruleId: rule.id,
+        title: rule.actions.notify.title ?? rule.name,
+        body: rule.actions.notify.body ?? 'Rule matched',
+      });
     }
   }
 

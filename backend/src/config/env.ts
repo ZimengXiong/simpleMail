@@ -81,4 +81,6 @@ export const env = {
     privateKey: process.env.VAPID_PRIVATE_KEY ?? '',
     email: process.env.VAPID_EMAIL ?? 'mailto:admin@example.com',
   },
+  allowInsecureMailTransport: process.env.ALLOW_INSECURE_MAIL_TRANSPORT === 'true',
+  allowPrivateNetworkTargets: process.env.ALLOW_PRIVATE_NETWORK_TARGETS === 'true',
 };

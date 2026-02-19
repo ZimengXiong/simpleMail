@@ -23,7 +23,7 @@ export const createPushSubscription = async (subscription: {
     `INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth, user_agent)
      VALUES ($1,$2,$3,$4,$5)
      ON CONFLICT (endpoint)
-     DO UPDATE SET p256dh = EXCLUDED.p256dh, auth = EXCLUDED.auth, user_agent = EXCLUDED.user_agent, updated_at = NOW()
+     DO UPDATE SET user_id = EXCLUDED.user_id, p256dh = EXCLUDED.p256dh, auth = EXCLUDED.auth, user_agent = EXCLUDED.user_agent, updated_at = NOW()
      RETURNING id`,
     [subscription.userId, subscription.endpoint, subscription.p256dh, subscription.auth, subscription.userAgent ?? null],
   );

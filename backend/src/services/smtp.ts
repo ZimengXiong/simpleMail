@@ -1,8 +1,10 @@
 import { createRequire } from 'node:module';
 import nodemailer from 'nodemailer';
 import { query } from '../db/pool.js';
+import { env } from '../config/env.js';
 import { appendMessageToMailbox } from './imap.js';
 import { enqueueSync } from './queue.js';
+import { assertSafeOutboundHost } from './networkGuard.js';
 import {
   ensureValidGoogleAccessToken,
   isGoogleTokenExpiringSoon,
@@ -12,50 +14,115 @@ import { messageIdVariants, normalizeMessageId } from './threadingUtils.js';
 
 const require = createRequire(import.meta.url);
 const MailComposer = require('nodemailer/lib/mail-composer/index.js');
+const addressparser = require('nodemailer/lib/addressparser/index.js');
 
-const getTransport = (connector: any, authConfig: Record<string, any>) => {
+type SmtpTlsMode = 'ssl' | 'starttls' | 'none';
+
+const normalizeSmtpTlsMode = (value: unknown): SmtpTlsMode | null => {
+  const normalized = String(value ?? '').trim().toLowerCase();
+  if (!normalized) {
+    return null;
+  }
+  if (['ssl', 'tls', 'implicit', 'implicit_tls', 'smtps'].includes(normalized)) {
+    return 'ssl';
+  }
+  if (['starttls', 'start_tls', 'explicit', 'explicit_tls', 'opportunistic_tls'].includes(normalized)) {
+    return 'starttls';
+  }
+  if (['none', 'plain', 'insecure', 'cleartext'].includes(normalized)) {
+    return 'none';
+  }
+  return null;
+};
+
+const resolveSmtpTlsMode = (value: unknown): SmtpTlsMode =>
+  normalizeSmtpTlsMode(value) ?? 'starttls';
+
+const assertValidPort = (value: unknown, context: string) => {
+  const port = Number(value);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(`${context} port must be an integer between 1 and 65535`);
+  }
+  return port;
+};
+
+const assertAllowedSmtpTlsMode = (tlsMode: SmtpTlsMode) => {
+  const insecureAllowed = env.allowInsecureMailTransport || env.nodeEnv === 'development' || env.nodeEnv === 'test';
+  if (tlsMode === 'none' && !insecureAllowed) {
+    throw new Error('unencrypted SMTP transport is disabled');
+  }
+};
+
+const getTransport = async (connector: any, authConfig: Record<string, any>) => {
   const auth = authConfig ?? (connector.auth_config ?? {});
   const gmailConnector = connector.provider === 'gmail';
   const useOAuth = (auth.authType ?? 'password') === 'oauth2';
   const host = connector.host || (gmailConnector ? 'smtp.gmail.com' : undefined);
-  const port = Number(
+  const port = assertValidPort(
     connector.port || (gmailConnector ? 587 : undefined),
+    'SMTP connector',
   );
+  const tlsMode = resolveSmtpTlsMode(connector.tls_mode ?? connector.tlsMode);
+  assertAllowedSmtpTlsMode(tlsMode);
 
   if (!host) {
     throw new Error('SMTP connector host is required');
   }
-  if (!port) {
-    throw new Error('SMTP connector port is required');
-  }
+  await assertSafeOutboundHost(String(host), { context: 'outgoing connector host' });
+
+  const tlsOptions = tlsMode === 'none'
+    ? {}
+    : {
+        tls: {
+          minVersion: 'TLSv1.2',
+          rejectUnauthorized: true,
+        },
+      };
 
   if (gmailConnector && useOAuth) {
+    const oauthUser = String(connector.from_address ?? '').trim();
+    if (!oauthUser) {
+      throw new Error('Gmail OAuth2 SMTP requires a from address');
+    }
+    if (!auth.refreshToken && !auth.accessToken) {
+      throw new Error('Gmail OAuth2 SMTP requires an access token or refresh token');
+    }
     return nodemailer.createTransport({
       host,
       port,
-      secure: connector.tls_mode === 'ssl',
-      requireTLS: connector.tls_mode === 'starttls',
+      secure: tlsMode === 'ssl',
+      requireTLS: tlsMode === 'starttls',
+      ignoreTLS: tlsMode === 'none',
+      ...tlsOptions,
       auth: {
         type: 'OAuth2',
-        user: connector.from_address,
+        user: oauthUser,
         clientId: auth.oauthClientId,
         clientSecret: auth.oauthClientSecret,
         refreshToken: auth.refreshToken,
         accessToken: auth.accessToken,
       },
-    });
+    } as any);
+  }
+
+  const username = String(auth.username ?? '').trim();
+  const password = String(auth.password ?? '');
+  if (!username || !password) {
+    throw new Error('SMTP username and password are required');
   }
 
   return nodemailer.createTransport({
     host,
     port,
-    secure: connector.tls_mode === 'ssl',
-    requireTLS: connector.tls_mode === 'starttls',
+    secure: tlsMode === 'ssl',
+    requireTLS: tlsMode === 'starttls',
+    ignoreTLS: tlsMode === 'none',
+    ...tlsOptions,
     auth: {
-      user: auth.username,
-      pass: auth.password,
+      user: username,
+      pass: password,
     },
-  });
+  } as any);
 };
 
 export const verifyOutgoingConnectorCredentials = async (input: {
@@ -94,7 +161,7 @@ export const verifyOutgoingConnectorCredentials = async (input: {
     tls_mode: input.tlsMode ?? 'starttls',
   };
 
-  const transport = getTransport(connector, authConfig);
+  const transport = await getTransport(connector, authConfig);
   try {
     await transport.verify();
   } finally {
@@ -102,7 +169,7 @@ export const verifyOutgoingConnectorCredentials = async (input: {
   }
 };
 
-const isRecoverableSmtpError = (error: unknown) => {
+export const isRecoverableSmtpError = (error: unknown) => {
   const asError = error as { responseCode?: number; code?: string; command?: string };
   const message = String(error).toLowerCase();
   if (asError.responseCode === 421 || asError.responseCode === 422 || asError.responseCode === 450 || asError.responseCode === 451 || asError.responseCode === 452 || asError.responseCode === 454) {
@@ -171,14 +238,32 @@ const normalizeReferencesHeader = (value?: string | null): string | undefined =>
   return parts.map((part) => `<${part}>`).join(' ');
 };
 
-const parseEnvelopeRecipients = (value: string | undefined, extra: string[] = []) => {
-  const parsed = [
-    ...(value ? value.split(/[,\n;]/).map((entry) => entry.trim()) : []),
+export const parseEnvelopeRecipients = (value: string | undefined, extra: string[] = []) => {
+  const rawEntries = [
+    value ?? '',
     ...extra,
   ]
-    .map((entry) => entry.trim())
+    .map((entry) => String(entry ?? '').trim())
     .filter(Boolean);
-  return Array.from(new Set(parsed));
+
+  const dedupe = new Set<string>();
+  const recipients: string[] = [];
+  const parsed = (addressparser(rawEntries.join(', ')) as Array<{ address?: string }> | undefined) ?? [];
+
+  const candidates = parsed.length > 0
+    ? parsed.map((item) => String(item.address ?? '').trim()).filter(Boolean)
+    : rawEntries;
+
+  for (const candidate of candidates) {
+    const normalized = candidate.toLowerCase();
+    if (!normalized || dedupe.has(normalized)) {
+      continue;
+    }
+    dedupe.add(normalized);
+    recipients.push(candidate);
+  }
+
+  return recipients;
 };
 
 export const sendThroughConnector = async (
@@ -346,6 +431,7 @@ export const sendThroughConnector = async (
   while (attempts < maxAttempts) {
     attempts += 1;
     const useOauth2 = useGmailApiSend;
+    let transport: any = null;
     try {
       if (useOauth2 && isGoogleTokenExpiringSoon(activeAuth as Record<string, any>)) {
         activeAuth = await ensureValidGoogleAccessToken('outgoing', outgoing.id, activeAuth as Record<string, any>, {
@@ -368,11 +454,14 @@ export const sendThroughConnector = async (
           },
         );
       } else {
-        const transport = getTransport(outgoing, activeAuth ?? {});
+        transport = await getTransport(outgoing, activeAuth ?? {});
         const envelopeRecipients = parseEnvelopeRecipients(payload.to, [
           ...(payload.cc ?? []),
           ...(payload.bcc ?? []),
         ]);
+        if (envelopeRecipients.length === 0) {
+          throw new Error('at least one recipient is required');
+        }
         await transport.sendMail({
           envelope: {
             from: identity.email_address,
@@ -405,6 +494,8 @@ export const sendThroughConnector = async (
       }
       await new Promise((resolve) => setTimeout(resolve, Math.min(1000 * Math.pow(2, attempts - 1), 60000)));
       continue;
+    } finally {
+      transport?.close();
     }
   }
 

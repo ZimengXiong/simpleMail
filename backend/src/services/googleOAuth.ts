@@ -20,6 +20,14 @@ export interface OAuthState {
 
 const stateStore = new Map<string, { expiresAt: number; payload: OAuthState }>();
 
+const pruneExpiredStateStore = (nowMs = Date.now()) => {
+  for (const [key, value] of stateStore.entries()) {
+    if (value.expiresAt <= nowMs) {
+      stateStore.delete(key);
+    }
+  }
+};
+
 const getGoogleClient = (clientId?: string, clientSecret?: string): OAuth2Client => {
   return new OAuth2Client({
     clientId: clientId ?? env.googleClientId,
@@ -39,6 +47,7 @@ export const createOAuthState = async (
 
   const state = randomUUID();
   const expiresAt = Date.now() + 10 * 60 * 1000;
+  pruneExpiredStateStore();
   stateStore.set(state, {
     expiresAt,
     payload: { type, connectorId, userId },
@@ -51,6 +60,33 @@ export const createOAuthState = async (
 };
 
 export const consumeOAuthState = async (state: string): Promise<OAuthState | null> => {
+  pruneExpiredStateStore();
+
+  try {
+    const consumed = await query<{
+      connector_id: string;
+      connector_type: 'incoming' | 'outgoing';
+      user_id: string | null;
+    }>(
+      `DELETE FROM oauth_states
+        WHERE state = $1
+          AND expires_at > NOW()
+      RETURNING connector_id, connector_type, user_id`,
+      [state],
+    );
+    if (consumed.rows.length > 0) {
+      stateStore.delete(state);
+      const row = consumed.rows[0];
+      return {
+        type: row.connector_type,
+        connectorId: row.connector_id,
+        userId: row.user_id ?? undefined,
+      };
+    }
+  } catch {
+    // If DB access fails, fall back to in-memory state to avoid blocking OAuth callbacks.
+  }
+
   const cached = stateStore.get(state);
   if (cached) {
     if (cached.expiresAt < Date.now()) {
@@ -58,25 +94,10 @@ export const consumeOAuthState = async (state: string): Promise<OAuthState | nul
       return null;
     }
     stateStore.delete(state);
+    await query('DELETE FROM oauth_states WHERE state = $1', [state]).catch(() => undefined);
     return cached.payload;
   }
-
-  const result = await query<{ connector_id: string; connector_type: 'incoming' | 'outgoing'; user_id: string | null }>(
-    'SELECT connector_id, connector_type, user_id FROM oauth_states WHERE state = $1 AND expires_at > NOW()',
-    [state],
-  );
-
-  if (result.rows.length === 0) {
-    return null;
-  }
-
-  await query('DELETE FROM oauth_states WHERE state = $1', [state]);
-  const row = result.rows[0];
-  return {
-    type: row.connector_type,
-    connectorId: row.connector_id,
-    userId: row.user_id ?? undefined,
-  };
+  return null;
 };
 
 const toTimestamp = (value?: string | null): number | undefined => {
@@ -106,9 +127,12 @@ export const isGoogleTokenExpiringSoon = (authConfig: Record<string, any>, windo
 };
 
 const isExpired = (value?: string | null): boolean => {
+  if (!value) {
+    return false;
+  }
   const expiry = toTimestamp(value);
   if (!expiry) {
-    return false;
+    return true;
   }
 
   return expiry <= Date.now();
@@ -158,14 +182,10 @@ export const ensureValidGoogleAccessToken = async (
   }
 
   if (!authConfig.refreshToken) {
-    if (!options.forceRefresh && authConfig.accessToken) {
+    if (!options.forceRefresh && authConfig.accessToken && !isExpired(authConfig.tokenExpiresAt)) {
       return authConfig;
     }
     throw new Error('OAuth refresh token is missing; user must reconnect account');
-  }
-
-  if (!authConfig.accessToken && !options.forceRefresh) {
-    return authConfig;
   }
 
   const client = getGoogleClient(authConfig.oauthClientId, authConfig.oauthClientSecret);

@@ -57,7 +57,7 @@ const LoginView = () => {
               />
               <p className="text-[10px] text-text-secondary leading-relaxed pt-1 flex items-center gap-1">
                 <ShieldCheck className="w-3 h-3 text-green-500" />
-                Tokens are stored locally and encrypted in transit.
+                Token is kept in this browser session and sent over HTTPS.
               </p>
             </div>
 

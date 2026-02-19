@@ -44,7 +44,7 @@ import {
   normalizeGmailMailboxPath,
   getGmailMailboxPathAliases,
 } from '../services/imap.js';
-import { listSyncEvents } from '../services/imapEvents.js';
+import { listSyncEvents, waitForSyncEventSignal } from '../services/imapEvents.js';
 import { createPushSubscription, removePushSubscription } from '../services/push.js';
 import { listThreadMessages } from '../services/threading.js';
 import { buildMessageSearchQuery, parseMessageSearchQuery } from '../services/search.js';
@@ -79,6 +79,7 @@ import {
 } from '../services/sendIdempotency.js';
 import { markActiveMailbox, resolveSyncQueuePriority } from '../services/syncPriority.js';
 import { verifyOutgoingConnectorCredentials } from '../services/smtp.js';
+import { assertSafeOutboundHost, assertSafePushEndpoint } from '../services/networkGuard.js';
 
 const required = (value: unknown, key: string): string => {
   if (value === undefined || value === null || value === '') {
@@ -255,6 +256,111 @@ const parseOptionalHeaderValue = (value: unknown): string | undefined => {
   return normalized.length > 0 ? normalized : undefined;
 };
 
+const MAIL_TLS_MODE_VALUES = new Set(['ssl', 'starttls', 'none']);
+const BASE64_BODY_PATTERN = /^[A-Za-z0-9+/]*={0,2}$/;
+const MIME_TYPE_PATTERN = /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/i;
+const HEADER_VALUE_PATTERN = /^[^\r\n]*$/;
+
+const MAX_SEND_RECIPIENTS = 100;
+const MAX_SEND_ATTACHMENTS = 20;
+const MAX_SEND_SUBJECT_CHARS = 998;
+const MAX_SEND_BODY_TEXT_CHARS = 200_000;
+const MAX_SEND_BODY_HTML_CHARS = 500_000;
+const MAX_SEND_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+const MAX_SEND_TOTAL_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+const MAX_SEND_HEADER_CHARS = 2_000;
+
+const insecureMailTransportAllowed =
+  env.allowInsecureMailTransport || env.nodeEnv === 'development' || env.nodeEnv === 'test';
+
+const parseOptionalPort = (value: unknown, fieldName: string): number | undefined => {
+  if (value === undefined || value === null || value === '') {
+    return undefined;
+  }
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) {
+    throw new Error(`${fieldName} must be an integer between 1 and 65535`);
+  }
+  return parsed;
+};
+
+const normalizeTlsMode = (value: unknown, fieldName: string): 'ssl' | 'starttls' | 'none' | undefined => {
+  if (value === undefined || value === null || value === '') {
+    return undefined;
+  }
+  const normalized = String(value).trim().toLowerCase();
+  if (['ssl', 'tls', 'implicit', 'implicit_tls', 'imaps', 'smtps'].includes(normalized)) {
+    return 'ssl';
+  }
+  if (['starttls', 'start_tls', 'explicit', 'explicit_tls'].includes(normalized)) {
+    return 'starttls';
+  }
+  if (['none', 'plain', 'insecure', 'cleartext'].includes(normalized)) {
+    return 'none';
+  }
+  if (MAIL_TLS_MODE_VALUES.has(normalized)) {
+    return normalized as 'ssl' | 'starttls' | 'none';
+  }
+  throw new Error(`${fieldName} must be one of: ssl, starttls, none`);
+};
+
+const estimateBase64PayloadBytes = (value: string): number | null => {
+  const normalized = value.replace(/\s+/g, '');
+  if (!normalized) {
+    return 0;
+  }
+  if (normalized.length % 4 !== 0) {
+    return null;
+  }
+  if (!BASE64_BODY_PATTERN.test(normalized)) {
+    return null;
+  }
+  const padding = normalized.endsWith('==') ? 2 : normalized.endsWith('=') ? 1 : 0;
+  return ((normalized.length / 4) * 3) - padding;
+};
+
+const isPlainObject = (value: unknown): value is Record<string, any> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+const toPublicAuthConfig = (authConfig: unknown) => {
+  const source = (authConfig && typeof authConfig === 'object')
+    ? authConfig as Record<string, any>
+    : {};
+  const authType = String(source.authType ?? 'password').toLowerCase() === 'oauth2'
+    ? 'oauth2'
+    : 'password';
+
+  if (authType === 'oauth2') {
+    return {
+      authType: 'oauth2',
+      oauthClientId: source.oauthClientId ? String(source.oauthClientId) : undefined,
+      tokenExpiresAt: source.tokenExpiresAt ? String(source.tokenExpiresAt) : undefined,
+      hasAccessToken: Boolean(source.accessToken),
+      hasRefreshToken: Boolean(source.refreshToken),
+      hasClientSecret: Boolean(source.oauthClientSecret),
+    };
+  }
+
+  return {
+    authType: 'password',
+    username: source.username ? String(source.username) : undefined,
+    hasPassword: Boolean(source.password),
+  };
+};
+
+const sanitizeConnectorForResponse = (connector: any) => {
+  if (!connector || typeof connector !== 'object') {
+    return connector;
+  }
+  const authConfig = toPublicAuthConfig(connector.authConfig ?? connector.auth_config);
+  const sanitized = {
+    ...connector,
+    authConfig,
+  } as Record<string, any>;
+  delete sanitized.auth_config;
+  return sanitized;
+};
+
 const isArchiveMoveTarget = (value: unknown) => {
   if (value === undefined || value === null) {
     return false;
@@ -312,6 +418,12 @@ const verifyPubSubPushToken = async (
   if (!payload.iss || !GOOGLE_IDENTITY_ISSUERS.has(payload.iss)) {
     throw new Error('invalid pubsub oidc issuer');
   }
+  if (payload.email_verified === false) {
+    throw new Error('pubsub oidc email is not verified');
+  }
+  if (payload.aud && !audience.includes(String(payload.aud))) {
+    throw new Error('invalid pubsub oidc audience');
+  }
   if (
     env.gmailPush.pushServiceAccountEmail
     && payload.email !== env.gmailPush.pushServiceAccountEmail
@@ -326,9 +438,16 @@ const decodePubSubPushBody = (body: any): { emailAddress: string; historyId?: st
   if (!encoded || typeof encoded !== 'string') {
     return null;
   }
+  if (encoded.length > 32_768) {
+    return null;
+  }
+  const normalized = encoded.replace(/\s+/g, '');
+  if (normalized.length % 4 !== 0 || !BASE64_BODY_PATTERN.test(normalized)) {
+    return null;
+  }
 
-  const decoded = Buffer.from(encoded, 'base64').toString('utf8');
-  if (!decoded) {
+  const decoded = Buffer.from(normalized, 'base64').toString('utf8');
+  if (!decoded || decoded.length > 32_768) {
     return null;
   }
 
@@ -346,7 +465,14 @@ const decodePubSubPushBody = (body: any): { emailAddress: string; historyId?: st
   };
 };
 
-const wait = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+const buildGmailWatchLabelIds = (watchMailboxes: string[]) => {
+  const ids = Array.from(new Set(
+    watchMailboxes
+      .map((mailbox) => normalizeGmailMailboxPath(mailbox))
+      .filter((labelId) => labelId !== 'ALL'),
+  ));
+  return ids.length > 0 ? ids : ['INBOX'];
+};
 
 export const registerRoutes = async (app: FastifyInstance) => {
   const getUserId = (request: any) => {
@@ -377,11 +503,13 @@ export const registerRoutes = async (app: FastifyInstance) => {
 
   app.get('/api/connectors/incoming', async (req) => {
     const userId = getUserId(req);
-    return listIncomingConnectors(userId);
+    const connectors = await listIncomingConnectors(userId);
+    return connectors.map((connector) => sanitizeConnectorForResponse(connector));
   });
   app.get('/api/connectors/outgoing', async (req) => {
     const userId = getUserId(req);
-    return listOutgoingConnectors(userId);
+    const connectors = await listOutgoingConnectors(userId);
+    return connectors.map((connector) => sanitizeConnectorForResponse(connector));
   });
   app.get('/api/connectors/incoming/:connectorId', async (req, reply) => {
     const connectorId = String((req.params as any).connectorId);
@@ -390,7 +518,7 @@ export const registerRoutes = async (app: FastifyInstance) => {
     if (!result) {
       return reply.code(404).send({ error: 'connector not found' });
     }
-    return result;
+    return sanitizeConnectorForResponse(result);
   });
   app.get('/api/connectors/outgoing/:connectorId', async (req, reply) => {
     const connectorId = String((req.params as any).connectorId);
@@ -399,7 +527,7 @@ export const registerRoutes = async (app: FastifyInstance) => {
     if (!result) {
       return reply.code(404).send({ error: 'connector not found' });
     }
-    return result;
+    return sanitizeConnectorForResponse(result);
   });
   app.get('/api/connectors/:connectorId/mailboxes', async (req, reply) => {
     const userId = getUserId(req);
@@ -421,8 +549,35 @@ export const registerRoutes = async (app: FastifyInstance) => {
       return reply.code(400).send({ error: 'name, provider, emailAddress required' });
     }
 
-    const authType = body?.authType ?? 'password';
-    const requestedSyncSettings = body?.syncSettings ?? {};
+    const normalizedAuthType = String(body?.authType ?? 'password').toLowerCase();
+    const provider = String(body.provider ?? '').trim().toLowerCase();
+    if (body.syncSettings !== undefined && !isPlainObject(body.syncSettings)) {
+      return reply.code(400).send({ error: 'syncSettings must be an object' });
+    }
+    if (body.authConfig !== undefined && !isPlainObject(body.authConfig)) {
+      return reply.code(400).send({ error: 'authConfig must be an object' });
+    }
+    let parsedPort: number | undefined;
+    let normalizedImapTlsMode: 'ssl' | 'starttls' | 'none' | undefined;
+    try {
+      parsedPort = parseOptionalPort(body.port, 'incoming connector port');
+      normalizedImapTlsMode = normalizeTlsMode(
+        body?.syncSettings?.imapTlsMode ?? body?.syncSettings?.tlsMode,
+        'syncSettings.imapTlsMode',
+      );
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : 'invalid incoming connector config' });
+    }
+    if ((body.tls === false || normalizedImapTlsMode === 'none') && !insecureMailTransportAllowed) {
+      return reply.code(400).send({ error: 'unencrypted IMAP is disabled on this server' });
+    }
+    if (body.host !== undefined && body.host !== null && String(body.host).trim()) {
+      await assertSafeOutboundHost(String(body.host), { context: 'incoming connector host' });
+    }
+    const requestedSyncSettings = {
+      ...(body?.syncSettings ?? {}),
+      ...(normalizedImapTlsMode ? { imapTlsMode: normalizedImapTlsMode } : {}),
+    };
     const defaultWatchMailbox = isGmailLikeConnector({
       provider: String(body.provider),
       sync_settings: requestedSyncSettings,
@@ -439,7 +594,7 @@ export const registerRoutes = async (app: FastifyInstance) => {
       ...requestedSyncSettings,
       watchMailboxes: Array.from(new Set(
         watchMailboxes.map((mailbox: string) => isGmailLikeConnector({
-          provider: String(body.provider),
+          provider: provider,
           sync_settings: requestedSyncSettings,
           syncSettings: requestedSyncSettings,
         })
@@ -447,8 +602,18 @@ export const registerRoutes = async (app: FastifyInstance) => {
           : mailbox),
       )),
     };
+    const supportsOauthIncoming = isGmailAuthConnector({
+      provider,
+      sync_settings: syncSettings,
+      syncSettings: syncSettings,
+    });
+    if (normalizedAuthType === 'oauth2' && !supportsOauthIncoming) {
+      return reply.code(400).send({
+        error: 'oauth2 incoming auth is only supported for provider=gmail or provider=imap with syncSettings.gmailImap=true',
+      });
+    }
 
-    if (authType === 'oauth2') {
+    if (normalizedAuthType === 'oauth2') {
       const expectedGmailMode = String(Boolean(syncSettings?.gmailImap));
       const existing = await query<{ id: string }>(
         `SELECT id
@@ -458,7 +623,7 @@ export const registerRoutes = async (app: FastifyInstance) => {
             AND email_address = $3
             AND COALESCE(auth_config->>'authType', 'password') = $4
             AND COALESCE(sync_settings->>'gmailImap', 'false') = $5`,
-        [userId, String(body.provider), String(body.emailAddress), authType, expectedGmailMode],
+        [userId, provider, String(body.emailAddress), normalizedAuthType, expectedGmailMode],
       );
 
       if (existing.rows.length > 0) {
@@ -468,17 +633,17 @@ export const registerRoutes = async (app: FastifyInstance) => {
 
     const result = await createIncomingConnector(userId, {
       name: String(body.name),
-      provider: String(body.provider),
+      provider,
       emailAddress: String(body.emailAddress),
       host: body.host,
-      port: body.port,
+      port: parsedPort,
       tls: body.tls ?? true,
-      authType,
+      authType: normalizedAuthType,
       authConfig: body.authConfig ?? {},
       syncSettings,
     });
 
-    if (authType !== 'oauth2') {
+    if (normalizedAuthType !== 'oauth2') {
       const firstMailbox = syncSettings.watchMailboxes?.[0] ?? defaultWatchMailbox;
       try {
         await startIncomingConnectorIdleWatch(userId, result.id, firstMailbox);
@@ -497,10 +662,27 @@ export const registerRoutes = async (app: FastifyInstance) => {
       return reply.code(400).send({ error: 'name, provider, fromAddress required' });
     }
 
-    const authType = body.authType ?? (body.provider === 'gmail' ? 'oauth2' : 'password');
     const normalizedProvider = String(body.provider ?? '').trim().toLowerCase();
-    if (String(authType).toLowerCase() === 'oauth2' && normalizedProvider !== 'gmail') {
+    const authType = String(body.authType ?? (normalizedProvider === 'gmail' ? 'oauth2' : 'password')).toLowerCase();
+    if (body.authConfig !== undefined && !isPlainObject(body.authConfig)) {
+      return reply.code(400).send({ error: 'authConfig must be an object' });
+    }
+    let parsedPort: number | undefined;
+    let normalizedTlsMode: 'ssl' | 'starttls' | 'none';
+    try {
+      parsedPort = parseOptionalPort(body.port, 'outgoing connector port');
+      normalizedTlsMode = normalizeTlsMode(body.tlsMode, 'tlsMode') ?? 'starttls';
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : 'invalid outgoing connector config' });
+    }
+    if (authType === 'oauth2' && normalizedProvider !== 'gmail') {
       return reply.code(400).send({ error: 'oauth2 is only supported for provider=gmail for outgoing connectors' });
+    }
+    if (normalizedTlsMode === 'none' && !insecureMailTransportAllowed) {
+      return reply.code(400).send({ error: 'unencrypted SMTP is disabled on this server' });
+    }
+    if (body.host !== undefined && body.host !== null && String(body.host).trim()) {
+      await assertSafeOutboundHost(String(body.host), { context: 'outgoing connector host' });
     }
     if (authType === 'oauth2') {
       const existing = await query<{ id: string }>(
@@ -510,7 +692,7 @@ export const registerRoutes = async (app: FastifyInstance) => {
             AND provider = $2
             AND from_address = $3
             AND COALESCE(auth_config->>'authType', 'password') = $4`,
-        [userId, String(body.provider), String(body.fromAddress), authType],
+        [userId, normalizedProvider, String(body.fromAddress), authType],
       );
 
       if (existing.rows.length > 0) {
@@ -521,26 +703,27 @@ export const registerRoutes = async (app: FastifyInstance) => {
     if (authType !== 'oauth2') {
       try {
         await verifyOutgoingConnectorCredentials({
-          provider: String(body.provider),
+          provider: normalizedProvider,
           fromAddress: String(body.fromAddress),
           host: body.host ?? null,
-          port: body.port ?? null,
-          tlsMode: body.tlsMode ?? 'starttls',
+          port: parsedPort ?? null,
+          tlsMode: normalizedTlsMode,
           authType,
           authConfig: body.authConfig ?? {},
         });
       } catch (error) {
-        return reply.code(400).send({ error: `smtp auth failed: ${String(error)}` });
+        req.log.warn({ error }, 'smtp auth verification failed while creating outgoing connector');
+        return reply.code(400).send({ error: 'smtp auth failed' });
       }
     }
 
     const result = await createOutgoingConnector(userId, {
       name: String(body.name),
-      provider: String(body.provider),
+      provider: normalizedProvider,
       fromAddress: String(body.fromAddress),
       host: body.host,
-      port: body.port,
-      tlsMode: body.tlsMode ?? 'starttls',
+      port: parsedPort,
+      tlsMode: normalizedTlsMode,
       authType,
       authConfig: body.authConfig ?? {},
       fromEnvelopeDefaults: body.fromEnvelopeDefaults ?? {},
@@ -557,22 +740,76 @@ export const registerRoutes = async (app: FastifyInstance) => {
     if (!body || typeof body !== 'object') {
       return reply.code(400).send({ error: 'request body required' });
     }
+    if (body.syncSettings !== undefined && body.syncSettings !== null && !isPlainObject(body.syncSettings)) {
+      return reply.code(400).send({ error: 'syncSettings must be an object' });
+    }
+    if (body.authConfig !== undefined && body.authConfig !== null && !isPlainObject(body.authConfig)) {
+      return reply.code(400).send({ error: 'authConfig must be an object' });
+    }
+
+    const existing = await getIncomingConnector(userId, connectorId);
+    if (!existing) {
+      return reply.code(404).send({ error: 'connector not found' });
+    }
+
+    let parsedPort: number | null | undefined;
+    let normalizedImapTlsMode: 'ssl' | 'starttls' | 'none' | undefined;
+    try {
+      parsedPort = body.port === undefined
+        ? undefined
+        : (body.port === null || body.port === '' ? null : parseOptionalPort(body.port, 'incoming connector port') ?? null);
+      normalizedImapTlsMode = normalizeTlsMode(
+        body?.syncSettings?.imapTlsMode ?? body?.syncSettings?.tlsMode,
+        'syncSettings.imapTlsMode',
+      );
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : 'invalid incoming connector config' });
+    }
+    if ((body.tls === false || normalizedImapTlsMode === 'none') && !insecureMailTransportAllowed) {
+      return reply.code(400).send({ error: 'unencrypted IMAP is disabled on this server' });
+    }
+
+    const mergedHost = body.host !== undefined ? body.host : existing.host;
+    if (mergedHost !== undefined && mergedHost !== null && String(mergedHost).trim()) {
+      await assertSafeOutboundHost(String(mergedHost), { context: 'incoming connector host' });
+    }
+    const mergedSyncSettings = {
+      ...(body.syncSettings ?? existing.sync_settings ?? existing.syncSettings ?? {}),
+      ...(normalizedImapTlsMode ? { imapTlsMode: normalizedImapTlsMode } : {}),
+    };
+    const mergedAuthConfig = body.authConfig ?? existing.auth_config ?? existing.authConfig ?? {};
+    const mergedAuthType = String(mergedAuthConfig?.authType ?? 'password').toLowerCase();
+    const supportsOauthIncoming = isGmailAuthConnector({
+      provider: String(existing.provider ?? '').trim().toLowerCase(),
+      sync_settings: mergedSyncSettings,
+      syncSettings: mergedSyncSettings,
+    });
+    if (mergedAuthType === 'oauth2' && !supportsOauthIncoming) {
+      return reply.code(400).send({
+        error: 'oauth2 incoming auth is only supported for provider=gmail or provider=imap with syncSettings.gmailImap=true',
+      });
+    }
 
     await updateIncomingConnector(userId, connectorId, {
       name: body.name,
       emailAddress: body.emailAddress,
       host: body.host,
-      port: body.port,
+      port: parsedPort,
       tls: body.tls,
       authConfig: body.authConfig,
-      syncSettings: body.syncSettings,
+      syncSettings: body.syncSettings === undefined
+        ? undefined
+        : {
+            ...(body.syncSettings ?? {}),
+            ...(normalizedImapTlsMode ? { imapTlsMode: normalizedImapTlsMode } : {}),
+          },
       status: body.status,
     });
     const updated = await getIncomingConnector(userId, connectorId);
     if (!updated) {
       return reply.code(404).send({ error: 'connector not found' });
     }
-    return updated;
+    return sanitizeConnectorForResponse(updated);
   });
 
   app.patch('/api/connectors/outgoing/:connectorId', async (req, reply) => {
@@ -583,10 +820,27 @@ export const registerRoutes = async (app: FastifyInstance) => {
     if (!body || typeof body !== 'object') {
       return reply.code(400).send({ error: 'request body required' });
     }
+    if (body.authConfig !== undefined && body.authConfig !== null && !isPlainObject(body.authConfig)) {
+      return reply.code(400).send({ error: 'authConfig must be an object' });
+    }
 
     const existing = await getOutgoingConnector(userId, connectorId);
     if (!existing) {
       return reply.code(404).send({ error: 'connector not found' });
+    }
+
+    let parsedPort: number | null | undefined;
+    let normalizedTlsMode: 'ssl' | 'starttls' | 'none' | undefined;
+    try {
+      parsedPort = body.port === undefined
+        ? undefined
+        : (body.port === null || body.port === '' ? null : parseOptionalPort(body.port, 'outgoing connector port') ?? null);
+      normalizedTlsMode = normalizeTlsMode(body.tlsMode, 'tlsMode');
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : 'invalid outgoing connector config' });
+    }
+    if (normalizedTlsMode === 'none' && !insecureMailTransportAllowed) {
+      return reply.code(400).send({ error: 'unencrypted SMTP is disabled on this server' });
     }
 
     const hasSmtpConnectivityChange =
@@ -603,19 +857,24 @@ export const registerRoutes = async (app: FastifyInstance) => {
     if (String(mergedAuthType).toLowerCase() === 'oauth2' && String(existing.provider ?? '').toLowerCase() !== 'gmail') {
       return reply.code(400).send({ error: 'oauth2 is only supported for provider=gmail for outgoing connectors' });
     }
+    const mergedHost = body.host !== undefined ? body.host : (existing.host ?? null);
+    if (mergedHost !== undefined && mergedHost !== null && String(mergedHost).trim()) {
+      await assertSafeOutboundHost(String(mergedHost), { context: 'outgoing connector host' });
+    }
     if (hasSmtpConnectivityChange && mergedAuthType !== 'oauth2') {
       try {
         await verifyOutgoingConnectorCredentials({
           provider: String(existing.provider ?? ''),
           fromAddress: String(body.fromAddress ?? existing.fromAddress ?? existing.from_address ?? ''),
           host: body.host !== undefined ? body.host : (existing.host ?? null),
-          port: body.port !== undefined ? body.port : (existing.port ?? null),
-          tlsMode: body.tlsMode ?? existing.tlsMode ?? existing.tls_mode ?? 'starttls',
+          port: parsedPort !== undefined ? parsedPort : (existing.port ?? null),
+          tlsMode: normalizedTlsMode ?? existing.tlsMode ?? existing.tls_mode ?? 'starttls',
           authType: mergedAuthType,
           authConfig: mergedAuthConfig ?? {},
         });
       } catch (error) {
-        return reply.code(400).send({ error: `smtp auth failed: ${String(error)}` });
+        req.log.warn({ error }, 'smtp auth verification failed while updating outgoing connector');
+        return reply.code(400).send({ error: 'smtp auth failed' });
       }
     }
 
@@ -623,8 +882,8 @@ export const registerRoutes = async (app: FastifyInstance) => {
       name: body.name,
       fromAddress: body.fromAddress,
       host: body.host,
-      port: body.port,
-      tlsMode: body.tlsMode,
+      port: parsedPort,
+      tlsMode: normalizedTlsMode,
       authConfig: body.authConfig,
       fromEnvelopeDefaults: body.fromEnvelopeDefaults,
       sentCopyBehavior: body.sentCopyBehavior,
@@ -633,7 +892,7 @@ export const registerRoutes = async (app: FastifyInstance) => {
     if (!updated) {
       return reply.code(404).send({ error: 'connector not found' });
     }
-    return updated;
+    return sanitizeConnectorForResponse(updated);
   });
 
   app.post('/api/connectors/outgoing/:connectorId/test', async (req, reply) => {
@@ -663,6 +922,9 @@ export const registerRoutes = async (app: FastifyInstance) => {
           '/profile',
         );
       } else {
+        if (connector.host !== undefined && connector.host !== null && String(connector.host).trim()) {
+          await assertSafeOutboundHost(String(connector.host), { context: 'outgoing connector host' });
+        }
         await verifyOutgoingConnectorCredentials({
           provider,
           fromAddress: String(connector.fromAddress ?? connector.from_address ?? ''),
@@ -674,7 +936,8 @@ export const registerRoutes = async (app: FastifyInstance) => {
         });
       }
     } catch (error) {
-      return reply.code(400).send({ error: `smtp test failed: ${String(error)}` });
+      req.log.warn({ error }, 'smtp test failed');
+      return reply.code(400).send({ error: 'smtp test failed' });
     }
 
     return { status: 'ok', id: connectorId };
@@ -997,7 +1260,7 @@ export const registerRoutes = async (app: FastifyInstance) => {
         const fallbackMailbox = isGmailLikeConnector({ provider, sync_settings: connectorSyncSettings, syncSettings: connectorSyncSettings })
           ? normalizeGmailMailboxPath(env.sync.defaultMailbox)
           : env.sync.defaultMailbox;
-        const existingWatchMailboxes = Array.isArray(connectorSyncSettings?.watchMailboxes)
+        const existingWatchMailboxes: string[] = Array.isArray(connectorSyncSettings?.watchMailboxes)
           ? connectorSyncSettings.watchMailboxes.map((value: unknown) => String(value))
           : [];
         if (!existingWatchMailboxes.includes(fallbackMailbox)) {
@@ -1013,6 +1276,13 @@ export const registerRoutes = async (app: FastifyInstance) => {
         const connectorPushEnabled = connectorSyncSettings?.gmailPush?.enabled !== false;
         if (provider === 'gmail' && env.gmailPush.enabled && env.gmailPush.topicName && connectorPushEnabled) {
           try {
+            const watchLabelIds = buildGmailWatchLabelIds(
+              Array.isArray(connectorSyncSettings.watchMailboxes)
+                ? connectorSyncSettings.watchMailboxes
+                  .map((value: unknown) => String(value))
+                  .filter(Boolean)
+                : [fallbackMailbox],
+            );
             const watchResponse = await gmailApiRequest<{ historyId?: string | number; expiration?: string | number }>(
               'incoming',
               { id: connectorId, auth_config: nextAuth },
@@ -1021,7 +1291,7 @@ export const registerRoutes = async (app: FastifyInstance) => {
                 method: 'POST',
                 body: JSON.stringify({
                   topicName: env.gmailPush.topicName,
-                  labelIds: ['INBOX'],
+                  labelIds: watchLabelIds,
                   labelFilterAction: 'include',
                 }),
               },
@@ -1384,10 +1654,10 @@ export const registerRoutes = async (app: FastifyInstance) => {
 
     const existingSyncSettings = connector.sync_settings ?? {};
     const fallbackMailbox = normalizeGmailMailboxPath(env.sync.defaultMailbox);
-    const existingWatchMailboxes = Array.isArray(existingSyncSettings.watchMailboxes)
+    const existingWatchMailboxes: string[] = Array.isArray(existingSyncSettings.watchMailboxes)
       ? existingSyncSettings.watchMailboxes.map((value: unknown) => String(value)).filter(Boolean)
       : [];
-    const watchMailboxes = Array.from(new Set(
+    const watchMailboxes: string[] = Array.from(new Set<string>(
       (existingWatchMailboxes.length > 0 ? existingWatchMailboxes : [fallbackMailbox])
         .map((mailbox: string) => normalizeGmailMailboxPath(mailbox)),
     ));
@@ -1405,7 +1675,7 @@ export const registerRoutes = async (app: FastifyInstance) => {
           method: 'POST',
           body: JSON.stringify({
             topicName: env.gmailPush.topicName,
-            labelIds: ['INBOX'],
+            labelIds: buildGmailWatchLabelIds(watchMailboxes),
             labelFilterAction: 'include',
           }),
         },
@@ -1597,11 +1867,17 @@ export const registerRoutes = async (app: FastifyInstance) => {
           }
           continue;
         }
-        reply.raw.write(`event: ping\ndata: {"since":${since}}\n\n`);
+
+        const signal = await waitForSyncEventSignal(userId, since, 25_000);
+        if (closed) {
+          break;
+        }
+        if (!signal) {
+          reply.raw.write(`event: ping\ndata: {"since":${since}}\n\n`);
+        }
       } catch (error) {
         reply.raw.write(`event: error\ndata: ${JSON.stringify({ error: String(error) })}\n\n`);
       }
-      await wait(1000);
     }
 
     req.raw.off('close', onClose);
@@ -2589,8 +2865,15 @@ export const registerRoutes = async (app: FastifyInstance) => {
   app.post('/api/messages/send', async (req, reply) => {
     const userId = getUserId(req);
     const body = req.body as any;
-    if (!body?.identityId || !body?.subject) {
+    if (!body || typeof body !== 'object' || !body?.identityId || !body?.subject) {
       return reply.code(400).send({ error: 'identityId and subject required' });
+    }
+    const subject = String(body.subject);
+    if (!subject.trim()) {
+      return reply.code(400).send({ error: 'subject is required' });
+    }
+    if (subject.length > MAX_SEND_SUBJECT_CHARS) {
+      return reply.code(400).send({ error: `subject exceeds ${MAX_SEND_SUBJECT_CHARS} characters` });
     }
     const headerIdempotency = req.headers['idempotency-key'] ?? req.headers['x-idempotency-key'];
     const idempotencyHeader = Array.isArray(headerIdempotency) ? headerIdempotency[0] : headerIdempotency;
@@ -2612,18 +2895,125 @@ export const registerRoutes = async (app: FastifyInstance) => {
     const normalizedTo = toList.join(', ');
     const ccList = parseAddressList(body.cc);
     const bccList = parseAddressList(body.bcc);
+    const totalRecipients = toList.length + (ccList?.length ?? 0) + (bccList?.length ?? 0);
+    if (totalRecipients > MAX_SEND_RECIPIENTS) {
+      return reply.code(400).send({ error: `recipient limit exceeded (max ${MAX_SEND_RECIPIENTS})` });
+    }
+
+    if (body.bodyText !== undefined && body.bodyText !== null && typeof body.bodyText !== 'string') {
+      return reply.code(400).send({ error: 'bodyText must be a string' });
+    }
+    if (body.bodyHtml !== undefined && body.bodyHtml !== null && typeof body.bodyHtml !== 'string') {
+      return reply.code(400).send({ error: 'bodyHtml must be a string' });
+    }
+    const bodyText = typeof body.bodyText === 'string' ? body.bodyText : undefined;
+    const bodyHtml = typeof body.bodyHtml === 'string' ? body.bodyHtml : undefined;
+    if (bodyText && bodyText.length > MAX_SEND_BODY_TEXT_CHARS) {
+      return reply.code(400).send({ error: `bodyText exceeds ${MAX_SEND_BODY_TEXT_CHARS} characters` });
+    }
+    if (bodyHtml && bodyHtml.length > MAX_SEND_BODY_HTML_CHARS) {
+      return reply.code(400).send({ error: `bodyHtml exceeds ${MAX_SEND_BODY_HTML_CHARS} characters` });
+    }
+
+    const inReplyTo = parseOptionalHeaderValue(body.inReplyTo);
+    const references = parseOptionalHeaderValue(body.references);
+    if (inReplyTo && (!HEADER_VALUE_PATTERN.test(inReplyTo) || inReplyTo.length > MAX_SEND_HEADER_CHARS)) {
+      return reply.code(400).send({ error: 'inReplyTo header is invalid' });
+    }
+    if (references && (!HEADER_VALUE_PATTERN.test(references) || references.length > MAX_SEND_HEADER_CHARS)) {
+      return reply.code(400).send({ error: 'references header is invalid' });
+    }
+
+    let threadId: string | undefined;
+    if (body.threadId !== undefined && body.threadId !== null) {
+      threadId = String(body.threadId).trim();
+      if (!threadId) {
+        return reply.code(400).send({ error: 'threadId must be non-empty when provided' });
+      }
+      if (!HEADER_VALUE_PATTERN.test(threadId) || threadId.length > 255) {
+        return reply.code(400).send({ error: 'threadId is invalid' });
+      }
+    }
+
+    if (body.attachments !== undefined && !Array.isArray(body.attachments)) {
+      return reply.code(400).send({ error: 'attachments must be an array' });
+    }
+    const attachmentsInput = Array.isArray(body.attachments) ? body.attachments : [];
+    if (attachmentsInput.length > MAX_SEND_ATTACHMENTS) {
+      return reply.code(400).send({ error: `attachment limit exceeded (max ${MAX_SEND_ATTACHMENTS})` });
+    }
+    let totalAttachmentBytes = 0;
+    let attachments: Array<{
+      filename: string;
+      contentType: string;
+      contentBase64: string;
+      inline: boolean;
+      contentId?: string;
+    }>;
+    try {
+      attachments = attachmentsInput.map((attachment: any, index: number) => {
+        if (!attachment || typeof attachment !== 'object') {
+          throw new Error(`attachment[${index}] must be an object`);
+        }
+        const filename = String(attachment.filename ?? '').trim();
+        const contentType = String(attachment.contentType ?? '').trim().toLowerCase();
+        const contentBase64 = String(attachment.contentBase64 ?? '').trim();
+        const inline = attachment.inline === true;
+        const contentId = attachment.contentId === undefined || attachment.contentId === null
+          ? undefined
+          : String(attachment.contentId).trim();
+
+        if (!filename || filename.length > 180 || !HEADER_VALUE_PATTERN.test(filename)) {
+          throw new Error(`attachment[${index}] filename is invalid`);
+        }
+        if (!contentType || !MIME_TYPE_PATTERN.test(contentType)) {
+          throw new Error(`attachment[${index}] contentType is invalid`);
+        }
+        if (!contentBase64) {
+          throw new Error(`attachment[${index}] contentBase64 is required`);
+        }
+        const estimatedBytes = estimateBase64PayloadBytes(contentBase64);
+        if (estimatedBytes === null) {
+          throw new Error(`attachment[${index}] contentBase64 is invalid`);
+        }
+        if (estimatedBytes > MAX_SEND_ATTACHMENT_BYTES) {
+          throw new Error(`attachment[${index}] exceeds ${MAX_SEND_ATTACHMENT_BYTES} bytes`);
+        }
+        totalAttachmentBytes += estimatedBytes;
+        if (totalAttachmentBytes > MAX_SEND_TOTAL_ATTACHMENT_BYTES) {
+          throw new Error(`total attachment payload exceeds ${MAX_SEND_TOTAL_ATTACHMENT_BYTES} bytes`);
+        }
+        if (contentId && (!HEADER_VALUE_PATTERN.test(contentId) || contentId.length > 255)) {
+          throw new Error(`attachment[${index}] contentId is invalid`);
+        }
+        if (inline && !contentId) {
+          throw new Error(`attachment[${index}] inline attachments require contentId`);
+        }
+
+        return {
+          filename,
+          contentType,
+          contentBase64,
+          inline,
+          contentId,
+        };
+      });
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : 'attachment validation failed' });
+    }
+
     const requestHash = makeSendRequestHash({
       identityId,
       to: normalizedTo,
       cc: ccList,
       bcc: bccList,
-      subject: String(body.subject),
-      bodyText: body.bodyText,
-      bodyHtml: body.bodyHtml,
-      threadId: body.threadId ? String(body.threadId) : undefined,
-      inReplyTo: parseOptionalHeaderValue(body.inReplyTo),
-      references: parseOptionalHeaderValue(body.references),
-      attachments: body.attachments ?? [],
+      subject,
+      bodyText,
+      bodyHtml,
+      threadId,
+      inReplyTo,
+      references,
+      attachments,
     });
 
     const idempotency = await getOrCreateSendIdempotency({
@@ -2635,8 +3025,8 @@ export const registerRoutes = async (app: FastifyInstance) => {
         to: normalizedTo,
         cc: ccList ?? [],
         bcc: bccList ?? [],
-        subject: String(body.subject),
-        bodyText: typeof body.bodyText === 'string' ? body.bodyText.slice(0, 1000) : '',
+        subject,
+        bodyText: bodyText ? bodyText.slice(0, 1000) : '',
       },
     });
 
@@ -2662,13 +3052,13 @@ export const registerRoutes = async (app: FastifyInstance) => {
       to: normalizedTo,
       cc: ccList,
       bcc: bccList,
-      subject: String(body.subject),
-      bodyText: body.bodyText,
-      bodyHtml: body.bodyHtml,
-      threadId: body.threadId ? String(body.threadId) : undefined,
-      inReplyTo: parseOptionalHeaderValue(body.inReplyTo),
-      references: parseOptionalHeaderValue(body.references),
-      attachments: body.attachments ?? [],
+      subject,
+      bodyText,
+      bodyHtml,
+      threadId,
+      inReplyTo,
+      references,
+      attachments,
     });
 
     return { status: 'queued' };
@@ -2743,6 +3133,7 @@ export const registerRoutes = async (app: FastifyInstance) => {
     if (!body?.endpoint || !body?.p256dh || !body?.auth) {
       return reply.code(400).send({ error: 'endpoint, p256dh, auth required' });
     }
+    await assertSafePushEndpoint(String(body.endpoint));
 
     const subscription = await createPushSubscription({
       userId,

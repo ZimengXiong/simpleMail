@@ -17,12 +17,13 @@ import {
   Mail as MailIcon,
   CornerUpLeft,
   AlertCircle,
+  AlertTriangle,
   ExternalLink,
   UserCircle
 } from 'lucide-react';
 import type { AttachmentRecord, MessageRecord } from '../types/index';
 import Avatar from './Avatar';
-import { sanitizeEmailHtml } from '../services/htmlSanitizer';
+import { sanitizeEmailHtmlWithReport } from '../services/htmlSanitizer';
 import { buildReplyReferencesHeader, normalizeMessageIdHeader, orderThreadMessages } from '../services/threading';
 
 interface ThreadDetailProps {
@@ -95,6 +96,39 @@ const buildQuotedBody = (message: MessageRecord, mode: ComposeMode) => {
   const quotedLines = body ? body.split('\n').map(line => `> ${line}`) : ['> '];
   return header + quotedLines.join('\n');
 };
+
+const buildSandboxedEmailDoc = (safeBodyHtml: string) => `<!DOCTYPE html>
+<html>
+  <head>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <style>
+      :root { color-scheme: only light; }
+      body {
+        margin: 0;
+        padding: 12px;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+        font-size: 14px;
+        color: #222;
+        line-height: 1.55;
+        background: #fff;
+        overflow-wrap: anywhere;
+      }
+      img, video, audio, iframe, table {
+        max-width: 100%;
+      }
+      pre, code {
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+      a {
+        color: #0b67d0;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="mail-root">${safeBodyHtml}</div>
+  </body>
+</html>`;
 
 const applyThreadPatch = (
   current: MessageRecord[] | undefined,
@@ -320,7 +354,7 @@ const ThreadDetail = ({ threadId, connectorId, onActionComplete }: ThreadDetailP
 
       <div ref={scrollContainerRef} className="flex-1 overflow-y-auto bg-sidebar/30 p-4 pt-6 custom-scrollbar">
         <div className="w-full max-w-4xl mx-auto space-y-4 pb-32">
-          <div className="px-1 mb-8 pb-6 border-b border-border/40">
+          <div className="px-1 mb-4 pb-3 border-b border-border/40">
             <h1 className="text-2xl md:text-3xl font-extrabold text-text-primary tracking-tight leading-tight">
               {newestMessage.subject || '(no subject)'}
             </h1>
@@ -371,10 +405,25 @@ const ThreadDetail = ({ threadId, connectorId, onActionComplete }: ThreadDetailP
 const MessageItem = ({ msg, depth, defaultExpanded, onReply, onToggleStar }: { msg: MessageRecord; depth: number, defaultExpanded: boolean, onReply: () => void, onToggleStar: () => void }) => {
   const [isExpanded, setIsExpanded] = useState(defaultExpanded);
   const [showDetails, setShowDetails] = useState(false);
-  const safeBodyHtml = useMemo(
-    () => (msg.bodyHtml ? sanitizeEmailHtml(msg.bodyHtml) : null),
-    [msg.bodyHtml],
+  const [allowRichFormatting, setAllowRichFormatting] = useState(false);
+  const sanitizedBody = useMemo(
+    () => (msg.bodyHtml ? sanitizeEmailHtmlWithReport(msg.bodyHtml, { allowStyles: allowRichFormatting }) : null),
+    [msg.bodyHtml, allowRichFormatting],
   );
+  const safeBodyHtml = sanitizedBody?.html ?? null;
+  const blockedContentSummary = useMemo(() => {
+    if (!sanitizedBody?.hasBlockedContent || allowRichFormatting) {
+      return null;
+    }
+    const details: string[] = [];
+    if (sanitizedBody.blockedTagNames.length > 0) {
+      details.push(`tags: ${sanitizedBody.blockedTagNames.slice(0, 3).join(', ')}`);
+    }
+    if (sanitizedBody.blockedAttributeNames.length > 0) {
+      details.push(`attributes: ${sanitizedBody.blockedAttributeNames.slice(0, 3).join(', ')}`);
+    }
+    return details.length > 0 ? details.join(' · ') : null;
+  }, [allowRichFormatting, sanitizedBody]);
   const from = parseFromHeader(msg.fromHeader);
   const cc = msg.ccHeader || null;
   const bcc = msg.bccHeader || null;
@@ -393,9 +442,9 @@ const MessageItem = ({ msg, depth, defaultExpanded, onReply, onToggleStar }: { m
             </div>
             {isExpanded && (
               <div className="flex flex-col min-w-0">
-                <div className="text-[11px] text-text-secondary mt-0.5 flex items-center gap-1 opacity-80 cursor-pointer hover:underline w-full" onClick={(e) => { e.stopPropagation(); setShowDetails(!showDetails); }}>
+                <div className="text-[11px] text-text-secondary mt-0.5 flex items-center gap-1 opacity-80 cursor-pointer hover:underline w-fit max-w-full" onClick={(e) => { e.stopPropagation(); setShowDetails(!showDetails); }}>
                   <span className="shrink-0">to</span>
-                  <span className="truncate flex-1">{msg.toHeader}</span>
+                  <span className="truncate">{msg.toHeader}</span>
                   <ChevronDown className={`w-3 h-3 shrink-0 transition-transform ${showDetails ? 'rotate-180' : ''}`} />
                 </div>
               </div>
@@ -435,35 +484,43 @@ const MessageItem = ({ msg, depth, defaultExpanded, onReply, onToggleStar }: { m
       {isExpanded && (
         <>
           <div className="bg-white p-6 text-base leading-relaxed selection:bg-accent/10 text-[#222]">
+            {sanitizedBody?.hasBlockedContent && !allowRichFormatting && (
+              <div className="mb-3 rounded-md border border-amber-300/80 bg-amber-50 px-3 py-2 text-[12px] text-amber-900 flex items-start gap-2">
+                <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
+                <div className="min-w-0 flex-1">
+                  <div>Some content was blocked for safety.</div>
+                  {blockedContentSummary && (
+                    <div className="opacity-80 truncate">{blockedContentSummary}</div>
+                  )}
+                </div>
+                <button
+                  className="shrink-0 rounded border border-amber-400 bg-white px-2 py-0.5 text-[11px] font-semibold hover:bg-amber-100"
+                  onClick={() => setAllowRichFormatting(true)}
+                >
+                  Allow richer formatting
+                </button>
+              </div>
+            )}
+            {sanitizedBody?.hasBlockedContent && allowRichFormatting && (
+              <div className="mb-3 rounded-md border border-blue-300/80 bg-blue-50 px-3 py-2 text-[12px] text-blue-900 flex items-center justify-between gap-2">
+                <span>Richer formatting enabled for this message. Active content is still blocked.</span>
+                <button
+                  className="shrink-0 rounded border border-blue-400 bg-white px-2 py-0.5 text-[11px] font-semibold hover:bg-blue-100"
+                  onClick={() => setAllowRichFormatting(false)}
+                >
+                  Use safer view
+                </button>
+              </div>
+            )}
             {safeBodyHtml ? (
               <div className="w-full min-w-0 overflow-hidden">
                 <iframe
                   title={`msg-${msg.id}`}
-                  scrolling="no"
-                  srcDoc={`<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-size: 14px; color: #222 !important; line-height: 1.5; margin: 0; padding: 0; padding-bottom: 24px; width: 100% !important; overflow: hidden !important; background-color: #ffffff !important; } img { max-width: 100%; height: auto; display: block; } table { max-width: 100% !important; height: auto !important; border-collapse: collapse; } a { color: #2383e2 !important; text-decoration: none; } a:hover { text-decoration: underline; }</style></head><body><div id="content-wrapper">${safeBodyHtml}</div></body></html>`}
-                  className="w-full border-none transition-all duration-200"
-                  sandbox="allow-popups allow-popups-to-escape-sandbox allow-same-origin"
+                  srcDoc={buildSandboxedEmailDoc(safeBodyHtml)}
+                  className="w-full h-[420px] max-h-[70vh] border border-border/50 rounded-md bg-white"
+                  sandbox="allow-popups"
                   referrerPolicy="no-referrer"
-                  onLoad={(e) => {
-                    const iframe = e.currentTarget;
-                    const updateHeight = () => {
-                      if (iframe.contentWindow?.document.documentElement) {
-                        const height = iframe.contentWindow.document.documentElement.scrollHeight;
-                        iframe.style.height = height + 'px';
-                      }
-                    };
-                    updateHeight();
-
-                    // Real-time height updates as content (like images) loads
-                    if (iframe.contentWindow && typeof window.ResizeObserver !== 'undefined') {
-                      const win = iframe.contentWindow;
-                      const observer = new window.ResizeObserver(updateHeight);
-                      observer.observe(win.document.body);
-                    }
-
-                    setTimeout(updateHeight, 500);
-                    setTimeout(updateHeight, 2000);
-                  }}
+                  loading="lazy"
                 />
               </div>
             ) : <div className="whitespace-pre-wrap">{msg.bodyText}</div>}

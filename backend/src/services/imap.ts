@@ -15,6 +15,7 @@ import {
   removeLabelsFromMessageByKey,
   syncSystemLabelsForMessage,
 } from './labels.js';
+import { assertSafeOutboundHost } from './networkGuard.js';
 
 const getConnectorAuth = (connector: any) => connector?.auth_config ?? {};
 
@@ -560,16 +561,41 @@ export const normalizeGmailMailboxPath = (mailbox: string) => {
   const value = String(mailbox || '').trim();
   if (!value) return 'INBOX';
   const upper = value.toUpperCase();
-  const legacyMap: Record<string, string> = {
+  const canonicalMap: Record<string, string> = {
+    INBOX: 'INBOX',
+    SENT: 'SENT',
+    'SENT MAIL': 'SENT',
+    DRAFT: 'DRAFT',
+    DRAFTS: 'DRAFT',
+    TRASH: 'TRASH',
+    SPAM: 'SPAM',
+    JUNK: 'SPAM',
+    STARRED: 'STARRED',
+    IMPORTANT: 'IMPORTANT',
+    ALL: 'ALL',
+    'ALL MAIL': 'ALL',
     '[GMAIL]/SENT MAIL': 'SENT',
+    '[GOOGLE MAIL]/SENT MAIL': 'SENT',
+    '[GMAIL]/SENT': 'SENT',
+    '[GOOGLE MAIL]/SENT': 'SENT',
     '[GMAIL]/SPAM': 'SPAM',
+    '[GOOGLE MAIL]/SPAM': 'SPAM',
+    '[GMAIL]/JUNK': 'SPAM',
+    '[GOOGLE MAIL]/JUNK': 'SPAM',
     '[GMAIL]/TRASH': 'TRASH',
+    '[GOOGLE MAIL]/TRASH': 'TRASH',
     '[GMAIL]/STARRED': 'STARRED',
+    '[GOOGLE MAIL]/STARRED': 'STARRED',
     '[GMAIL]/DRAFTS': 'DRAFT',
+    '[GOOGLE MAIL]/DRAFTS': 'DRAFT',
+    '[GMAIL]/DRAFT': 'DRAFT',
+    '[GOOGLE MAIL]/DRAFT': 'DRAFT',
     '[GMAIL]/IMPORTANT': 'IMPORTANT',
+    '[GOOGLE MAIL]/IMPORTANT': 'IMPORTANT',
     '[GMAIL]/ALL MAIL': 'ALL',
+    '[GOOGLE MAIL]/ALL MAIL': 'ALL',
   };
-  return legacyMap[upper] ?? upper;
+  return canonicalMap[upper] ?? value;
 };
 
 export const getGmailMailboxPathAliases = (mailbox: string): string[] => {
@@ -736,8 +762,97 @@ const shouldProactivelyRefreshGoogleToken = (connector: any): boolean => isGoogl
   getConnectorAuth(connector),
 );
 
+type ImapTlsMode = 'ssl' | 'starttls' | 'none';
+
+const normalizeImapTlsMode = (value: unknown): ImapTlsMode | null => {
+  const normalized = String(value ?? '').trim().toLowerCase();
+  if (!normalized) {
+    return null;
+  }
+  if (['ssl', 'tls', 'implicit', 'implicit_tls', 'imaps'].includes(normalized)) {
+    return 'ssl';
+  }
+  if (['starttls', 'start_tls', 'explicit', 'explicit_tls'].includes(normalized)) {
+    return 'starttls';
+  }
+  if (['none', 'plain', 'insecure', 'cleartext'].includes(normalized)) {
+    return 'none';
+  }
+  return null;
+};
+
+const resolveImapTlsMode = (connector: any, port: number): ImapTlsMode => {
+  const candidates = [
+    connector?.tls_mode,
+    connector?.tlsMode,
+    connector?.sync_settings?.imapTlsMode,
+    connector?.sync_settings?.tlsMode,
+    connector?.syncSettings?.imapTlsMode,
+    connector?.syncSettings?.tlsMode,
+    connector?.auth_config?.imapTlsMode,
+    connector?.auth_config?.tlsMode,
+    connector?.authConfig?.imapTlsMode,
+    connector?.authConfig?.tlsMode,
+  ];
+
+  for (const candidate of candidates) {
+    const parsed = normalizeImapTlsMode(candidate);
+    if (parsed) {
+      return parsed;
+    }
+  }
+
+  if (connector?.tls === false) {
+    return 'none';
+  }
+  if (connector?.tls === true) {
+    return port === 143 ? 'starttls' : 'ssl';
+  }
+
+  if (port === 143) {
+    return 'starttls';
+  }
+  return 'ssl';
+};
+
+const assertValidImapPort = (value: unknown) => {
+  const port = Number(value);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error('IMAP connector port must be an integer between 1 and 65535');
+  }
+  return port;
+};
+
+const assertAllowedImapTlsMode = (tlsMode: ImapTlsMode) => {
+  const insecureAllowed = env.allowInsecureMailTransport || env.nodeEnv === 'development' || env.nodeEnv === 'test';
+  if (tlsMode === 'none' && !insecureAllowed) {
+    throw new Error('unencrypted IMAP transport is disabled');
+  }
+};
+
+export const resolveImapTlsModeForConnector = (connector: any, port: number): ImapTlsMode =>
+  resolveImapTlsMode(connector, port);
+
+export const isGmailHistoryTooOldError = (error: unknown) => {
+  const text = String(error).toLowerCase();
+  return text.includes(' 404 ') || text.includes('starthistoryid');
+};
+
+export const shouldResetMailboxForUidValidity = (
+  storedUidValidity: string | null | undefined,
+  currentUidValidity: string | null | undefined,
+) => {
+  if (!storedUidValidity || !currentUidValidity) {
+    return false;
+  }
+  return String(storedUidValidity) !== String(currentUidValidity);
+};
+
 export const getImapClient = async (connector: any, options: GetImapClientOptions = {}) => {
   const auth = getConnectorAuth(connector);
+  if (auth.authType === 'oauth2' && !isGmailImapConnector(connector)) {
+    throw new Error('oauth2 incoming auth is currently only supported for gmail and gmail-imap connectors');
+  }
   const resolvedAuth =
     auth.authType === 'oauth2' && isGmailImapConnector(connector)
       ? await ensureValidGoogleAccessToken('incoming', connector.id, auth, {
@@ -750,10 +865,16 @@ export const getImapClient = async (connector: any, options: GetImapClientOption
     throw new Error('IMAP connector host is required');
   }
 
-  const port = Number(connector.port || (isGmailImapConnector(connector) ? 993 : undefined));
-  if (!port) {
-    throw new Error('IMAP connector port is required');
-  }
+  const port = assertValidImapPort(connector.port || (isGmailImapConnector(connector) ? 993 : undefined));
+  await assertSafeOutboundHost(String(host), { context: 'incoming connector host' });
+  const tlsMode = resolveImapTlsMode(connector, port);
+  assertAllowedImapTlsMode(tlsMode);
+  const secure = tlsMode === 'ssl';
+  const doSTARTTLS = tlsMode === 'starttls'
+    ? true
+    : tlsMode === 'none'
+      ? false
+      : undefined;
 
   const imapAuth: Record<string, any> = {
     user: connector.email_address,
@@ -765,14 +886,26 @@ export const getImapClient = async (connector: any, options: GetImapClientOption
     }
     imapAuth.accessToken = resolvedAuth.accessToken;
   } else {
-    imapAuth.pass = resolvedAuth.password;
-    imapAuth.loginMethod = 'AUTH=PLAIN';
+    const password = String(resolvedAuth.password ?? '');
+    if (!password) {
+      throw new Error('IMAP password is required');
+    }
+    imapAuth.pass = password;
   }
 
   return new ImapFlow({
     host,
     port,
-    secure: Boolean(connector.tls),
+    secure,
+    ...(doSTARTTLS !== undefined ? { doSTARTTLS } : {}),
+    ...(tlsMode === 'none'
+      ? {}
+      : {
+          tls: {
+            minVersion: 'TLSv1.2',
+            rejectUnauthorized: true,
+          },
+        }),
     auth: imapAuth as any,
     logger: false,
     disableAutoIdle: !env.sync.useIdle,
@@ -1466,9 +1599,10 @@ const getGmailLabels = async (connector: any) => {
 const getGmailMailboxes = async (connector: any) => {
   const labels = await getGmailLabels(connector);
   const rows = labels
-    .filter((label) => label.id !== 'UNREAD' && label.id !== 'CHAT' && label.id !== 'CATEGORY_FORUMS' && label.id !== 'CATEGORY_UPDATES' && label.id !== 'CATEGORY_PROMOTIONS' && label.id !== 'CATEGORY_SOCIAL')
+    .filter((label) => !['UNREAD', 'CHAT', 'CATEGORY_FORUMS', 'CATEGORY_UPDATES', 'CATEGORY_PROMOTIONS', 'CATEGORY_SOCIAL'].includes(label.id.toUpperCase()))
     .map((label) => {
-      const normalizedPath = label.id.toUpperCase();
+      const normalizedPath = normalizeGmailMailboxPath(label.id);
+      const path = label.type === 'system' ? normalizedPath : String(label.id).trim();
       const systemDisplayName = label.name
         .toLowerCase()
         .replace(/_/g, ' ')
@@ -1477,7 +1611,7 @@ const getGmailMailboxes = async (connector: any) => {
         name: label.type === 'system'
           ? systemDisplayName
           : label.name,
-        path: normalizedPath,
+        path,
         delimiter: '/',
         parent: null,
         flags: [],
@@ -1618,27 +1752,100 @@ const fetchGmailRawMessage = async (connector: any, gmailMessageId: string) => {
   return decodeBase64UrlToBuffer(payload.raw);
 };
 
+const cleanupDeletedMessageBlobs = async (
+  messageIds: string[],
+  rawBlobKeys: Array<string | null | undefined>,
+) => {
+  const uniqueRawBlobKeys = Array.from(new Set(
+    rawBlobKeys
+      .map((value) => (value ? String(value).trim() : ''))
+      .filter(Boolean),
+  ));
+
+  if (messageIds.length === 0 && uniqueRawBlobKeys.length === 0) {
+    return;
+  }
+
+  let attachmentBlobKeys: string[] = [];
+  if (messageIds.length > 0) {
+    const attachmentResult = await query<{ blob_key: string }>(
+      `SELECT blob_key
+         FROM attachments
+        WHERE message_id = ANY($1::uuid[])
+          AND blob_key IS NOT NULL`,
+      [messageIds],
+    ).catch(() => ({ rows: [] as { blob_key: string }[] }));
+    attachmentBlobKeys = attachmentResult.rows
+      .map((row) => String(row.blob_key || '').trim())
+      .filter(Boolean);
+  }
+
+  const keysToDelete = Array.from(new Set([
+    ...uniqueRawBlobKeys,
+    ...attachmentBlobKeys,
+  ]));
+
+  if (keysToDelete.length === 0) {
+    return;
+  }
+
+  await Promise.allSettled(keysToDelete.map((key) => blobStore.deleteObject(key)));
+};
+
+const deleteMailboxMessagesByGmailIds = async (
+  connectorId: string,
+  mailbox: string,
+  gmailMessageIds: string[],
+) => {
+  if (gmailMessageIds.length === 0) {
+    return 0;
+  }
+
+  const result = await query<{ id: string; raw_blob_key: string | null }>(
+    `DELETE FROM messages
+      WHERE incoming_connector_id = $1
+        AND folder_path = $2
+        AND gmail_message_id = ANY($3::text[])
+    RETURNING id, raw_blob_key`,
+    [connectorId, mailbox, gmailMessageIds],
+  );
+
+  await cleanupDeletedMessageBlobs(
+    result.rows.map((row) => row.id),
+    result.rows.map((row) => row.raw_blob_key),
+  );
+  return result.rows.length;
+};
+
 const reconcileMailboxByGmailMessageIds = async (connectorId: string, mailbox: string, seenIds: string[]) => {
   if (seenIds.length === 0) {
-    const result = await query<{ id: string }>(
+    const result = await query<{ id: string; raw_blob_key: string | null }>(
       `DELETE FROM messages
         WHERE incoming_connector_id = $1
           AND folder_path = $2
           AND gmail_message_id IS NOT NULL
-      RETURNING id`,
+      RETURNING id, raw_blob_key`,
       [connectorId, mailbox],
+    );
+    await cleanupDeletedMessageBlobs(
+      result.rows.map((row) => row.id),
+      result.rows.map((row) => row.raw_blob_key),
     );
     return result.rows.length;
   }
 
-  const result = await query<{ id: string }>(
+  const result = await query<{ id: string; raw_blob_key: string | null }>(
     `DELETE FROM messages
       WHERE incoming_connector_id = $1
         AND folder_path = $2
         AND gmail_message_id IS NOT NULL
         AND gmail_message_id <> ALL($3::text[])
-    RETURNING id`,
+    RETURNING id, raw_blob_key`,
     [connectorId, mailbox, seenIds],
+  );
+  await cleanupDeletedMessageBlobs(
+    result.rows.map((row) => row.id),
+    result.rows.map((row) => row.raw_blob_key),
   );
   return result.rows.length;
 };
@@ -1740,13 +1947,14 @@ const runGmailMailboxSync = async (connector: any, mailboxInput: string, options
       metadata = await fetchGmailMessageMetadata(connector, gmailMessageId);
     } catch (error) {
       if (String(error).includes(' 404 ')) {
-        await query(
-          `DELETE FROM messages
-            WHERE incoming_connector_id = $1
-              AND folder_path = $2
-              AND gmail_message_id = $3`,
-          [incomingConnectorId, mailbox, gmailMessageId],
+        const removed = await deleteMailboxMessagesByGmailIds(
+          incomingConnectorId,
+          mailbox,
+          [gmailMessageId],
         );
+        if (removed > 0) {
+          syncProgress.reconciledRemoved += removed;
+        }
         return;
       }
       throw error;
@@ -1755,16 +1963,13 @@ const runGmailMailboxSync = async (connector: any, mailboxInput: string, options
     const labels = new Set(metadata.labelIds ?? []);
     const isInMailbox = labelId ? labels.has(labelId) : true;
     if (!isInMailbox) {
-      const removed = await query<{ id: string }>(
-        `DELETE FROM messages
-          WHERE incoming_connector_id = $1
-            AND folder_path = $2
-            AND gmail_message_id = $3
-        RETURNING id`,
-        [incomingConnectorId, mailbox, gmailMessageId],
+      const removed = await deleteMailboxMessagesByGmailIds(
+        incomingConnectorId,
+        mailbox,
+        [gmailMessageId],
       );
-      if (removed.rows.length > 0) {
-        syncProgress.reconciledRemoved += removed.rows.length;
+      if (removed > 0) {
+        syncProgress.reconciledRemoved += removed;
       }
       return;
     }
@@ -1804,10 +2009,11 @@ const runGmailMailboxSync = async (connector: any, mailboxInput: string, options
       resolvedThreadId = threadLookup.rows[0]?.thread_id ?? uuidv4();
     }
 
-    let existing = await query<{ id: string; has_body: boolean; has_raw: boolean }>(
+    let existing = await query<{ id: string; has_body: boolean; has_raw: boolean; raw_blob_key: string | null }>(
       `SELECT id,
               (body_text IS NOT NULL OR body_html IS NOT NULL) AS has_body,
-              (raw_blob_key IS NOT NULL) AS has_raw
+              (raw_blob_key IS NOT NULL) AS has_raw,
+              raw_blob_key
          FROM messages
         WHERE incoming_connector_id = $1
           AND folder_path = $2
@@ -1816,10 +2022,11 @@ const runGmailMailboxSync = async (connector: any, mailboxInput: string, options
     );
 
     if (!existing.rows[0] && rfcMessageId) {
-      existing = await query<{ id: string; has_body: boolean; has_raw: boolean }>(
+      existing = await query<{ id: string; has_body: boolean; has_raw: boolean; raw_blob_key: string | null }>(
         `SELECT id,
                 (body_text IS NOT NULL OR body_html IS NOT NULL) AS has_body,
-                (raw_blob_key IS NOT NULL) AS has_raw
+                (raw_blob_key IS NOT NULL) AS has_raw,
+                raw_blob_key
            FROM messages
           WHERE incoming_connector_id = $1
             AND folder_path = $2
@@ -1850,6 +2057,7 @@ const runGmailMailboxSync = async (connector: any, mailboxInput: string, options
     let messageRowId: string;
     let hasBody = false;
     let hasRaw = false;
+    let existingRawKey: string | null = null;
     if (!existing.rows[0]) {
       let rawKey: string | null = null;
       let sourceBuffer: Buffer | null = null;
@@ -1901,6 +2109,7 @@ const runGmailMailboxSync = async (connector: any, mailboxInput: string, options
       );
       messageRowId = insertedMessage.rows[0].id;
       hasRaw = Boolean(rawKey);
+      existingRawKey = rawKey;
 
       if (sourceBuffer) {
         try {
@@ -1927,6 +2136,7 @@ const runGmailMailboxSync = async (connector: any, mailboxInput: string, options
       messageRowId = existing.rows[0].id;
       hasBody = !!existing.rows[0].has_body;
       hasRaw = !!existing.rows[0].has_raw;
+      existingRawKey = existing.rows[0].raw_blob_key;
       await query(
         `UPDATE messages
             SET message_id = COALESCE($4, message_id),
@@ -1974,18 +2184,40 @@ const runGmailMailboxSync = async (connector: any, mailboxInput: string, options
     }
 
     if (hydrateRaw && (!hasBody || !hasRaw)) {
-      const sourceBuffer = await fetchGmailRawMessage(connector, gmailMessageId);
-      const rawKey = `raw/${connector.id}/${mailbox}/${gmailMessageId}-${uuidv4()}.eml`;
-      await blobStore.putObject(rawKey, sourceBuffer, 'message/rfc822');
-      await query(
-        `UPDATE messages
-            SET raw_blob_key = COALESCE(raw_blob_key, $2),
-                updated_at = NOW()
-          WHERE id = $1`,
-        [messageRowId, rawKey],
-      );
+      let sourceBuffer: Buffer | null = null;
+      let rawKeyToPersist: string | null = null;
+
+      if (hasRaw && existingRawKey) {
+        sourceBuffer = await blobStore.getObject(existingRawKey).catch(() => null);
+      }
+
+      if (!sourceBuffer) {
+        sourceBuffer = await fetchGmailRawMessage(connector, gmailMessageId);
+        rawKeyToPersist = hasRaw
+          ? (existingRawKey ?? `raw/${connector.id}/${mailbox}/${gmailMessageId}-${uuidv4()}.eml`)
+          : `raw/${connector.id}/${mailbox}/${gmailMessageId}-${uuidv4()}.eml`;
+        await blobStore.putObject(rawKeyToPersist, sourceBuffer, 'message/rfc822');
+      }
+
+      if (!hasRaw && rawKeyToPersist) {
+        await query(
+          `UPDATE messages
+              SET raw_blob_key = $2,
+                  updated_at = NOW()
+            WHERE id = $1`,
+          [messageRowId, rawKeyToPersist],
+        );
+        hasRaw = true;
+        existingRawKey = rawKeyToPersist;
+      }
+
+      if (!sourceBuffer) {
+        throw new Error(`unable to hydrate gmail message ${gmailMessageId}: missing source buffer`);
+      }
+
       try {
         await parseAndPersistMessage(messageRowId, sourceBuffer);
+        hasBody = true;
       } catch (error) {
         await emitSyncEvent(incomingConnectorId, 'sync_error', {
           mailbox,
@@ -2078,13 +2310,12 @@ const runGmailMailboxSync = async (connector: any, mailboxInput: string, options
         latestHistoryId = history.latestHistoryId;
       }
     } catch (error) {
-      const text = String(error);
-      if (text.includes(' 404 ') || text.toLowerCase().includes('starthistoryid')) {
+      if (isGmailHistoryTooOldError(error)) {
         historyFallback = true;
         await emitSyncEvent(incomingConnectorId, 'sync_error', {
           mailbox,
           phase: 'gmail-history-fallback',
-          error: `${GMAIL_HISTORY_STALE_SENTINEL}: ${text}`,
+          error: `${GMAIL_HISTORY_STALE_SENTINEL}: ${String(error)}`,
         });
       } else {
         throw error;
@@ -2100,19 +2331,16 @@ const runGmailMailboxSync = async (connector: any, mailboxInput: string, options
     deletedIds = [];
   }
 
-  for (const gmailMessageId of deletedIds) {
-    processedSinceCancelCheck += 1;
+  for (const deletedChunk of chunkArray(deletedIds, 200)) {
+    processedSinceCancelCheck += deletedChunk.length;
     await ensureNotCancelled();
-    const removed = await query<{ id: string }>(
-      `DELETE FROM messages
-        WHERE incoming_connector_id = $1
-          AND folder_path = $2
-          AND gmail_message_id = $3
-      RETURNING id`,
-      [incomingConnectorId, mailbox, gmailMessageId],
+    const removed = await deleteMailboxMessagesByGmailIds(
+      incomingConnectorId,
+      mailbox,
+      deletedChunk,
     );
-    if (removed.rows.length > 0) {
-      syncProgress.reconciledRemoved += removed.rows.length;
+    if (removed > 0) {
+      syncProgress.reconciledRemoved += removed;
     }
   }
 
@@ -2697,11 +2925,7 @@ const runMailboxSync = async (connector: any, mailbox: string, options: GetImapC
       highestUid = Math.max(highestUid, uidNext - 1);
     }
 
-    if (
-      connectorState.mailboxUidValidity &&
-      currentUidValidity &&
-      connectorState.mailboxUidValidity !== currentUidValidity
-    ) {
+    if (shouldResetMailboxForUidValidity(connectorState.mailboxUidValidity, currentUidValidity)) {
       await query('DELETE FROM messages WHERE incoming_connector_id = $1 AND folder_path = $2', [incomingConnectorId, mailbox]);
       localMessageStateCache.clear();
       lastSeenUid = 0;
