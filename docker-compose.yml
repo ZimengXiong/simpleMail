@@ -1,0 +1,122 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: bettermail-postgres
+    environment:
+      POSTGRES_DB: bettermail
+      POSTGRES_USER: bettermail
+      POSTGRES_PASSWORD: bettermail
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  seaweed-master:
+    image: chrislusf/seaweedfs
+    container_name: bettermail-seaweed-master
+    command: master -ip=seaweed-master -port=9333 -mdir=/data
+    volumes:
+      - seaweed_master_data:/data
+    restart: unless-stopped
+
+  seaweed-volume:
+    image: chrislusf/seaweedfs
+    container_name: bettermail-seaweed-volume
+    command: volume -mserver=seaweed-master:9333 -port=8080 -dir=/data
+    volumes:
+      - seaweed_volume_data:/data
+    depends_on:
+      - seaweed-master
+    restart: unless-stopped
+
+  seaweed-filer:
+    image: chrislusf/seaweedfs
+    container_name: bettermail-seaweed-filer
+    command: filer -master=seaweed-master:9333 -s3 -s3.port=8333 -s3.config=/etc/seaweedfs/s3.json
+    volumes:
+      - ./deploy/seaweedfs:/etc/seaweedfs:ro
+      - seaweed_filer_data:/data
+    depends_on:
+      - seaweed-master
+      - seaweed-volume
+    ports:
+      - '8333:8333'
+      - '8888:8888'
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: bettermail-api
+    environment:
+      DATABASE_URL: postgres://bettermail:bettermail@postgres:5432/bettermail
+      PORT: 3000
+      API_ADMIN_TOKEN: ${API_ADMIN_TOKEN}
+      NODE_ENV: production
+      APP_BASE_URL: http://localhost:3000
+      SEAWEED_S3_ENDPOINT: http://seaweed-filer:8333
+      SEAWEED_REGION: us-east-1
+      SEAWEED_BUCKET: bettermail
+      SEAWEED_ACCESS_KEY_ID: seaweed_admin
+      SEAWEED_SECRET_ACCESS_KEY: seaweed_admin_secret
+      SEAWEED_FORCE_PATH_STYLE: 'true'
+    depends_on:
+      - postgres
+      - seaweed-filer
+    ports:
+      - '3000:3000'
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: bettermail-worker
+    command: ["node", "dist/worker/run.js"]
+    environment:
+      DATABASE_URL: postgres://bettermail:bettermail@postgres:5432/bettermail
+      NODE_ENV: production
+      SEAWEED_S3_ENDPOINT: http://seaweed-filer:8333
+      SEAWEED_REGION: us-east-1
+      SEAWEED_BUCKET: bettermail
+      SEAWEED_ACCESS_KEY_ID: seaweed_admin
+      SEAWEED_SECRET_ACCESS_KEY: seaweed_admin_secret
+      SEAWEED_FORCE_PATH_STYLE: 'true'
+    depends_on:
+      - postgres
+      - seaweed-filer
+      - api
+      - worker-migrate
+    restart: unless-stopped
+
+  worker-migrate:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: bettermail-worker-migrate
+    command: ["node", "dist/worker/migrate.js"]
+    environment:
+      DATABASE_URL: postgres://bettermail:bettermail@postgres:5432/bettermail
+    depends_on:
+      - postgres
+    restart: 'no'
+
+  migrate:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: bettermail-migrate
+    command: ["node", "dist/scripts/migrate.js"]
+    environment:
+      DATABASE_URL: postgres://bettermail:bettermail@postgres:5432/bettermail
+    depends_on:
+      - postgres
+    restart: 'no'
+
+volumes:
+  postgres_data:
+  seaweed_master_data:
+  seaweed_volume_data:
+  seaweed_filer_data:

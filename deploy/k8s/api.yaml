@@ -1,0 +1,54 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bettermail-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: bettermail-api
+  template:
+    metadata:
+      labels:
+        app: bettermail-api
+    spec:
+      containers:
+        - name: api
+          image: bettermail:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3000
+          env:
+            - name: PORT
+              value: "3000"
+            - name: NODE_ENV
+              value: production
+            - name: API_ADMIN_TOKEN
+              value: "<REPLACE_ME>"
+            - name: APP_BASE_URL
+              value: https://mail.yourdomain.tld
+            - name: DATABASE_URL
+              value: postgres://bettermail:bettermail@postgres:5432/bettermail
+            - name: SEAWEED_S3_ENDPOINT
+              value: http://seaweed-filer:8333
+            - name: SEAWEED_BUCKET
+              value: bettermail
+            - name: SEAWEED_ACCESS_KEY_ID
+              value: seaweed_admin
+            - name: SEAWEED_SECRET_ACCESS_KEY
+              value: seaweed_admin_secret
+            - name: SEAWEED_FORCE_PATH_STYLE
+              value: "true"
+          command: ["node", "dist/server.js"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bettermail-api
+spec:
+  selector:
+    app: bettermail-api
+  ports:
+    - port: 80
+      targetPort: 3000
+      protocol: TCP

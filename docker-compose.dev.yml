@@ -1,0 +1,54 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: bettermail-postgres-dev
+    environment:
+      POSTGRES_DB: bettermail
+      POSTGRES_USER: bettermail
+      POSTGRES_PASSWORD: bettermail
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data_dev:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  seaweed-master:
+    image: chrislusf/seaweedfs
+    container_name: bettermail-seaweed-master-dev
+    command: master -ip=seaweed-master -port=9333 -mdir=/data
+    volumes:
+      - seaweed_master_data_dev:/data
+    restart: unless-stopped
+
+  seaweed-volume:
+    image: chrislusf/seaweedfs
+    container_name: bettermail-seaweed-volume-dev
+    command: volume -mserver=seaweed-master:9333 -port=8080 -dir=/data
+    volumes:
+      - seaweed_volume_data_dev:/data
+    depends_on:
+      - seaweed-master
+    restart: unless-stopped
+
+  seaweed-filer:
+    image: chrislusf/seaweedfs
+    container_name: bettermail-seaweed-filer-dev
+    command: filer -master=seaweed-master:9333 -s3 -s3.port=8333 -s3.config=/etc/seaweedfs/s3.json
+    volumes:
+      - ./deploy/seaweedfs:/etc/seaweedfs:ro
+      - seaweed_filer_data_dev:/data
+    depends_on:
+      - seaweed-master
+      - seaweed-volume
+    ports:
+      - "8333:8333"
+      - "8888:8888"
+    restart: unless-stopped
+
+volumes:
+  postgres_data_dev:
+  seaweed_master_data_dev:
+  seaweed_volume_data_dev:
+  seaweed_filer_data_dev:

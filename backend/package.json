@@ -1,0 +1,35 @@
+{
+  "name": "bettermail-backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch server.ts",
+    "start": "node dist/server.js",
+    "build": "tsc -p tsconfig.json",
+    "worker": "tsx src/worker/run.ts",
+    "migrate": "tsx scripts/migrate.ts",
+    "worker:migrate": "tsx scripts/worker-migrate.ts",
+    "seed": "tsx scripts/seed.ts"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.870.0",
+    "dotenv": "^16.6.1",
+    "fastify": "^5.6.1",
+    "graphile-worker": "^0.16.5",
+    "google-auth-library": "^9.0.0",
+    "imapflow": "^1.0.164",
+    "nodemailer": "^6.10.1",
+    "postal-mime": "^2.2.5",
+    "pg": "^8.16.3",
+    "web-push": "^3.6.7",
+    "uuid": "^11.0.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.4",
+    "@types/nodemailer": "^6.4.21",
+    "@types/web-push": "^3.6.4",
+    "tsx": "^4.20.5",
+    "typescript": "^5.8.3"
+  }
+}
