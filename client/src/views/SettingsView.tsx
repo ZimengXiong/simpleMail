@@ -216,7 +216,7 @@ const SettingsView = () => {
                       onClick={() => toggleLayout('columns')}
                       className={`flex flex-col gap-3 p-4 rounded-md border transition-all text-left group ${layoutMode === 'columns' ? 'border-accent bg-accent/5' : 'border-border hover:border-text-secondary/30 bg-bg-card'}`}
                     >
-                      <div className="flex gap-1.5 h-24 w-full opacity-40">
+                      <div className="flex gap-1.5 h-24 w-full opacity-60">
                         <div className="w-1/4 h-full bg-text-secondary/20 rounded-sm" />
                         <div className="w-1/3 h-full bg-text-secondary/20 rounded-sm" />
                         <div className="flex-1 h-full bg-accent/20 rounded-sm border border-accent/20" />
@@ -234,7 +234,7 @@ const SettingsView = () => {
                       onClick={() => toggleLayout('list')}
                       className={`flex flex-col gap-3 p-4 rounded-md border transition-all text-left group ${layoutMode === 'list' ? 'border-accent bg-accent/5' : 'border-border hover:border-text-secondary/30 bg-bg-card'}`}
                     >
-                      <div className="flex flex-col gap-1.5 h-24 w-full opacity-40">
+                      <div className="flex flex-col gap-1.5 h-24 w-full opacity-60">
                         <div className="h-4 bg-text-secondary/20 rounded-sm w-full" />
                         <div className="h-4 bg-text-secondary/20 rounded-sm w-full" />
                         <div className="h-12 bg-accent/20 rounded-sm w-full border border-accent/20 flex items-center px-3 text-[8px] font-bold text-accent uppercase">Reading Pane</div>
@@ -267,7 +267,7 @@ const SettingsView = () => {
 
                   {!incomingConnectors?.length ? (
                     <div className="p-8 border border-dashed border-border rounded-md text-center bg-bg-card">
-                      <Mail className="w-8 h-8 text-text-secondary opacity-10 mx-auto mb-3" />
+                      <Mail className="w-8 h-8 text-text-secondary opacity-30 mx-auto mb-3" />
                       <p className="text-size-sm text-text-secondary font-medium">No incoming accounts connected yet.</p>
                     </div>
                   ) : (
@@ -288,7 +288,7 @@ const SettingsView = () => {
                               <div className="min-w-0">
                                 <h3 className="text-size-sm font-semibold text-text-primary truncate">{connector.name}</h3>
                                 <div className="flex items-center gap-2 mt-0.5">
-                                  <span className="text-size-tiny font-bold uppercase tracking-wider text-text-secondary opacity-50 bg-black/5 dark:bg-white/10 px-1 rounded-sm">
+                                  <span className="text-size-tiny font-bold uppercase tracking-wider text-text-secondary opacity-80 bg-black/5 dark:bg-white/10 px-1 rounded-sm">
                                     {connector.provider}
                                   </span>
                                   <span className="text-size-tiny text-text-secondary truncate">{connector.emailAddress}</span>
@@ -296,7 +296,7 @@ const SettingsView = () => {
                               </div>
                             </div>
 
-                            <div className="flex items-center gap-1 opacity-40 group-hover:opacity-100 transition-opacity">
+                            <div className="flex items-center gap-1 opacity-60 group-hover:opacity-100 transition-opacity">
                               <button onClick={() => manualSync.mutate(connector.id)} className="p-1.5 hover:bg-black/5 rounded text-text-secondary" title="Sync Now"><RefreshCw className={`w-3.5 h-3.5 ${manualSync.isPending && manualSync.variables === connector.id ? 'animate-spin' : ''}`} /></button>
                               {isGmailApiConnector && (
                                 <button
@@ -334,7 +334,7 @@ const SettingsView = () => {
 
                   {!outgoingConnectors?.length ? (
                     <div className="p-8 border border-dashed border-border rounded-md text-center bg-bg-card">
-                      <Send className="w-8 h-8 text-text-secondary opacity-10 mx-auto mb-3" />
+                      <Send className="w-8 h-8 text-text-secondary opacity-30 mx-auto mb-3" />
                       <p className="text-size-sm text-text-secondary font-medium">No outgoing servers configured yet.</p>
                     </div>
                   ) : (
@@ -349,7 +349,7 @@ const SettingsView = () => {
                               <div className="min-w-0">
                                 <h3 className="text-size-sm font-semibold text-text-primary truncate">{connector.name}</h3>
                                 <div className="flex items-center gap-2 mt-0.5">
-                                  <span className="text-size-tiny font-bold uppercase tracking-wider text-text-secondary opacity-50 bg-black/5 dark:bg-white/10 px-1 rounded-sm">
+                                  <span className="text-size-tiny font-bold uppercase tracking-wider text-text-secondary opacity-80 bg-black/5 dark:bg-white/10 px-1 rounded-sm">
                                     {connector.provider}
                                   </span>
                                   <span className="text-size-tiny text-text-secondary truncate">{connector.fromAddress}</span>
@@ -361,7 +361,7 @@ const SettingsView = () => {
                                 </div>
                               </div>
                             </div>
-                            <div className="flex items-center gap-1 opacity-40 group-hover:opacity-100 transition-opacity">
+                            <div className="flex items-center gap-1 opacity-60 group-hover:opacity-100 transition-opacity">
                               <button
                                 onClick={() => testOutgoing.mutate(connector.id)}
                                 disabled={smtpTestPending}
@@ -404,7 +404,7 @@ const SettingsView = () => {
                             <div className="text-size-xs text-text-secondary truncate">{identity.emailAddress}</div>
                           </div>
                         </div>
-                        <div className="flex items-center gap-1 opacity-40 group-hover:opacity-100 transition-opacity">
+                        <div className="flex items-center gap-1 opacity-60 group-hover:opacity-100 transition-opacity">
                           <button onClick={() => { if (window.confirm('Delete?')) deleteIdentity.mutate(identity.id); }} className="p-1.5 hover:bg-red-50 dark:hover:bg-red-900/20 text-red-500 rounded"><Trash2 className="w-3.5 h-3.5" /></button>
                           <button onClick={() => setEditingIdentity(identity)} className="p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded text-text-secondary"><ChevronRight className="w-4 h-4" /></button>
                         </div>

@@ -71,6 +71,9 @@ const InboxView = () => {
   const effectiveConnectorId = isSendOnlyMode
     ? undefined
     : (connectorIdFromParams || firstConnectorId);
+  const activeConnector = isSendOnlyMode
+    ? null
+    : ((connectors ?? []).find((connector) => connector.id === effectiveConnectorId) ?? null);
 
   useEffect(() => {
     if (!isSendOnlyMode || folder) {
@@ -114,8 +117,9 @@ const InboxView = () => {
     },
     enabled: isSendOnlyMode ? Boolean(sendOnlyEmail) : !!effectiveConnectorId,
     placeholderData: keepPreviousData,
-    // Reduced from 2s to 8s — saves ~4x the DB queries at rest.
-    refetchInterval: isTabVisible ? 8_000 : 30_000,
+    refetchInterval: isTabVisible
+      ? (activeConnector?.provider === 'imap' ? 2_000 : 8_000)
+      : 30_000,
     refetchIntervalInBackground: false,
   });
 
@@ -453,8 +457,8 @@ const InboxView = () => {
     <div className="flex items-center gap-4 px-2 shrink-0">
       <div className="text-xs text-text-secondary font-semibold whitespace-nowrap opacity-70">{totalCount > 0 ? `${startRange}-${endRange} of ${totalCount}` : '0-0 of 0'}</div>
       <div className="flex items-center gap-0.5">
-        <button onClick={() => setPage(page - 1)} disabled={page <= 1} className="p-1 hover:bg-black/5 dark:hover:bg-white/5 rounded disabled:opacity-30 transition-colors"><ChevronLeft className="w-4 h-4" /></button>
-        <button onClick={() => setPage(page + 1)} disabled={endRange >= totalCount} className="p-1 hover:bg-black/5 dark:hover:bg-white/5 rounded disabled:opacity-30 transition-colors"><ChevronRight className="w-4 h-4" /></button>
+        <button onClick={() => setPage(page - 1)} disabled={page <= 1} className="p-1 hover:bg-black/5 dark:hover:bg-white/5 rounded disabled:opacity-50 transition-colors"><ChevronLeft className="w-4 h-4" /></button>
+        <button onClick={() => setPage(page + 1)} disabled={endRange >= totalCount} className="p-1 hover:bg-black/5 dark:hover:bg-white/5 rounded disabled:opacity-50 transition-colors"><ChevronRight className="w-4 h-4" /></button>
       </div>
     </div>
   );
@@ -481,7 +485,7 @@ const InboxView = () => {
       {selectedMessageIds.size > 0 && !isSendOnlyMode ? bulkToolbar : (
         <div className="h-11 border-b border-border/60 flex items-center px-3 gap-2 shrink-0 bg-bg-card relative">
           {!isSendOnlyMode && (
-            <div className="shrink-0 mr-1"><button onClick={toggleSelectAll} className="p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded text-text-secondary"><Square className="w-4 h-4 opacity-60" /></button></div>
+            <div className="shrink-0 mr-1"><button onClick={toggleSelectAll} className="p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded text-text-secondary"><Square className="w-4 h-4 opacity-70" /></button></div>
           )}
           <div className="relative flex-1 max-w-2xl mx-auto">
             <Search className="w-3.5 h-3.5 absolute left-3 top-1/2 -translate-y-1/2 text-text-secondary opacity-60" />
@@ -509,7 +513,7 @@ const InboxView = () => {
             {loadingMessages ? (
               <div className="flex items-center justify-center h-32"><Loader2 className="w-6 h-6 animate-spin text-text-secondary" /></div>
             ) : messages.length === 0 ? (
-              <div className="p-12 text-center text-text-secondary opacity-50 italic text-sm">No messages found.</div>
+              <div className="p-12 text-center text-text-secondary opacity-70 italic text-sm">No messages found.</div>
             ) : (
               <div className={layoutMode === 'columns' ? 'divide-y divide-border/20' : ''}>
                 {messages.map((msg) =>
@@ -555,7 +559,7 @@ const InboxView = () => {
                 : <div className="flex-1 flex flex-col items-center justify-center text-text-secondary opacity-60"><Mail className="w-12 h-12 mb-2 stroke-1" /><p className="text-sm font-medium">Select a sent/outbox message</p><p className="text-xs mt-1">Responses will not appear without an IMAP inbox.</p></div>)
               : (selectedThreadId
                 ? <ThreadDetail threadId={selectedThreadId} connectorId={effectiveConnectorId} onActionComplete={() => { }} />
-                : <div className="flex-1 flex flex-col items-center justify-center text-text-secondary opacity-50"><Mail className="w-12 h-12 mb-2 stroke-1" /><p className="text-sm font-medium">Select a message to read</p></div>)
+                : <div className="flex-1 flex flex-col items-center justify-center text-text-secondary opacity-70"><Mail className="w-12 h-12 mb-2 stroke-1" /><p className="text-sm font-medium">Select a message to read</p></div>)
             }
           </div>
         )}
@@ -637,7 +641,7 @@ const MemoColumnItem = memo(({ msg, selectedThreadId, isSelected, onSelect, onTo
     >
       {!disableActions && (
         <div className="pt-0.5 shrink-0 z-10" onClick={(e) => onToggleSelect(msg.id, e)}>
-          <button className={`p-0.5 rounded transition-colors ${isSelected ? 'text-accent' : 'text-text-secondary opacity-40 group-hover:opacity-100'}`}>
+          <button className={`p-0.5 rounded transition-colors ${isSelected ? 'text-accent' : 'text-text-secondary opacity-60 group-hover:opacity-100'}`}>
             {isSelected ? <CheckSquare className="w-3.5 h-3.5" /> : <Square className="w-3.5 h-3.5" />}
           </button>
         </div>
@@ -685,7 +689,7 @@ const MemoListItem = memo(({ msg, isSelected, onSelect, onToggleSelect, onUpdate
     >
       {!disableActions && (
         <div className="shrink-0 mr-3 z-10" onClick={(e) => onToggleSelect(msg.id, e)}>
-          <button className={`p-1 rounded transition-colors ${isSelected ? 'text-accent' : 'text-text-secondary opacity-50 group-hover:opacity-100'}`}>
+          <button className={`p-1 rounded transition-colors ${isSelected ? 'text-accent' : 'text-text-secondary opacity-70 group-hover:opacity-100'}`}>
             {isSelected ? <CheckSquare className="w-4 h-4" /> : <Square className="w-4 h-4" />}
           </button>
         </div>
@@ -698,7 +702,7 @@ const MemoListItem = memo(({ msg, isSelected, onSelect, onToggleSelect, onUpdate
             onClick={(e) => { e.stopPropagation(); onUpdateMessage(msg.id, { isStarred: !msg.isStarred }); }}
             title={msg.isStarred ? 'Unstar' : 'Star'}
           >
-            <Star className={`w-3.5 h-3.5 ${msg.isStarred ? 'fill-yellow-400 text-yellow-400' : 'text-text-secondary opacity-40 group-hover:opacity-100'}`} />
+            <Star className={`w-3.5 h-3.5 ${msg.isStarred ? 'fill-yellow-400 text-yellow-400' : 'text-text-secondary opacity-60 group-hover:opacity-100'}`} />
           </button>
         )}
         <div className="flex-1 min-w-0">{participants}</div>

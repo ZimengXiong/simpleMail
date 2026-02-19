@@ -139,6 +139,16 @@ export const setSyncState = async (
   }
 
   if (assignments.length === 0) {
+    await safeQuery(
+      () => query(
+        `UPDATE sync_states
+            SET updated_at = NOW()
+          WHERE incoming_connector_id = $1
+            AND mailbox = $2`,
+        [connectorId, mailbox],
+      ),
+      null,
+    );
     return;
   }
 
@@ -972,6 +982,9 @@ const tryClaimMailboxSync = async (
   const staleMs = Number.isFinite(env.sync.syncClaimStaleMs) && env.sync.syncClaimStaleMs > 0
     ? Math.floor(env.sync.syncClaimStaleMs)
     : 900000;
+  const heartbeatStaleMs = Number.isFinite(env.sync.syncClaimHeartbeatStaleMs) && env.sync.syncClaimHeartbeatStaleMs > 0
+    ? Math.floor(env.sync.syncClaimHeartbeatStaleMs)
+    : 45000;
   const payload = JSON.stringify(normalizeSyncProgress(syncProgress));
 
   try {
@@ -990,10 +1003,14 @@ const tryClaimMailboxSync = async (
           AND (
             status IS DISTINCT FROM 'syncing'
             OR sync_started_at IS NULL
+            OR (
+              updated_at IS NOT NULL
+              AND updated_at < NOW() - ($7::double precision * INTERVAL '1 millisecond')
+            )
             OR sync_started_at < NOW() - ($6::double precision * INTERVAL '1 millisecond')
           )
       RETURNING incoming_connector_id`,
-      [connectorId, mailbox, payload, lastSeenUid, highestUid, staleMs],
+      [connectorId, mailbox, payload, lastSeenUid, highestUid, staleMs, heartbeatStaleMs],
     );
     return result.rows.length > 0;
   } catch (error) {
@@ -3135,10 +3152,21 @@ export const startIncomingConnectorIdleWatch = async (userId: string, connectorI
     await client.logout().catch(() => undefined);
   };
 
+  // Safety net for missed IDLE notifications: run a periodic sync regardless
+  // of IDLE return behavior so silent server-side drops cannot stall delivery.
+  const idleFallbackSyncIntervalMs = Math.max(env.sync.idleIntervalMs * 3, 6_000);
+  let fallbackTimer: NodeJS.Timeout | null = null;
+  let syncInFlight = false;
+
   const ensureSync = async () => {
+    if (syncInFlight || state.stop) {
+      return;
+    }
+    syncInFlight = true;
     try {
       updateWatchActivity(state);
       await syncIncomingConnector(userId, connectorId, normalizedMailbox);
+      state.errorCount = 0;
       updateWatchActivity(state);
     } catch (error) {
       noteWatchError(state, error);
@@ -3146,6 +3174,8 @@ export const startIncomingConnectorIdleWatch = async (userId: string, connectorI
         mailbox: normalizedMailbox,
         error: String(error),
       });
+    } finally {
+      syncInFlight = false;
     }
   };
 
@@ -3153,6 +3183,10 @@ export const startIncomingConnectorIdleWatch = async (userId: string, connectorI
     const MAX_CONSECUTIVE_ERRORS = 20;
     try {
       await ensureSync();
+      fallbackTimer = setInterval(() => {
+        void ensureSync();
+      }, idleFallbackSyncIntervalMs);
+      fallbackTimer.unref?.();
 
       while (!state.stop) {
         // Fix #5: circuit breaker — stop retrying after too many consecutive errors
@@ -3237,6 +3271,9 @@ export const startIncomingConnectorIdleWatch = async (userId: string, connectorI
         }
       }
     } finally {
+      if (fallbackTimer) {
+        clearInterval(fallbackTimer);
+      }
       state.stopped = true;
       await client.logout().catch(() => undefined);
       if (activeIdleWatchers.get(key) === state) {

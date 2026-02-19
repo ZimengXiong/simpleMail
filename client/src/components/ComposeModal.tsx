@@ -298,7 +298,7 @@ const ComposeModal = ({
           <div className="border border-border/40 rounded-md p-2 space-y-1 max-h-24 overflow-y-auto bg-black/[0.01] dark:bg-white/[0.01]">
             {attachments.map((attachment, index) => (
               <div key={`${attachment.filename}-${index}`} className="flex items-center gap-2 text-xs">
-                <Paperclip className="w-3 h-3 text-text-secondary opacity-50" /><span className="flex-1 truncate text-text-primary">{attachment.filename}</span><span className="text-text-secondary opacity-50">{(attachment.size / 1024).toFixed(0)}K</span>
+                <Paperclip className="w-3 h-3 text-text-secondary opacity-70" /><span className="flex-1 truncate text-text-primary">{attachment.filename}</span><span className="text-text-secondary opacity-70">{(attachment.size / 1024).toFixed(0)}K</span>
                 <button type="button" onClick={() => setAttachments(current => current.filter((_, i) => i !== index))} className="p-0.5 rounded hover:bg-red-50 text-text-secondary hover:text-red-500"><Minus className="w-3 h-3" /></button>
               </div>
             ))}
