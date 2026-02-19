@@ -385,15 +385,19 @@ const MessageItem = ({ msg, depth, defaultExpanded, onReply, onToggleStar }: { m
         <div className="absolute inset-0 cursor-pointer z-0" onClick={() => setIsExpanded(!isExpanded)} />
         <div className="flex items-center gap-3 flex-1 min-w-0 z-10 pointer-events-none">
           <Avatar text={from.name} fallbackIcon={UserCircle} size="md" className="pointer-events-auto" />
-          <div className="min-w-0 flex-1 pointer-events-auto">
+            <div className="min-w-0 flex-1 pointer-events-auto">
             <div className="flex items-baseline gap-2 overflow-hidden flex-1">
               <span className="text-sm font-semibold text-text-primary shrink-0 max-w-[300px] truncate cursor-text">{from.name}</span>
               {isExpanded && from.email && <span className="text-[11px] text-text-secondary opacity-60 truncate font-normal cursor-text">{from.email}</span>}
               {!isExpanded && <span className="text-[11px] text-text-secondary truncate font-normal opacity-50 ml-2 italic flex-1 min-w-0 cursor-text">— {msg.snippet}</span>}
             </div>
             {isExpanded && (
-              <div className="flex flex-col">
-                <div className="text-[11px] text-text-secondary mt-0.5 flex items-center gap-1 opacity-80 cursor-pointer hover:underline w-fit" onClick={(e) => { e.stopPropagation(); setShowDetails(!showDetails); }}>to {msg.toHeader}<ChevronDown className={`w-3 h-3 transition-transform ${showDetails ? 'rotate-180' : ''}`} /></div>
+              <div className="flex flex-col min-w-0">
+                <div className="text-[11px] text-text-secondary mt-0.5 flex items-center gap-1 opacity-80 cursor-pointer hover:underline w-full" onClick={(e) => { e.stopPropagation(); setShowDetails(!showDetails); }}>
+                  <span className="shrink-0">to</span>
+                  <span className="truncate flex-1">{msg.toHeader}</span>
+                  <ChevronDown className={`w-3 h-3 shrink-0 transition-transform ${showDetails ? 'rotate-180' : ''}`} />
+                </div>
               </div>
             )}
           </div>

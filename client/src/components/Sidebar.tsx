@@ -12,7 +12,6 @@ import {
   FileText,
   Trash2,
   AlertOctagon,
-  Archive,
   Clock
 } from 'lucide-react';
 import ComposeModal from './ComposeModal';
@@ -104,7 +103,6 @@ const Sidebar = () => {
     if (lower.includes('draft')) return FileText;
     if (lower.includes('trash') || lower.includes('bin')) return Trash2;
     if (lower.includes('spam') || lower.includes('junk')) return AlertOctagon;
-    if (lower.includes('archive')) return Archive;
     if (lower.includes('starred')) return Star;
     if (lower.includes('snoozed')) return Clock;
     return Hash;
@@ -123,9 +121,13 @@ const Sidebar = () => {
     return mailboxes
       .filter((mb: any) => {
         const name = String(mb?.name ?? '').trim().toLowerCase();
-        const path = String(mb?.path ?? '').trim().toLowerCase();
+        const path = String(mb?.path ?? '').trim();
+        const pathLower = path.toLowerCase();
+        const pathUpper = path.toUpperCase();
         if (!name || !path) return false;
-        if (path === '[gmail]') return false;
+        if (pathLower === '[gmail]') return false;
+        if (name.includes('archive')) return false;
+        if (pathUpper === 'ALL' || pathUpper === 'ARCHIVE' || pathUpper === '[GMAIL]/ALL MAIL') return false;
         return true;
       })
       .filter((mb: any, index: number, all: any[]) =>

@@ -255,6 +255,14 @@ const parseOptionalHeaderValue = (value: unknown): string | undefined => {
   return normalized.length > 0 ? normalized : undefined;
 };
 
+const isArchiveMoveTarget = (value: unknown) => {
+  if (value === undefined || value === null) {
+    return false;
+  }
+  const normalized = normalizeGmailMailboxPath(String(value));
+  return normalized === 'ALL' || normalized === 'ARCHIVE';
+};
+
 const sanitizeDispositionFilename = (value: unknown, fallback: string): string => {
   const normalized = String(value ?? '')
     .replace(/[\r\n";\\]/g, '_')
@@ -2328,6 +2336,9 @@ export const registerRoutes = async (app: FastifyInstance) => {
 
     const messageIds = rawIds.map(String).slice(0, 500); // safety cap
     const scope = body?.scope === 'thread' ? 'thread' : 'single';
+    if (isArchiveMoveTarget(body?.moveToFolder)) {
+      return reply.code(400).send({ error: 'archive is no longer supported' });
+    }
 
     const results: { id: string; status: string }[] = [];
     const chunks: string[][] = [];
@@ -2388,6 +2399,9 @@ export const registerRoutes = async (app: FastifyInstance) => {
 
     if (!body || typeof body !== 'object') {
       return reply.code(400).send({ error: 'request body required' });
+    }
+    if (isArchiveMoveTarget(body?.moveToFolder)) {
+      return reply.code(400).send({ error: 'archive is no longer supported' });
     }
 
     if (scope === 'thread') {

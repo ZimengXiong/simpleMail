@@ -18,7 +18,6 @@ import {
   MailOpen,
   CheckSquare,
   Square,
-  Archive,
 } from 'lucide-react';
 import type { MessageRecord } from '../types/index';
 import EmptyState from '../components/EmptyState';
@@ -458,7 +457,6 @@ const InboxView = () => {
       </button>
       <div className="text-xs font-bold mr-2">{selectedMessageIds.size} selected</div>
       <div className="h-4 w-px bg-current opacity-20 mx-1" />
-      <button onClick={() => bulkActionMutation.mutate({ moveToFolder: 'ARCHIVE' })} className="p-2 hover:bg-black/10 transition-colors rounded-md" title="Archive"><Archive className="w-4 h-4" /></button>
       <button onClick={() => bulkActionMutation.mutate({ delete: true })} className="p-2 hover:bg-red-500/20 rounded-md" title="Delete"><Trash2 className="w-4 h-4" /></button>
       <button onClick={() => bulkActionMutation.mutate({ isRead: true })} className="p-2 hover:bg-black/10 rounded-md" title="Mark as Read"><MailOpen className="w-4 h-4" /></button>
       <button onClick={() => bulkActionMutation.mutate({ isRead: false })} className="p-2 hover:bg-black/10 rounded-md" title="Mark as Unread"><MailIcon className="w-4 h-4" /></button>
@@ -732,13 +730,6 @@ const MemoListItem = memo(({ msg, isSelected, onSelect, onToggleSelect, onUpdate
       <div className={`text-xs font-medium whitespace-nowrap shrink-0 group-hover:hidden ml-3 min-w-[3.25rem] text-right ${!msg.isRead ? 'text-text-primary' : 'opacity-40'}`}>{formattedDate}</div>
       {!disableActions && (
         <div className="hidden group-hover:flex items-center gap-1 shrink-0">
-          <button
-            className="p-1.5 hover:bg-black/10 dark:hover:bg-white/10 rounded text-text-secondary transition-colors"
-            onClick={(e) => { e.stopPropagation(); onUpdateMessage(msg.id, { moveToFolder: 'ARCHIVE' }); }}
-            title="Archive"
-          >
-            <Archive className="w-4 h-4" />
-          </button>
           <button
             className="p-1.5 hover:bg-black/10 dark:hover:bg-white/10 rounded text-text-secondary transition-colors"
             onClick={(e) => { e.stopPropagation(); onUpdateMessage(msg.id, { delete: true }); }}

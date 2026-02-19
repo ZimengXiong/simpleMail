@@ -3413,6 +3413,11 @@ export const moveMessageInMailbox = async (
   destinationFolder: string,
   uid: number | null,
 ) => {
+  const normalizedDestinationForGuard = normalizeGmailMailboxPath(destinationFolder);
+  if (normalizedDestinationForGuard === 'ALL' || normalizedDestinationForGuard === 'ARCHIVE') {
+    throw new Error('archive is no longer supported');
+  }
+
   const incomingConnector = await getIncomingConnectorByIdForUser(userId, incomingConnectorId);
   if (!incomingConnector) {
     throw new Error('Incoming connector not found');
@@ -3431,23 +3436,17 @@ export const moveMessageInMailbox = async (
     const normalizedDestination = normalizeGmailMailboxPath(destinationFolder);
     const sourceLabel = mapFolderToGmailLabelId(sourceFolder);
     const destinationLabel = mapFolderToGmailLabelId(normalizedDestination);
-    const archiveRequested = normalizedDestination === 'ALL' || normalizedDestination === 'ARCHIVE';
 
     let addLabelIds: string[] = [];
     let removeLabelIds: string[] = [];
     let targetFolderPath = normalizedDestination;
 
-    if (archiveRequested) {
-      removeLabelIds = sourceLabel ? [sourceLabel] : ['INBOX'];
-      targetFolderPath = 'ALL';
-    } else {
-      if (!destinationLabel) {
-        throw new Error('destination label not supported');
-      }
-      addLabelIds = [destinationLabel];
-      removeLabelIds = sourceLabel ? [sourceLabel] : [];
-      targetFolderPath = normalizedDestination;
+    if (!destinationLabel) {
+      throw new Error('destination label not supported');
     }
+    addLabelIds = [destinationLabel];
+    removeLabelIds = sourceLabel ? [sourceLabel] : [];
+    targetFolderPath = normalizedDestination;
 
     const labels = await gmailModifyMessageLabels(
       incomingConnector,

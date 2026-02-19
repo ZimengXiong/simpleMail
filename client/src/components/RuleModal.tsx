@@ -107,7 +107,7 @@ const RuleModal = ({ onClose }: RuleModalProps) => {
                 <input 
                   type="text" 
                   className="input text-sm h-10 px-3 bg-bg-app border-border/60 text-text-primary focus:ring-accent/30"
-                  placeholder="Archive"
+                  placeholder="Destination folder"
                   value={formData.actions.moveToFolder}
                   onChange={e => setFormData({...formData, actions: {...formData.actions, moveToFolder: e.target.value}})}
                 />

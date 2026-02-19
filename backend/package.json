@@ -7,7 +7,7 @@
     "dev": "npm run migrate && tsx watch server.ts",
     "start": "node dist/server.js",
     "build": "tsc -p tsconfig.json",
-    "test": "tsx src/services/__tests__/threadingUtils.test.ts && tsx src/services/__tests__/syncPriority.test.ts && tsx src/services/__tests__/search.test.ts",
+    "test": "tsx src/services/__tests__/threadingUtils.test.ts && tsx tests/conversationThreading.test.ts && tsx src/services/__tests__/syncPriority.test.ts && tsx src/services/__tests__/search.test.ts",
     "worker": "tsx src/worker/run.ts",
     "migrate": "tsx scripts/migrate.ts",
     "worker:migrate": "tsx scripts/worker-migrate.ts",
