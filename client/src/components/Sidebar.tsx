@@ -1,100 +1,200 @@
-import React, { useState } from 'react';
-import { NavLink } from 'react-router-dom';
+import { useState, useMemo } from 'react';
+import { NavLink, useSearchParams } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import { api } from '../services/api';
 import { 
   Inbox, 
-  Send, 
-  Archive, 
-  Settings, 
-  Plus, 
-  ChevronRight, 
-  Mail, 
   PenBox,
-  AlertCircle
+  Hash,
+  Star,
+  Loader2,
+  Send,
+  FileText,
+  Trash2,
+  AlertOctagon,
+  Archive,
+  Clock
 } from 'lucide-react';
 import ComposeModal from './ComposeModal';
+import ProfileSwitcher from './ProfileSwitcher';
 
 const Sidebar = () => {
+  const [searchParams] = useSearchParams();
   const [isComposeOpen, setIsComposeOpen] = useState(false);
-  const { data: connectors, isLoading } = useQuery({
+  
+  const activeConnectorId = searchParams.get('connectorId');
+  const activeProfileType = searchParams.get('profile');
+  const activeSendEmail = String(searchParams.get('sendEmail') ?? '').trim().toLowerCase();
+  const isSendOnlyProfile = activeProfileType === 'send-only' && !!activeSendEmail;
+
+  const { data: connectors } = useQuery({
     queryKey: ['connectors', 'incoming'],
     queryFn: () => api.connectors.listIncoming(),
+    staleTime: 60_000,
+  });
+  const { data: outgoingConnectors } = useQuery({
+    queryKey: ['connectors', 'outgoing'],
+    queryFn: () => api.connectors.listOutgoing(),
+    staleTime: 60_000,
+  });
+  const { data: identities } = useQuery({
+    queryKey: ['identities'],
+    queryFn: () => api.identities.list(),
+    staleTime: 60_000,
+  });
+  const incomingEmails = useMemo(
+    () => new Set((connectors ?? []).map((connector) => String(connector.emailAddress ?? '').trim().toLowerCase()).filter(Boolean)),
+    [connectors],
+  );
+
+  const sendOnlyProfiles = useMemo(() => {
+    const dedupe = new Set<string>();
+    const profiles: Array<{ id: string; name: string; emailAddress: string; visual_config?: { icon?: string; emoji?: string } }> = [];
+
+    for (const outgoing of outgoingConnectors ?? []) {
+      const emailKey = String(outgoing.fromAddress ?? '').trim().toLowerCase();
+      if (!emailKey || dedupe.has(emailKey)) {
+        continue;
+      }
+      if (incomingEmails.has(emailKey)) {
+        continue;
+      }
+      dedupe.add(emailKey);
+      profiles.push({
+        id: `send-only:${emailKey}`,
+        name: outgoing.name || outgoing.fromAddress,
+        emailAddress: outgoing.fromAddress,
+      });
+    }
+
+    for (const identity of identities ?? []) {
+      const emailKey = String(identity.emailAddress ?? '').trim().toLowerCase();
+      if (!emailKey || dedupe.has(emailKey)) {
+        continue;
+      }
+      if (incomingEmails.has(emailKey)) {
+        continue;
+      }
+      dedupe.add(emailKey);
+      profiles.push({
+        id: `send-only:${emailKey}`,
+        name: identity.displayName || identity.emailAddress,
+        emailAddress: identity.emailAddress,
+        visual_config: identity.visual_config,
+      });
+    }
+    return profiles;
+  }, [identities, incomingEmails, outgoingConnectors]);
+
+  const effectiveConnectorId = isSendOnlyProfile
+    ? null
+    : (activeConnectorId || connectors?.[0]?.id);
+
+  const { data: mailboxes, isLoading: loadingMailboxes } = useQuery({
+    queryKey: ['mailboxes', effectiveConnectorId],
+    queryFn: () => api.connectors.getMailboxes(effectiveConnectorId!),
+    enabled: !!effectiveConnectorId && !isSendOnlyProfile,
+    staleTime: 60_000,
   });
 
-  const mainLinks = [
-    { label: 'Inbox', icon: Inbox, path: '/inbox' },
-    { label: 'Sent', icon: Send, path: '/folder/Sent' },
-    { label: 'Archive', icon: Archive, path: '/folder/Archive' },
-  ];
+  const getFolderIcon = (name: string) => {
+    const lower = name.toLowerCase();
+    if (lower.includes('inbox')) return Inbox;
+    if (lower.includes('sent')) return Send;
+    if (lower.includes('draft')) return FileText;
+    if (lower.includes('trash') || lower.includes('bin')) return Trash2;
+    if (lower.includes('spam') || lower.includes('junk')) return AlertOctagon;
+    if (lower.includes('archive')) return Archive;
+    if (lower.includes('starred')) return Star;
+    if (lower.includes('snoozed')) return Clock;
+    return Hash;
+  };
+
+  const linkClass = (isActive: boolean) => `
+    flex items-center gap-2 px-2.5 py-1 rounded-md transition-colors text-sm group
+    ${isActive 
+      ? 'bg-black/5 dark:bg-white/5 text-text-primary font-semibold' 
+      : 'text-text-secondary hover:bg-black/5 dark:hover:bg-white/5 hover:text-text-primary font-medium'}
+  `;
+
+  // Sort and filter mailboxes to put Inbox first and avoid duplicates
+  const dynamicFolders = useMemo(() => {
+    if (!mailboxes) return [];
+    return mailboxes
+      .filter((mb: any) => {
+        const name = String(mb?.name ?? '').trim().toLowerCase();
+        const path = String(mb?.path ?? '').trim().toLowerCase();
+        if (!name || !path) return false;
+        if (path === '[gmail]') return false;
+        return true;
+      })
+      .filter((mb: any, index: number, all: any[]) =>
+        all.findIndex((candidate: any) => String(candidate.path).toLowerCase() === String(mb.path).toLowerCase()) === index);
+  }, [mailboxes]);
 
   return (
-    <div className="w-60 bg-sidebar border-r border-border h-full flex flex-col shrink-0">
-      <div className="p-3">
+    <div className="flex-1 flex flex-col min-h-0 bg-sidebar border-r border-border font-sans select-none">
+      <ProfileSwitcher incomingConnectors={connectors || []} sendOnlyProfiles={sendOnlyProfiles} />
+
+      <div className="p-3 pt-0">
         <button 
           onClick={() => setIsComposeOpen(true)}
-          disabled={!connectors?.length}
-          className="w-full flex items-center justify-center gap-2 bg-white border border-border py-2 rounded-lg text-sm font-bold shadow-sm hover:bg-sidebar transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+          disabled={!(identities?.length)}
+          className="w-full flex items-center justify-center gap-2 bg-bg-card border border-border py-1.5 rounded-md text-sm font-semibold text-text-primary hover:bg-black/5 dark:hover:bg-white/5 transition-all disabled:opacity-50 disabled:cursor-not-allowed active:scale-[0.98]"
         >
-          <PenBox className="w-4 h-4 text-accent" />
+          <PenBox className="w-3.5 h-3.5 text-accent" />
           Compose
         </button>
       </div>
 
-      <nav className="flex-1 overflow-y-auto px-2 py-2">
-        <div className="space-y-0.5 mb-6">
-          {mainLinks.map((link) => (
-            <NavLink
-              key={link.path}
-              to={link.path}
-              className={({ isActive }) => `
-                flex items-center gap-2 px-2 py-1.5 rounded-sm group transition-colors
-                ${isActive ? 'bg-black/5 text-text-primary' : 'text-text-secondary hover:bg-black/5 hover:text-text-primary'}
-              `}
-            >
-              <link.icon className="w-4 h-4" />
-              <span className="flex-1 truncate">{link.label}</span>
-            </NavLink>
-          ))}
-        </div>
-
-        <div className="mb-4">
-          <div className="px-3 py-1 text-[11px] font-semibold text-text-secondary uppercase tracking-wider flex items-center justify-between group">
-            <span>Accounts</span>
-            <NavLink to="/settings/connectors/new?type=incoming" className="hidden group-hover:block opacity-60 hover:opacity-100">
-              <Plus className="w-3.5 h-3.5" />
-            </NavLink>
+      <nav className="flex-1 overflow-y-auto px-2 space-y-0.5 custom-scrollbar pt-2">
+        {isSendOnlyProfile ? (
+          <div className="animate-in fade-in duration-300">
+            {[{ name: 'Outbox', path: 'OUTBOX', icon: Clock }, { name: 'Sent', path: 'SENT', icon: Send }].map((mb) => {
+              const Icon = mb.icon;
+              const currentFolder = String(searchParams.get('folder') ?? '').toUpperCase();
+              const isActive = currentFolder
+                ? currentFolder === mb.path
+                : mb.path === 'OUTBOX';
+              return (
+                <NavLink
+                  key={mb.path}
+                  to={`/inbox?profile=send-only&sendEmail=${encodeURIComponent(activeSendEmail)}&folder=${mb.path}`}
+                  className={linkClass(isActive)}
+                >
+                  <Icon className="w-4 h-4 opacity-60" />
+                  <span className="truncate text-sm">{mb.name}</span>
+                </NavLink>
+              );
+            })}
           </div>
-          <div className="space-y-0.5 mt-1">
-            {!isLoading && !connectors?.length && (
-              <div className="px-3 py-4 text-center">
-                <p className="text-[10px] text-text-secondary italic leading-relaxed">No accounts connected yet. Add one in settings.</p>
+        ) : effectiveConnectorId ? (
+          <div className="animate-in fade-in duration-300">
+            {loadingMailboxes ? (
+              <div className="px-6 py-2 text-xs text-text-secondary italic flex items-center gap-2">
+                <Loader2 className="w-3 h-3 animate-spin" />
+                Loading folders...
               </div>
-            )}
-            {connectors?.map((c) => (
-              <div key={c.id} className="group">
-                <div className="flex items-center gap-2 px-2 py-1.5 rounded-sm text-text-secondary hover:bg-black/5 hover:text-text-primary cursor-pointer transition-colors">
-                  <ChevronRight className="w-3 h-3 transition-transform opacity-40 group-hover:opacity-100" />
-                  <span className="flex-1 truncate text-xs font-medium">{c.emailAddress}</span>
-                </div>
-              </div>
-            ))}
+            ) : dynamicFolders.length === 0 ? (
+              <div className="px-6 py-2 text-xs text-text-secondary italic">No folders</div>
+            ) : dynamicFolders.map((mb: any) => {
+                const Icon = getFolderIcon(mb.name);
+                const isActive = searchParams.get('folder') === mb.path
+                  || (!searchParams.get('folder') && String(mb.path).toUpperCase() === 'INBOX');
+                return (
+                  <NavLink
+                    key={mb.path}
+                    to={`/inbox?connectorId=${effectiveConnectorId}&folder=${encodeURIComponent(mb.path)}`}
+                    className={linkClass(isActive)}
+                  >
+                    <Icon className="w-4 h-4 opacity-60" />
+                    <span className="truncate text-sm">{mb.name}</span>
+                  </NavLink>
+                );
+              })}
           </div>
-        </div>
+        ) : null}
       </nav>
-
-      <div className="p-2 border-t border-border mt-auto">
-        <NavLink
-          to="/settings"
-          className={({ isActive }) => `
-            flex items-center gap-2 px-2 py-1.5 rounded-sm transition-colors
-            ${isActive ? 'bg-black/5 text-text-primary' : 'text-text-secondary hover:bg-black/5 hover:text-text-primary'}
-          `}
-        >
-          <Settings className="w-4 h-4" />
-          <span>Settings</span>
-        </NavLink>
-      </div>
 
       {isComposeOpen && (
         <ComposeModal onClose={() => setIsComposeOpen(false)} />

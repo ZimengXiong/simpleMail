@@ -1,19 +1,239 @@
-import React from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
-import { useQuery } from '@tanstack/react-query';
+import { useState } from 'react';
+import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { api } from '../services/api';
+import ComposeModal from '../components/ComposeModal';
 import { format } from 'date-fns';
-import { ChevronLeft, Loader2, Star, MoreVertical, Reply, CornerUpLeft } from 'lucide-react';
+import {
+  ChevronLeft,
+  Loader2,
+  Star,
+  Mail,
+  MailOpen,
+  Download,
+  Reply,
+  ReplyAll,
+  Forward,
+  CornerUpLeft,
+} from 'lucide-react';
+
+import type { MessageRecord } from '../types/index';
+type MessagesQueryResult = { messages: MessageRecord[]; totalCount: number };
+
+const isStarredFolderToken = (value: unknown) => String(value ?? '').trim().toUpperCase().includes('STARRED');
+
+const applyThreadPatch = (
+  current: MessageRecord[] | undefined,
+  messageId: string,
+  patch: { delete?: boolean; isRead?: boolean; isStarred?: boolean },
+) => {
+  if (!current) {
+    return current;
+  }
+  if (patch.delete) {
+    return current.filter((message) => message.id !== messageId);
+  }
+  return current.map((message) => {
+    if (message.id !== messageId) {
+      return message;
+    }
+    return {
+      ...message,
+      isRead: patch.isRead ?? message.isRead,
+      isStarred: patch.isStarred ?? message.isStarred,
+    };
+  });
+};
+
+const applyMessageListPatch = (
+  current: MessagesQueryResult | undefined,
+  messageId: string,
+  patch: { delete?: boolean; isRead?: boolean; isStarred?: boolean },
+  options?: { removeFromStarredOnUnstar?: boolean },
+) => {
+  if (!current?.messages) {
+    return current;
+  }
+  let removed = false;
+  const nextMessages = current.messages
+    .map((message) => {
+      if (message.id !== messageId) {
+        return message;
+      }
+      if (patch.delete || (options?.removeFromStarredOnUnstar === true && patch.isStarred === false)) {
+        removed = true;
+        return null;
+      }
+      return {
+        ...message,
+        isRead: patch.isRead ?? message.isRead,
+        isStarred: patch.isStarred ?? message.isStarred,
+      };
+    })
+    .filter((message): message is MessageRecord => Boolean(message));
+
+  return {
+    ...current,
+    messages: nextMessages,
+    totalCount: removed ? Math.max(0, current.totalCount - 1) : current.totalCount,
+  };
+};
+
+const parseEmailFromHeader = (header: string | null): string => {
+  if (!header) return '';
+  const angleMatch = header.match(/<([^>]+)>/);
+  return angleMatch?.[1]?.trim() || header.trim();
+};
+
+const makeReplySubject = (subject: string | null, mode: 'reply' | 'replyAll' | 'forward') => {
+  const base = subject || '(no subject)';
+  if (mode === 'forward') {
+    return base.match(/^fwd?:?/i) ? base : `Fwd: ${base}`;
+  }
+  return base.match(/^re:/i) ? base : `Re: ${base}`;
+};
+
+const splitAddressHeader = (header: string | null | undefined): string[] => {
+  if (!header) return [];
+  return header
+    .split(',')
+    .map((entry) => parseEmailFromHeader(entry))
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+};
+
+const normalizeMessageIdHeader = (value: string | null | undefined): string | null => {
+  if (!value) return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const angleMatch = trimmed.match(/<[^>]+>/);
+  if (angleMatch?.[0]) return angleMatch[0];
+  const token = trimmed.split(/\s+/)[0];
+  if (!token) return null;
+  return token.startsWith('<') && token.endsWith('>') ? token : `<${token.replace(/[<>]/g, '')}>`;
+};
+
+const buildReplyReferences = (message: MessageRecord): string | undefined => {
+  const currentMessageId = normalizeMessageIdHeader(message.messageId);
+  if (!currentMessageId) return undefined;
+  const existing = (message.referencesHeader ?? '').trim();
+  if (!existing) return currentMessageId;
+  return existing.includes(currentMessageId) ? existing : `${existing} ${currentMessageId}`;
+};
+
+const quoteForReply = (text: string): string => {
+  return text
+    .replace(/\r\n/g, '\n')
+    .split('\n')
+    .map((line) => `> ${line}`)
+    .join('\n');
+};
+
+const makeInitialBodyText = (message: MessageRecord, mode: 'reply' | 'replyAll' | 'forward'): string => {
+  const sentAt = message.receivedAt ? format(new Date(message.receivedAt), 'PPP p') : 'an earlier date';
+  const sourceText = (message.bodyText || message.snippet || '').trim();
+
+  if (mode === 'forward') {
+    const ccHeader = message.ccHeader ? `\nCc: ${message.ccHeader}` : '';
+    const bccHeader = message.bccHeader ? `\nBcc: ${message.bccHeader}` : '';
+    return `\n\n---------- Forwarded message ----------\nFrom: ${message.fromHeader || ''}\nDate: ${sentAt}\nSubject: ${message.subject || '(no subject)'}\nTo: ${message.toHeader || ''}${ccHeader}${bccHeader}\n\n${sourceText}`;
+  }
+
+  const quoted = quoteForReply(sourceText);
+  return `\n\nOn ${sentAt}, ${message.fromHeader || 'Unknown sender'} wrote:\n${quoted}`;
+};
 
 const ThreadView = () => {
   const { threadId } = useParams();
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const queryClient = useQueryClient();
+  const connectorId = searchParams.get('connectorId') || undefined;
+
+  const [replyContext, setReplyContext] = useState<{
+    open: boolean;
+    to: string;
+    cc: string;
+    bcc: string;
+    subject: string;
+    bodyText: string;
+    inReplyTo?: string;
+    references?: string;
+  } | null>(null);
 
   const { data: messages, isLoading } = useQuery({
-    queryKey: ['thread', threadId],
-    queryFn: () => api.messages.getThread(threadId!),
+    queryKey: ['thread', threadId, connectorId ?? 'all'],
+    queryFn: () => api.messages.getThread(threadId!, connectorId),
     enabled: !!threadId,
+    staleTime: 30_000,
   });
+
+  const updateMutation = useMutation({
+    mutationFn: (vars: { messageId: string; data: { delete?: boolean; isRead?: boolean; isStarred?: boolean } }) =>
+      api.messages.update(vars.messageId, { ...vars.data, scope: 'single' }),
+    onMutate: async (vars) => {
+      await Promise.all([
+        queryClient.cancelQueries({ queryKey: ['thread', threadId, connectorId ?? 'all'] }),
+        queryClient.cancelQueries({ queryKey: ['messages'] }),
+      ]);
+      const previousThread = queryClient.getQueryData<MessageRecord[]>(['thread', threadId, connectorId ?? 'all']);
+      const previousMessages = queryClient.getQueriesData<MessagesQueryResult>({ queryKey: ['messages'] });
+      queryClient.setQueryData<MessageRecord[]>(
+        ['thread', threadId, connectorId ?? 'all'],
+        (current) => applyThreadPatch(current, vars.messageId, vars.data),
+      );
+      for (const [key, data] of previousMessages) {
+        const queryKey = Array.isArray(key) ? key : [];
+        const removeFromStarredOnUnstar = isStarredFolderToken(queryKey[1]);
+        queryClient.setQueryData<MessagesQueryResult>(
+          key,
+          applyMessageListPatch(data, vars.messageId, vars.data, { removeFromStarredOnUnstar }),
+        );
+      }
+      return { previousThread, previousMessages };
+    },
+    onError: (_error, _vars, context) => {
+      if (context?.previousThread) {
+        queryClient.setQueryData(['thread', threadId, connectorId ?? 'all'], context.previousThread);
+      }
+      for (const [key, data] of context?.previousMessages ?? []) {
+        queryClient.setQueryData(key, data);
+      }
+    },
+    onSettled: () => {
+      queryClient.invalidateQueries({ queryKey: ['messages'] });
+      queryClient.invalidateQueries({ queryKey: ['thread', threadId, connectorId ?? 'all'] });
+    },
+  });
+
+  const firstMsg = messages?.[0];
+  const threadSubject = firstMsg?.subject || '(no subject)';
+  const threadConversationId = threadId || '';
+
+  const openReplyComposer = (mode: 'reply' | 'replyAll' | 'forward', message: MessageRecord | null) => {
+    if (!message) return;
+
+    const senderEmail = parseEmailFromHeader(message.fromHeader);
+    const cc = mode === 'replyAll'
+      ? Array.from(
+          new Set(
+            [...splitAddressHeader(message.toHeader), ...splitAddressHeader(message.ccHeader)]
+              .filter((entry) => entry.toLowerCase() !== senderEmail.toLowerCase()),
+          ),
+        ).join(', ')
+      : '';
+
+    setReplyContext({
+      open: true,
+      to: mode === 'forward' ? '' : senderEmail,
+      cc: mode === 'replyAll' ? cc : '',
+      bcc: '',
+      subject: makeReplySubject(message.subject, mode),
+      bodyText: makeInitialBodyText(message, mode),
+      inReplyTo: mode === 'forward' ? undefined : (normalizeMessageIdHeader(message.messageId) ?? undefined),
+      references: mode === 'forward' ? undefined : buildReplyReferences(message),
+    });
+  };
 
   if (isLoading) return (
     <div className="flex-1 flex items-center justify-center">
@@ -28,14 +248,28 @@ const ThreadView = () => {
           <ChevronLeft className="w-5 h-5" />
         </button>
         <h2 className="text-sm font-semibold truncate flex-1">
-          {messages?.[0]?.subject || '(no subject)'}
+          {threadSubject}
         </h2>
         <div className="flex items-center gap-1">
-          <button className="p-1.5 hover:bg-black/5 rounded-md text-text-secondary">
+          <button
+            onClick={() => firstMsg && updateMutation.mutate({ messageId: firstMsg.id, data: { isStarred: !firstMsg.isStarred } })}
+            className="p-1.5 hover:bg-black/5 rounded-md text-text-secondary"
+          >
             <Star className="w-4 h-4" />
           </button>
-          <button className="p-1.5 hover:bg-black/5 rounded-md text-text-secondary">
-            <MoreVertical className="w-4 h-4" />
+          <button
+            onClick={() => firstMsg && updateMutation.mutate({ messageId: firstMsg.id, data: { isRead: !firstMsg.isRead } })}
+            className="p-1.5 hover:bg-black/5 rounded-md text-text-secondary"
+            title={firstMsg?.isRead ? 'Mark as Unread' : 'Mark as Read'}
+          >
+            {firstMsg?.isRead ? <Mail className="w-4 h-4" /> : <MailOpen className="w-4 h-4" />}
+          </button>
+          <button
+            onClick={() => firstMsg && api.messages.downloadRaw(firstMsg.id)}
+            className="p-1.5 hover:bg-black/5 rounded-md text-text-secondary"
+            title="Download raw message"
+          >
+            <Download className="w-4 h-4" />
           </button>
         </div>
       </div>
@@ -44,7 +278,7 @@ const ThreadView = () => {
         <div className="max-w-4xl mx-auto space-y-6">
           <div className="mb-8">
             <h1 className="text-2xl font-bold text-text-primary tracking-tight">
-              {messages?.[0]?.subject || '(no subject)'}
+              {threadSubject}
             </h1>
           </div>
 
@@ -64,8 +298,26 @@ const ThreadView = () => {
                   <div className="text-[11px] text-text-secondary">
                     {msg.receivedAt && format(new Date(msg.receivedAt), 'MMM d, yyyy h:mm a')}
                   </div>
-                  <button className="p-1 hover:bg-black/5 rounded text-text-secondary">
+                  <button
+                    onClick={() => openReplyComposer('reply', msg)}
+                    className="p-1 hover:bg-black/5 rounded text-text-secondary"
+                    title="Reply"
+                  >
                     <Reply className="w-3.5 h-3.5" />
+                  </button>
+                  <button
+                    onClick={() => openReplyComposer('replyAll', msg)}
+                    className="p-1 hover:bg-black/5 rounded text-text-secondary"
+                    title="Reply all"
+                  >
+                    <ReplyAll className="w-3.5 h-3.5" />
+                  </button>
+                  <button
+                    onClick={() => openReplyComposer('forward', msg)}
+                    className="p-1 hover:bg-black/5 rounded text-text-secondary"
+                    title="Forward"
+                  >
+                    <Forward className="w-3.5 h-3.5" />
                   </button>
                 </div>
               </div>
@@ -80,13 +332,30 @@ const ThreadView = () => {
           ))}
 
           <div className="pt-8 flex justify-center">
-            <button className="flex items-center gap-2 px-6 py-2 border border-border rounded-full text-sm font-bold text-text-secondary hover:bg-sidebar hover:text-text-primary transition-all">
+            <button
+              onClick={() => openReplyComposer('reply', firstMsg || null)}
+              className="flex items-center gap-2 px-6 py-2 border border-border rounded-full text-sm font-bold text-text-secondary hover:bg-sidebar hover:text-text-primary transition-all"
+            >
               <CornerUpLeft className="w-4 h-4" />
               Reply to conversation
             </button>
           </div>
         </div>
       </div>
+
+      {replyContext?.open && (
+        <ComposeModal
+          onClose={() => setReplyContext(null)}
+          initialTo={replyContext.to}
+          initialCc={replyContext.cc}
+          initialBcc={replyContext.bcc}
+          initialSubject={replyContext.subject}
+          initialBodyText={replyContext.bodyText}
+          initialThreadId={threadConversationId}
+          initialInReplyTo={replyContext.inReplyTo}
+          initialReferences={replyContext.references}
+        />
+      )}
     </div>
   );
 };

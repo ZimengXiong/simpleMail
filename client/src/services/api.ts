@@ -4,47 +4,66 @@ import type {
   IdentityRecord,
   MessageRecord,
   MailboxInfo,
+  AttachmentRecord,
+  MailboxSyncState,
+  ConnectorSyncStatesResponse,
 } from '../types/index';
 
 const API_BASE = '/api';
 
-const getAuthHeaders = () => {
-  const headerToken = import.meta.env.VITE_BETTERMAIL_USER_TOKEN as string | undefined;
-  const adminToken = import.meta.env.VITE_BETTERMAIL_ADMIN_TOKEN as string | undefined;
-  const queryToken =
-    typeof window !== 'undefined'
-      ? new URLSearchParams(window.location.search).get('bettermail_token')
-      : null;
-  const storedToken =
-    typeof window !== 'undefined' ? localStorage.getItem('BETTERMAIL_USER_TOKEN') : null;
+const resolveToken = () => {
+  const envToken = (import.meta.env.VITE_BETTERMAIL_USER_TOKEN as string | undefined)?.trim();
+  return localStorage.getItem('BETTERMAIL_USER_TOKEN') ?? envToken ?? null;
+};
 
-  const authToken = (queryToken || headerToken || storedToken || '').trim();
-  const apiToken = (adminToken || '').trim();
+const getAuthToken = () => resolveToken();
 
-  if (queryToken && typeof window !== 'undefined') {
-    localStorage.setItem('BETTERMAIL_USER_TOKEN', queryToken);
+const parseDownloadFilename = (value: string | null) => {
+  if (!value) return null;
+  const utf8Match = value.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8Match?.[1]) {
+    try {
+      return decodeURIComponent(utf8Match[1]);
+    } catch {
+      return utf8Match[1];
+    }
   }
+  const plainMatch = value.match(/filename=\"?([^\";]+)\"?/i);
+  return plainMatch?.[1] ?? null;
+};
 
-  if (!authToken) {
-    return apiToken ? { 'x-api-key': apiToken } : {};
-  }
-
-  return {
-    Authorization: `Bearer ${authToken}`,
-    'x-user-token': authToken,
-    ...(apiToken ? { 'x-api-key': apiToken } : {}),
-  };
+const triggerBrowserDownload = (blob: Blob, filename: string) => {
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(url);
 };
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
+  const token = getAuthToken();
+  
+  const headers = new Headers(options?.headers);
+  if (options?.body) {
+    headers.set('Content-Type', 'application/json');
+  }
+  if (token) {
+    headers.set('Authorization', `Bearer ${token}`);
+  }
+
   const response = await fetch(`${API_BASE}${path}`, {
     ...options,
-    headers: {
-      'Content-Type': 'application/json',
-      ...getAuthHeaders(),
-      ...options?.headers,
-    },
+    headers,
   });
+
+  if (response.status === 401) {
+    localStorage.removeItem('BETTERMAIL_USER_TOKEN');
+    window.location.href = '/login';
+    throw new Error('Unauthorized');
+  }
 
   if (!response.ok) {
     const error = await response.json().catch(() => ({ error: 'Unknown error' }));
@@ -54,32 +73,165 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   return response.json();
 }
 
+async function requestBlob(path: string, options?: RequestInit): Promise<{ blob: Blob; filename: string | null }> {
+  const token = getAuthToken();
+  const headers = new Headers(options?.headers);
+  if (token) {
+    headers.set('Authorization', `Bearer ${token}`);
+  }
+
+  const response = await fetch(`${API_BASE}${path}`, {
+    ...options,
+    headers,
+  });
+
+  if (response.status === 401) {
+    localStorage.removeItem('BETTERMAIL_USER_TOKEN');
+    window.location.href = '/login';
+    throw new Error('Unauthorized');
+  }
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({ error: 'Unknown error' }));
+    throw new Error(error.error || response.statusText);
+  }
+
+  return {
+    blob: await response.blob(),
+    filename: parseDownloadFilename(response.headers.get('Content-Disposition')),
+  };
+}
+
 export const api = {
-  health: () => request<{ status: string }>('/health'),
+  auth: {
+    login: (token: string) => {
+      localStorage.setItem('BETTERMAIL_USER_TOKEN', token);
+    },
+    logout: () => {
+      localStorage.removeItem('BETTERMAIL_USER_TOKEN');
+      window.location.href = '/login';
+    },
+    isAuthenticated: () => !!getAuthToken(),
+  },
 
   connectors: {
+    getIncoming: (id: string) => request<IncomingConnectorRecord>(`/connectors/incoming/${id}`),
     listIncoming: () => request<IncomingConnectorRecord[]>('/connectors/incoming'),
+    updateIncoming: (id: string, data: any) => request<IncomingConnectorRecord>(`/connectors/incoming/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(data),
+    }),
     listOutgoing: () => request<OutgoingConnectorRecord[]>('/connectors/outgoing'),
+    getOutgoing: (id: string) => request<OutgoingConnectorRecord>(`/connectors/outgoing/${id}`),
     createIncoming: (data: any) => request<IncomingConnectorRecord>('/connectors/incoming', { method: 'POST', body: JSON.stringify(data) }),
     createOutgoing: (data: any) => request<OutgoingConnectorRecord>('/connectors/outgoing', { method: 'POST', body: JSON.stringify(data) }),
+    updateOutgoing: (id: string, data: any) => request<OutgoingConnectorRecord>(`/connectors/outgoing/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(data),
+    }),
+    deleteIncoming: (id: string) => request(`/connectors/incoming/${id}`, { method: 'DELETE' }),
+    deleteOutgoing: (id: string) => request(`/connectors/outgoing/${id}`, { method: 'DELETE' }),
+    testOutgoing: (id: string) => request<{ status: string; id: string }>(`/connectors/outgoing/${id}/test`, { method: 'POST' }),
     getMailboxes: (connectorId: string) => request<MailboxInfo[]>(`/connectors/${connectorId}/mailboxes`),
   },
 
   identities: {
+    get: (id: string) => request<IdentityRecord>(`/identities/${id}`),
     list: () => request<IdentityRecord[]>('/identities'),
     create: (data: any) => request<IdentityRecord>('/identities', { method: 'POST', body: JSON.stringify(data) }),
+    update: (id: string, data: any) => request<IdentityRecord>(`/identities/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
+    delete: (id: string) => request(`/identities/${id}`, { method: 'DELETE' }),
+  },
+
+  rules: {
+    list: () => request<any[]>('/rules'),
+    create: (data: any) => request<any>('/rules', { method: 'POST', body: JSON.stringify(data) }),
+    delete: (id: string) => request(`/rules/${id}`, { method: 'DELETE' }),
+    runAll: () => request<{ status: string }>('/rules/run', { method: 'POST' }),
+  },
+
+  labels: {
+    list: () => request<any[]>('/labels'),
+    create: (name: string, key?: string) => request<any>('/labels', { method: 'POST', body: JSON.stringify({ name, key }) }),
+    delete: (id: string) => request(`/labels/${id}`, { method: 'DELETE' }),
+    addToMessage: (messageId: string, labelKeys: string[]) => 
+      request(`/messages/${messageId}/labels`, { method: 'POST', body: JSON.stringify({ addLabelKeys: labelKeys }) }),
+    removeFromMessage: (messageId: string, labelKeys: string[]) => 
+      request(`/messages/${messageId}/labels`, { method: 'POST', body: JSON.stringify({ removeLabelKeys: labelKeys }) }),
+  },
+
+  savedSearches: {
+    list: () => request<any[]>('/saved-searches'),
+    create: (data: { name: string, queryText: string }) => request<any>('/saved-searches', { method: 'POST', body: JSON.stringify(data) }),
+    delete: (id: string) => request(`/saved-searches/${id}`, { method: 'DELETE' }),
+  },
+
+  search: {
+    quickFilters: () => request<any>('/search/quick-filters'),
+    suggestions: (q: string) => request<any>(`/search/suggestions?q=${encodeURIComponent(q)}`),
   },
 
   messages: {
-    list: (params?: { folder?: string; limit?: number }) => {
+    list: (params?: { folder?: string; connectorId?: string; limit?: number; offset?: number }) => {
       const query = new URLSearchParams();
       if (params?.folder) query.append('folder', params.folder);
+      if (params?.connectorId) query.append('connectorId', params.connectorId);
       if (params?.limit) query.append('limit', String(params.limit));
-      return request<MessageRecord[]>(`/messages?${query.toString()}`);
+      if (typeof params?.offset === 'number') query.append('offset', String(params.offset));
+      return request<{ messages: MessageRecord[]; totalCount: number }>(`/messages?${query.toString()}`);
     },
-    getThread: (threadId: string) => request<MessageRecord[]>(`/messages/thread/${threadId}`),
-    search: (q: string, limit = 50) => request<MessageRecord[]>('/messages/search', { method: 'POST', body: JSON.stringify({ q, limit }) }),
-    send: (data: any) => request<{ status: string }>('/messages/send', { method: 'POST', body: JSON.stringify(data) }),
+    listSendOnly: (params: { emailAddress: string; folder?: string; q?: string; limit?: number; offset?: number }) => {
+      const query = new URLSearchParams();
+      query.append('emailAddress', params.emailAddress);
+      if (params.folder) query.append('folder', params.folder);
+      if (params.q) query.append('q', params.q);
+      if (params.limit) query.append('limit', String(params.limit));
+      if (typeof params.offset === 'number') query.append('offset', String(params.offset));
+      return request<{ messages: MessageRecord[]; totalCount: number }>(`/messages/send-only?${query.toString()}`);
+    },
+    getThread: (threadId: string, connectorId?: string) => {
+      const query = connectorId
+        ? `?connectorId=${encodeURIComponent(connectorId)}`
+        : '';
+      return request<MessageRecord[]>(`/messages/thread/${threadId}${query}`);
+    },
+    getLabels: (messageId: string) => request<any[]>(`/messages/${messageId}/labels`),
+    update: (messageId: string, data: { isRead?: boolean, isStarred?: boolean, moveToFolder?: string, delete?: boolean, scope?: 'single' | 'thread' }) =>
+      request<any>(`/messages/${messageId}`, { method: 'PATCH', body: JSON.stringify(data) }),
+    bulkUpdate: (messageIds: string[], data: { isRead?: boolean, isStarred?: boolean, moveToFolder?: string, delete?: boolean, scope?: 'single' | 'thread' }) =>
+      request<{ results: { id: string; status: string }[] }>('/messages/bulk', {
+        method: 'POST',
+        body: JSON.stringify({ messageIds, ...data }),
+      }),
+    getRawUrl: (messageId: string) => {
+      const token = getAuthToken();
+      if (!token) {
+        return `/api/messages/${messageId}/raw`;
+      }
+      return `/api/messages/${messageId}/raw?token=${encodeURIComponent(token)}`;
+    },
+    downloadRaw: async (messageId: string) => {
+      const { blob, filename } = await requestBlob(`/messages/${messageId}/raw`);
+      triggerBrowserDownload(blob, filename ?? `${messageId}.eml`);
+    },
+    search: (params: { q: string; folder?: string; connectorId?: string; limit?: number; offset?: number }) => {
+      return request<{ messages: MessageRecord[]; totalCount: number }>('/messages/search', { 
+        method: 'POST', 
+        body: JSON.stringify(params) 
+      });
+    },
+    send: (data: any, idempotencyKey: string) => {
+      return request<{ status: string; sendId: string }>('/messages/send', { 
+        method: 'POST', 
+        headers: { 'Idempotency-Key': idempotencyKey },
+        body: JSON.stringify(data) 
+      });
+    },
+    getAttachments: (messageId: string) => request<AttachmentRecord[]>(`/messages/${messageId}/attachments`),
+    triggerScan: (messageId: string, attachmentId: string) => 
+      request(`/attachments/scan`, { 
+        method: 'POST', 
+        body: JSON.stringify({ messageId, attachmentId }) 
+      }),
   },
 
   oauth: {
@@ -90,6 +242,60 @@ export const api = {
   },
 
   sync: {
-    trigger: (connectorId: string, mailbox = 'INBOX') => request<{ status: string }>(`/sync/${connectorId}`, { method: 'POST', body: JSON.stringify({ mailbox }) }),
+    trigger: (connectorId: string, mailbox = 'INBOX', useQueue = false, syncAll = false) => 
+      request(`/sync/${connectorId}`, { 
+        method: 'POST', 
+        body: JSON.stringify({ mailbox, useQueue, syncAll }) 
+      }),
+    cancel: (connectorId: string, mailbox = 'INBOX') =>
+      request(`/sync/${connectorId}/cancel`, {
+        method: 'POST',
+        body: JSON.stringify({ mailbox }),
+      }),
+    watch: (connectorId: string, mailbox = 'INBOX') => 
+      request(`/sync/${connectorId}/watch`, { method: 'POST', body: JSON.stringify({ mailbox }) }),
+    stopWatch: (connectorId: string, mailbox = 'INBOX') => 
+      request(`/sync/${connectorId}/watch/stop`, { method: 'POST', body: JSON.stringify({ mailbox }) }),
+    setGmailPush: (connectorId: string, enabled: boolean) =>
+      request(`/sync/${connectorId}/gmail-push`, {
+        method: 'POST',
+        body: JSON.stringify({ enabled }),
+      }),
+    setActiveMailbox: (connectorId: string, mailbox: string) =>
+      request('/sync/active-mailbox', {
+        method: 'POST',
+        body: JSON.stringify({ connectorId, mailbox }),
+      }),
+    getState: (connectorId: string, mailbox = 'INBOX') => {
+      const query = new URLSearchParams({ mailbox });
+      return request<MailboxSyncState>(`/connectors/${connectorId}/sync-state?${query.toString()}`);
+    },
+    getStates: (connectorId: string) =>
+      request<ConnectorSyncStatesResponse>(`/connectors/${connectorId}/sync-states`),
   },
+
+  events: {
+    list: (since = 0, limit = 50) => request<any[]>(`/events?since=${since}&limit=${limit}`),
+  },
+
+  attachments: {
+    getDownloadUrl: (attachmentId: string) => {
+      const token = getAuthToken();
+      if (!token) {
+        return `/api/attachments/${attachmentId}/download`;
+      }
+      return `/api/attachments/${attachmentId}/download?token=${encodeURIComponent(token)}`;
+    },
+    getPreviewUrl: (attachmentId: string) => {
+      const token = getAuthToken();
+      if (!token) {
+        return `/api/attachments/${attachmentId}/view`;
+      }
+      return `/api/attachments/${attachmentId}/view?token=${encodeURIComponent(token)}`;
+    },
+    download: async (attachmentId: string, fallbackFilename = 'attachment') => {
+      const { blob, filename } = await requestBlob(`/attachments/${attachmentId}/download`);
+      triggerBrowserDownload(blob, filename ?? fallbackFilename);
+    },
+  }
 };

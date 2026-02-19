@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { query } from '../db/pool.js';
+import { pool, query } from '../db/pool.js';
 import type { IncomingConnectorRecord, OutgoingConnectorRecord, IdentityRecord } from '../shared/types.js';
 
 const toJson = (value: any) => JSON.stringify(value ?? {});
@@ -27,7 +27,9 @@ const ensureIncomingConnectorOwner = async (userId: string, incomingConnectorId:
 export const listIncomingConnectors = async (userId: string): Promise<IncomingConnectorRecord[]> => {
   const result = await query<any>(
     `SELECT id, user_id, name, email_address as "emailAddress", provider, host, port, tls,
-            auth_config as "authConfig", sync_settings as "syncSettings", status, created_at as "createdAt", updated_at as "updatedAt"
+            auth_config as "authConfig", sync_settings as "syncSettings", status,
+            visual_config as "visual_config",
+            created_at as "createdAt", updated_at as "updatedAt"
        FROM incoming_connectors
       WHERE user_id = $1
       ORDER BY created_at DESC`,
@@ -67,6 +69,7 @@ export const updateIncomingConnector = async (
     tls?: boolean;
     authConfig?: Record<string, any> | null;
     syncSettings?: Record<string, any> | null;
+    visual_config?: Record<string, any> | null;
     status?: string;
   },
 ) => {
@@ -101,6 +104,10 @@ export const updateIncomingConnector = async (
     values.push(toJson(payload.syncSettings));
     setClauses.push(`sync_settings = $${values.length}::jsonb`);
   }
+  if (payload.visual_config !== undefined) {
+    values.push(toJson(payload.visual_config));
+    setClauses.push(`visual_config = $${values.length}::jsonb`);
+  }
   if (payload.status !== undefined) {
     values.push(payload.status);
     setClauses.push(`status = $${values.length}`);
@@ -130,13 +137,14 @@ export const createIncomingConnector = async (
     authType: string;
     authConfig?: any;
     syncSettings?: any;
+    visual_config?: any;
   },
 ) => {
   const id = randomUUID();
   const result = await query<{ id: string }>(
     `INSERT INTO incoming_connectors
-      (id, user_id, name, email_address, provider, host, port, tls, auth_config, sync_settings)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb)
+      (id, user_id, name, email_address, provider, host, port, tls, auth_config, sync_settings, visual_config)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb, $11::jsonb)
      RETURNING id`,
     [
       id,
@@ -149,6 +157,7 @@ export const createIncomingConnector = async (
       payload.tls ?? true,
       toJson({ authType: payload.authType, ...(payload.authConfig ?? {}) }),
       toJson(payload.syncSettings ?? {}),
+      toJson(payload.visual_config ?? {}),
     ],
   );
 
@@ -190,7 +199,36 @@ export const getOutgoingConnectorById = async (id: string): Promise<any | null> 
 };
 
 export const deleteOutgoingConnector = async (userId: string, id: string): Promise<void> => {
-  await query('DELETE FROM outgoing_connectors WHERE id = $1 AND user_id = $2', [id, userId]);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      `DELETE FROM send_idempotency si
+        USING identities i
+       WHERE si.identity_id = i.id
+         AND i.user_id = $1
+         AND i.outgoing_connector_id = $2`,
+      [userId, id],
+    );
+    await client.query(
+      `DELETE FROM identities
+        WHERE user_id = $1
+          AND outgoing_connector_id = $2`,
+      [userId, id],
+    );
+    await client.query(
+      `DELETE FROM outgoing_connectors
+        WHERE id = $1
+          AND user_id = $2`,
+      [id, userId],
+    );
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
 };
 
 export const updateOutgoingConnector = async (
@@ -312,6 +350,7 @@ export const createIdentity = async (
   signature?: string | null,
   sentToIncomingConnectorId?: string | null,
   replyTo?: string | null,
+  visual_config?: any,
 ) => {
   await ensureIdentityOwner(userId, outgoingConnectorId);
   if (sentToIncomingConnectorId) {
@@ -321,8 +360,8 @@ export const createIdentity = async (
   const id = randomUUID();
   const result = await query<{ id: string }>(
     `INSERT INTO identities
-      (id, user_id, display_name, email_address, signature, outgoing_connector_id, sent_to_incoming_connector_id, reply_to)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+      (id, user_id, display_name, email_address, signature, outgoing_connector_id, sent_to_incoming_connector_id, reply_to, visual_config)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb)
       RETURNING id`,
     [
       id,
@@ -333,6 +372,7 @@ export const createIdentity = async (
       outgoingConnectorId,
       sentToIncomingConnectorId ?? null,
       replyTo ?? null,
+      toJson(visual_config ?? {}),
     ],
   );
 
@@ -342,7 +382,8 @@ export const createIdentity = async (
 export const listIdentities = async (userId: string): Promise<IdentityRecord[]> => {
   const result = await query<any>(
     `SELECT id, user_id as "userId", display_name as "displayName", email_address as "emailAddress", signature,
-            outgoing_connector_id as "outgoingConnectorId", sent_to_incoming_connector_id as "sentToIncomingConnectorId", reply_to as "replyTo"
+            outgoing_connector_id as "outgoingConnectorId", sent_to_incoming_connector_id as "sentToIncomingConnectorId",
+            reply_to as "replyTo", visual_config as "visual_config"
        FROM identities
       WHERE user_id = $1
       ORDER BY created_at DESC`,
@@ -385,6 +426,7 @@ export const updateIdentity = async (
     outgoingConnectorId?: string | null;
     sentToIncomingConnectorId?: string | null;
     replyTo?: string | null;
+    visual_config?: Record<string, any> | null;
   },
 ) => {
   await ensureIdentityOwnership(userId, identityId);
@@ -423,6 +465,10 @@ export const updateIdentity = async (
   if (payload.replyTo !== undefined) {
     values.push(payload.replyTo);
     updates.push(`reply_to = $${values.length}`);
+  }
+  if (payload.visual_config !== undefined) {
+    values.push(toJson(payload.visual_config));
+    updates.push(`visual_config = $${values.length}::jsonb`);
   }
 
   updates.push('updated_at = NOW()');

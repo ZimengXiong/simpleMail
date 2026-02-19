@@ -3,7 +3,12 @@ import { env } from '../config/env.js';
 
 const connectionString = env.databaseUrl;
 
-export const pool = new Pool({ connectionString });
+export const pool = new Pool({
+  connectionString,
+  max: 25,
+  idleTimeoutMillis: 30_000,
+  connectionTimeoutMillis: 5_000,
+});
 
 import type { QueryResultRow } from 'pg';
 

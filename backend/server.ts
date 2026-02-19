@@ -3,7 +3,8 @@ import { env } from './src/config/env.js';
 import { registerRoutes } from './src/routes/index.js';
 import type { FastifyError, FastifyReply, FastifyRequest } from 'fastify';
 import type { ResolvedUser } from './src/services/user.js';
-import { getUserByToken } from './src/services/user.js';
+import { createUser, getUserByToken } from './src/services/user.js';
+import { resumeConfiguredIdleWatches } from './src/services/imap.js';
 
 type AuthenticatedRequest = FastifyRequest & { user: ResolvedUser | null };
 
@@ -17,6 +18,7 @@ if (env.nodeEnv === 'production' && !env.apiAdminToken) {
 
 const isPublicRoute = (url: string) =>
   url === '/api/health' ||
+  url.startsWith(env.gmailPush.webhookPath) ||
   url.startsWith('/api/oauth/google/callback');
 
 const isAdminRoute = (url: string) =>
@@ -29,7 +31,70 @@ const extractUserToken = (request: FastifyRequest) => {
   }
 
   const userToken = request.headers['x-user-token'];
-  return Array.isArray(userToken) ? userToken[0] : userToken;
+  const headerToken = Array.isArray(userToken) ? userToken[0] : userToken;
+  if (headerToken) {
+    return headerToken;
+  }
+
+  const rawUrl = request.raw.url ?? request.url;
+  const queryIndex = rawUrl.indexOf('?');
+  if (queryIndex >= 0) {
+    const search = rawUrl.slice(queryIndex + 1);
+    const params = new URLSearchParams(search);
+    const queryToken = params.get('token') || params.get('userToken');
+    if (queryToken) {
+      return queryToken;
+    }
+  }
+
+  return undefined;
+};
+
+const bootstrapDevUser = async () => {
+  if (env.nodeEnv !== 'development' || !env.bootstrapDevUser) {
+    return;
+  }
+
+  if (!env.devUserToken) {
+    return;
+  }
+
+  const user = await createUser({
+    email: env.devUserEmail,
+    name: env.devUserName,
+    token: env.devUserToken,
+  });
+
+  if (user?.token) {
+    console.log(`Bootstrapped dev user ${user.email} with prefix ${user.tokenPrefix}`);
+  }
+};
+
+const ensureBootstrapDevUser = async (userToken: string) => {
+  if (env.nodeEnv !== 'development' || !env.bootstrapDevUser || !env.devUserToken) {
+    return null;
+  }
+
+  if (userToken !== env.devUserToken) {
+    return null;
+  }
+
+  const user = await createUser({
+    email: env.devUserEmail,
+    name: env.devUserName,
+    token: env.devUserToken,
+  });
+
+  if (user?.token) {
+    console.log(`Recreated missing dev user ${user.email} with prefix ${user.tokenPrefix}`);
+  }
+
+  return {
+    id: user.id,
+    email: user.email,
+    name: user.name,
+    tokenPrefix: user.tokenPrefix,
+  };
 };
 
 server.addHook('onRequest', async (request, reply) => {
@@ -59,7 +124,7 @@ server.addHook('onRequest', async (request, reply) => {
     return reply.code(401).send({ error: 'missing user token' });
   }
 
-  const user = await getUserByToken(userToken);
+  const user = (await getUserByToken(userToken)) ?? (await ensureBootstrapDevUser(userToken));
   if (!user) {
     return reply.code(401).send({ error: 'invalid user token' });
   }
@@ -76,6 +141,10 @@ server.setErrorHandler((error, request: FastifyRequest, reply: FastifyReply) => 
 });
 
 await registerRoutes(server);
+await bootstrapDevUser();
+void resumeConfiguredIdleWatches().catch((error) => {
+  server.log.warn({ error }, 'failed to resume idle watchers');
+});
 
 const stop = async () => {
   await server.close();

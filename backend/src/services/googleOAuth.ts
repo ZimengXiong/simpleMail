@@ -6,6 +6,7 @@ import { updateIncomingConnectorAuth, updateOutgoingConnectorAuth } from './conn
 
 const GOOGLE_SCOPES = [
   'https://www.googleapis.com/auth/gmail.readonly',
+  'https://mail.google.com/',
   'https://www.googleapis.com/auth/gmail.send',
   'https://www.googleapis.com/auth/userinfo.email',
 ];
@@ -89,6 +90,19 @@ const toTimestamp = (value?: string | null): number | undefined => {
   }
 
   return parsed;
+};
+
+export const isGoogleTokenExpiringSoon = (authConfig: Record<string, any>, windowMs = 5 * 60 * 1000): boolean => {
+  if (authConfig.authType !== 'oauth2' || !authConfig.tokenExpiresAt) {
+    return false;
+  }
+
+  const expiry = toTimestamp(authConfig.tokenExpiresAt);
+  if (!expiry) {
+    return false;
+  }
+
+  return expiry - Date.now() <= windowMs;
 };
 
 const isExpired = (value?: string | null): boolean => {

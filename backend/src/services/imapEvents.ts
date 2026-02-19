@@ -32,7 +32,7 @@ export const emitSyncEvent = async (
 
 export const listSyncEvents = async (userId: string, since = 0, limit = 100) => {
   const result = await query<any>(
-    `SELECT id, incoming_connector_id as "incomingConnectorId", event_type as "eventType", payload, created_at as "createdAt"
+    `SELECT se.id, se.incoming_connector_id as "incomingConnectorId", se.event_type as "eventType", se.payload, se.created_at as "createdAt"
      FROM sync_events se
      INNER JOIN incoming_connectors ic ON ic.id = se.incoming_connector_id
      WHERE se.id > $1 AND ic.user_id = $2

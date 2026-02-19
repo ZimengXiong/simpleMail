@@ -1,10 +1,21 @@
 import { query } from '../db/pool.js';
-import { moveMessageInMailbox, setMessageReadState, setMessageStarredState } from './imap.js';
+import {
+  applyThreadMessageActions,
+  moveMessageInMailbox,
+  deleteMessageFromMailbox,
+  setMessageReadState,
+  setMessageStarredState,
+} from './imap.js';
+import { addLabelsToMessageByKey, removeLabelsFromMessageByKey } from './labels.js';
 
 export interface RuleMatch {
   fromContains?: string;
   toContains?: string;
   subjectContains?: string;
+  isUnread?: boolean;
+  isStarred?: boolean;
+  hasLabel?: string[];
+  notHasLabel?: string[];
   hasAttachment?: boolean;
   listIdContains?: string;
 }
@@ -12,8 +23,12 @@ export interface RuleMatch {
 export interface RuleAction {
   markRead?: boolean;
   star?: boolean;
+  addLabelKeys?: string[];
+  removeLabelKeys?: string[];
   markUnread?: boolean;
   moveToFolder?: string;
+  applyToThread?: boolean;
+  delete?: boolean;
   notify?: {
     title?: string;
     body?: string;
@@ -35,6 +50,8 @@ const matchRule = async (rule: Rule, message: {
   toHeader: string | null;
   subject: string | null;
   messageId: string | null;
+  isRead: boolean;
+  isStarred: boolean;
   rawHeaders?: Record<string, any> | null;
   incomingConnectorId?: string;
   folderPath?: string;
@@ -65,6 +82,38 @@ const matchRule = async (rule: Rule, message: {
     }
   }
 
+  if (typeof conditions.isUnread === 'boolean') {
+    if (conditions.isUnread && message.isRead) {
+      return false;
+    }
+    if (!conditions.isUnread && !message.isRead) {
+      return false;
+    }
+  }
+
+  if (typeof conditions.isStarred === 'boolean' && message.isStarred !== conditions.isStarred) {
+    return false;
+  }
+
+  const hasLabels = message.rawHeaders?.labels ?? null;
+  const hasLabelList = Array.isArray(conditions.hasLabel) ? conditions.hasLabel : [];
+  if (hasLabelList.length > 0) {
+    for (const label of hasLabelList) {
+      if (!hasLabels?.includes?.(label)) {
+        return false;
+      }
+    }
+  }
+
+  const notHasLabelList = Array.isArray(conditions.notHasLabel) ? conditions.notHasLabel : [];
+  if (notHasLabelList.length > 0) {
+    for (const label of notHasLabelList) {
+      if (hasLabels?.includes?.(label)) {
+        return false;
+      }
+    }
+  }
+
   return true;
 };
 
@@ -75,14 +124,20 @@ export const evaluateRules = async (
     id: string;
     incomingConnectorId?: string;
     folderPath?: string;
-    uid?: number;
+    uid?: number | null;
     fromHeader: string | null;
     toHeader: string | null;
     subject: string | null;
+    isRead?: boolean;
+    isStarred?: boolean;
     rawHeaders: Record<string, any> | null;
   },
   attachmentCount: number,
+  ruleId?: string,
 ) => {
+  const filterClause = ruleId ? ' AND id = $2' : '';
+  const values = ruleId ? [userId, ruleId] : [userId];
+
   const result = await query<{
     id: string;
     name: string;
@@ -95,10 +150,12 @@ export const evaluateRules = async (
      WHERE is_active = true
        AND user_id = $1
        AND matching_scope = 'incoming'
+       ${filterClause}
      ORDER BY execution_order, created_at`,
-    [userId],
+    values,
   );
 
+  let matched = 0;
   for (const row of result.rows) {
     const rule: Rule = {
       id: row.id,
@@ -108,26 +165,66 @@ export const evaluateRules = async (
       actions: row.actions as RuleAction,
     };
 
-    const matches = await matchRule(rule, {
-      fromHeader: messageRow.fromHeader,
-      toHeader: messageRow.toHeader,
-      subject: messageRow.subject,
+    const labelRows = await query<{ key: string }>(
+      `SELECT l.key
+         FROM message_labels ml
+         INNER JOIN labels l ON l.id = ml.label_id
+        WHERE ml.message_id = $1`,
+      [messageRow.id],
+    );
+
+    const messageForEvaluation = {
       messageId: messageRow.id,
       incomingConnectorId: messageRow.incomingConnectorId,
       folderPath: messageRow.folderPath,
       uid: messageRow.uid,
-      rawHeaders: messageRow.rawHeaders,
-    }, attachmentCount);
+      fromHeader: messageRow.fromHeader,
+      toHeader: messageRow.toHeader,
+      subject: messageRow.subject,
+      isRead: messageRow.isRead ?? true,
+      isStarred: messageRow.isStarred ?? false,
+      rawHeaders: {
+        ...(messageRow.rawHeaders ?? {}),
+        labels: labelRows.rows.map((item) => item.key),
+      },
+    };
+
+    const matches = await matchRule(rule, messageForEvaluation, attachmentCount);
 
     if (!matches) {
       continue;
     }
-    const connectorId = messageRow.incomingConnectorId;
+    matched += 1;
+    const connectorId = messageForEvaluation.incomingConnectorId;
     const hasImapContext = Boolean(
-      connectorId && messageRow.folderPath && messageRow.uid !== undefined && messageRow.uid !== null,
+      connectorId && messageForEvaluation.folderPath && messageForEvaluation.uid !== undefined && messageForEvaluation.uid !== null,
     );
-    const folderPath = messageRow.folderPath as string | undefined;
-    const uid = messageRow.uid as number | null | undefined;
+    const folderPath = messageForEvaluation.folderPath as string | undefined;
+    const uid = messageForEvaluation.uid as number | null | undefined;
+
+    if (rule.actions.applyToThread) {
+      await applyThreadMessageActions(userId, messageRow.id, {
+        isRead: rule.actions.markRead ? true : rule.actions.markUnread ? false : undefined,
+        isStarred: rule.actions.star ? true : undefined,
+        moveToFolder: rule.actions.moveToFolder,
+        delete: Boolean(rule.actions.delete),
+        addLabelKeys: rule.actions.addLabelKeys,
+        removeLabelKeys: rule.actions.removeLabelKeys,
+      });
+      if (rule.actions.notify) {
+        await query(
+          `INSERT INTO sync_events (incoming_connector_id, event_type, payload)
+           VALUES ($1, 'rule_triggered', $2::jsonb)`,
+          [incomingConnectorId, JSON.stringify({
+            messageId: messageRow.id,
+            ruleId: rule.id,
+            title: rule.actions.notify.title ?? rule.name,
+            body: rule.actions.notify.body ?? 'Rule matched',
+          })],
+        );
+      }
+      continue;
+    }
 
     if (rule.actions.markRead) {
       if (hasImapContext && connectorId && folderPath && uid !== undefined && uid !== null) {
@@ -171,6 +268,22 @@ export const evaluateRules = async (
       }
     }
 
+    if (rule.actions.addLabelKeys?.length) {
+      await addLabelsToMessageByKey(
+        userId,
+        messageRow.id,
+        rule.actions.addLabelKeys,
+      );
+    }
+
+    if (rule.actions.removeLabelKeys?.length) {
+      await removeLabelsFromMessageByKey(
+        userId,
+        messageRow.id,
+        rule.actions.removeLabelKeys,
+      );
+    }
+
     if (rule.actions.moveToFolder) {
       if (hasImapContext && connectorId && folderPath && uid !== undefined && uid !== null) {
         await moveMessageInMailbox(
@@ -192,6 +305,23 @@ export const evaluateRules = async (
       }
     }
 
+    if (rule.actions.delete) {
+      if (hasImapContext && connectorId && folderPath && uid !== undefined && uid !== null) {
+        await deleteMessageFromMailbox(
+          userId,
+          messageRow.id,
+          connectorId,
+          folderPath,
+          uid,
+        );
+      } else {
+        await query(
+          'DELETE FROM messages WHERE id = $1',
+          [messageRow.id],
+        );
+      }
+    }
+
     if (rule.actions.notify) {
       await query(
         `INSERT INTO sync_events (incoming_connector_id, event_type, payload)
@@ -205,6 +335,123 @@ export const evaluateRules = async (
       );
     }
   }
+
+  return matched;
+};
+
+export const runRulesAgainstMessages = async (
+  userId: string,
+  options?: {
+    ruleId?: string;
+    incomingConnectorId?: string;
+    limit?: number;
+    offset?: number;
+  },
+) => {
+  const payload = options ?? {};
+  const requestedLimit = payload.limit ?? 300;
+  const requestedOffset = payload.offset ?? 0;
+  const batchLimit = Number.isFinite(requestedLimit) && requestedLimit > 0 ? Math.floor(requestedLimit) : 300;
+  let offset = Number.isFinite(requestedOffset) && requestedOffset >= 0 ? Math.floor(requestedOffset) : 0;
+  let processed = 0;
+  let matched = 0;
+
+  const whereClauses = ['ic.user_id = $1'];
+  const values: any[] = [userId];
+  if (payload.incomingConnectorId) {
+    values.push(payload.incomingConnectorId);
+    whereClauses.push(`ic.id = $${values.length}`);
+  }
+  if (payload.ruleId && !(await query<{ id: string }>(`
+    SELECT id
+      FROM rules
+     WHERE id = $2
+       AND user_id = $1
+       AND is_active = true
+  `, [userId, payload.ruleId])).rows.length) {
+    throw new Error('Rule not found');
+  }
+
+  while (true) {
+    const messages = await query<{
+      id: string;
+      incoming_connector_id: string;
+      folder_path: string | null;
+      uid: number | null;
+      from_header: string | null;
+      to_header: string | null;
+      subject: string | null;
+      is_read: boolean;
+      is_starred: boolean;
+      raw_headers: Record<string, any> | null;
+    }>(
+      `SELECT m.id, m.incoming_connector_id, m.folder_path, m.uid, m.from_header, m.to_header, m.subject, m.is_read, m.is_starred, m.raw_headers
+         FROM messages m
+         INNER JOIN incoming_connectors ic ON ic.id = m.incoming_connector_id
+        WHERE ${whereClauses.join(' AND ')}
+        ORDER BY m.received_at DESC
+        LIMIT $${values.length + 1} OFFSET $${values.length + 2}`,
+      [...values, batchLimit, offset],
+    );
+
+    if (messages.rows.length === 0) {
+      break;
+    }
+
+    for (const message of messages.rows) {
+      const labelsResult = await query<{ key: string }>(
+        `SELECT l.key
+           FROM message_labels ml
+           INNER JOIN labels l ON l.id = ml.label_id
+          WHERE ml.message_id = $1`,
+        [message.id],
+      );
+
+      const attachmentResult = await query<{ count: number }>(
+        `SELECT COUNT(*)::int as count FROM attachments WHERE message_id = $1`,
+        [message.id],
+      );
+
+      const attachmentCount = Number(attachmentResult.rows[0]?.count ?? 0);
+
+      const messageForEvaluation = {
+        id: message.id,
+        incomingConnectorId: message.incoming_connector_id,
+        folderPath: message.folder_path ?? undefined,
+        uid: message.uid ?? null,
+        fromHeader: message.from_header,
+        toHeader: message.to_header,
+        subject: message.subject,
+        isRead: message.is_read,
+        isStarred: message.is_starred,
+        rawHeaders: {
+          ...(message.raw_headers ?? {}),
+          labels: labelsResult.rows.map((item) => item.key),
+        },
+      };
+
+      const matchedForMessage = await evaluateRules(
+        userId,
+        message.incoming_connector_id,
+        messageForEvaluation,
+        attachmentCount,
+        payload.ruleId,
+      );
+
+      if (matchedForMessage > 0) {
+        matched += matchedForMessage;
+      }
+
+      processed += 1;
+    }
+
+    if (messages.rows.length < batchLimit) {
+      break;
+    }
+    offset += batchLimit;
+  }
+
+  return { processed, matched };
 };
 
 export const createRule = async (

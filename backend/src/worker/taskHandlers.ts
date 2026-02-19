@@ -1,9 +1,10 @@
-import { syncIncomingConnector } from '../services/imap.js';
+import { hydrateGmailMailboxContentBatch, syncIncomingConnector } from '../services/imap.js';
 import { sendThroughConnector } from '../services/smtp.js';
 import { query } from '../db/pool.js';
 import { scanBuffer } from '../services/clamav.js';
 import { blobStore } from '../storage/seaweedS3BlobStore.js';
 import { getAttachmentScanDecision } from '../services/scanPolicy.js';
+import { enqueueGmailHydration } from '../services/queue.js';
 import {
   acquireSendClaim,
   finalizeSendFailure,
@@ -15,11 +16,32 @@ export interface SyncIncomingTaskPayload {
   userId: string;
   connectorId: string;
   mailbox?: string;
+  gmailHistoryIdHint?: string | null;
 }
 
 export const syncIncomingConnectorTask = async (payload: SyncIncomingTaskPayload) => {
   const mailbox = payload.mailbox ?? 'INBOX';
-  await syncIncomingConnector(payload.userId, payload.connectorId, mailbox);
+  await syncIncomingConnector(payload.userId, payload.connectorId, mailbox, {
+    gmailHistoryIdHint: payload.gmailHistoryIdHint ?? null,
+  });
+};
+
+export interface GmailHydrationTaskPayload {
+  userId: string;
+  connectorId: string;
+  mailbox: string;
+}
+
+export const hydrateGmailMailboxContentTask = async (payload: GmailHydrationTaskPayload) => {
+  const result = await hydrateGmailMailboxContentBatch(
+    payload.userId,
+    payload.connectorId,
+    payload.mailbox,
+  );
+  if (result.remaining > 0) {
+    await enqueueGmailHydration(payload.userId, payload.connectorId, payload.mailbox);
+  }
+  return result;
 };
 
 export interface SendTaskPayload {
@@ -32,6 +54,9 @@ export interface SendTaskPayload {
   subject: string;
   bodyText?: string;
   bodyHtml?: string;
+  threadId?: string;
+  inReplyTo?: string;
+  references?: string;
   attachments?: Array<{ filename: string; contentType: string; contentBase64: string; inline?: boolean; contentId?: string }>;
 }
 
@@ -66,7 +91,7 @@ export const sendEmailTask = async (payload: SendTaskPayload) => {
   if (lease.status === 'succeeded') {
     return lease.result || { accepted: true };
   }
-  if (lease.status === 'processing') {
+  if (!lease.leaseAcquired) {
     return { status: 'in_flight' };
   }
 
@@ -79,6 +104,9 @@ export const sendEmailTask = async (payload: SendTaskPayload) => {
       subject: payload.subject,
       bodyText: payload.bodyText,
       bodyHtml: payload.bodyHtml,
+      threadId: payload.threadId,
+      inReplyTo: payload.inReplyTo,
+      references: payload.references,
       attachments: payload.attachments ?? [],
     });
     await finalizeSendSuccess(payload.userId, idempotencyKey, sendResult as Record<string, any>);

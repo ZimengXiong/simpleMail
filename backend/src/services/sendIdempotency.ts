@@ -21,6 +21,9 @@ interface SendRequestHashPayload {
   subject: string;
   bodyText?: string;
   bodyHtml?: string;
+  threadId?: string;
+  inReplyTo?: string;
+  references?: string;
   attachments?: Array<{
     filename: string;
     contentType: string;
@@ -35,10 +38,15 @@ export interface SendIdempotencyRecord {
   idempotencyKey: string;
   identityId: string;
   requestHash: string;
+  requestMeta: Record<string, any> | null;
   status: SendIdempotencyStatus;
   result: Record<string, any> | null;
   errorMessage: string | null;
   attempts: number;
+}
+
+export interface SendClaimResult extends SendIdempotencyRecord {
+  leaseAcquired: boolean;
 }
 
 const normalizeKey = (value?: string | null) => (value ? String(value).trim() : '');
@@ -59,6 +67,9 @@ export const makeSendRequestHash = (payload: SendRequestHashPayload) => {
       subject: payload.subject,
       bodyText: payload.bodyText ?? '',
       bodyHtml: payload.bodyHtml ?? '',
+      threadId: payload.threadId ?? '',
+      inReplyTo: payload.inReplyTo ?? '',
+      references: payload.references ?? '',
       attachments: (payload.attachments ?? [])
         .map((attachment: {
           filename: string;
@@ -85,7 +96,8 @@ export const findSendIdempotency = async (
   idempotencyKey: string,
 ) => {
   const result = await query<SendIdempotencyRecord>(
-    `SELECT user_id as \"userId\", idempotency_key as \"idempotencyKey\", identity_id as \"identityId\", request_hash as \"requestHash\", status, result, error_message as \"errorMessage\", attempts
+    `SELECT user_id as \"userId\", idempotency_key as \"idempotencyKey\", identity_id as \"identityId\", request_hash as \"requestHash\",
+            request_meta as \"requestMeta\", status, result, error_message as \"errorMessage\", attempts
      FROM send_idempotency
     WHERE user_id = $1 AND idempotency_key = $2`,
     [userId, idempotencyKey],
@@ -98,6 +110,7 @@ export const getOrCreateSendIdempotency = async (payload: {
   identityId: string;
   idempotencyKey: string;
   requestHash: string;
+  requestMeta?: Record<string, any>;
 }) => {
   const existing = await findSendIdempotency(payload.userId, payload.idempotencyKey);
   if (existing) {
@@ -112,12 +125,20 @@ export const getOrCreateSendIdempotency = async (payload: {
 
   const created = await query<SendIdempotencyRecord>(`
     INSERT INTO send_idempotency
-      (user_id, idempotency_key, identity_id, request_hash, status, result, error_message, expires_at, updated_at, created_at, attempts)
-    VALUES ($1, $2, $3, $4, 'pending', NULL, NULL, NOW() + ($5::int * INTERVAL '1 hour'), NOW(), NOW(), 0)
+      (user_id, idempotency_key, identity_id, request_hash, request_meta, status, result, error_message, expires_at, updated_at, created_at, attempts)
+    VALUES ($1, $2, $3, $4, $5::jsonb, 'pending', NULL, NULL, NOW() + ($6::int * INTERVAL '1 hour'), NOW(), NOW(), 0)
     ON CONFLICT (user_id, idempotency_key) DO NOTHING
-    RETURNING user_id as \"userId\", idempotency_key as \"idempotencyKey\", identity_id as \"identityId\", request_hash as \"requestHash\", status, result, error_message as \"errorMessage\", attempts
+    RETURNING user_id as \"userId\", idempotency_key as \"idempotencyKey\", identity_id as \"identityId\", request_hash as \"requestHash\",
+              request_meta as \"requestMeta\", status, result, error_message as \"errorMessage\", attempts
   `,
-    [payload.userId, payload.idempotencyKey, payload.identityId, payload.requestHash, SEND_IDEMPOTENCY_TTL_HOURS],
+    [
+      payload.userId,
+      payload.idempotencyKey,
+      payload.identityId,
+      payload.requestHash,
+      payload.requestMeta ?? {},
+      SEND_IDEMPOTENCY_TTL_HOURS,
+    ],
   );
 
   if (created.rows[0]) {
@@ -131,7 +152,7 @@ export const acquireSendClaim = async (
   userId: string,
   idempotencyKey: string,
   identityId: string,
-): Promise<SendIdempotencyRecord> => {
+): Promise<SendClaimResult> => {
   const acquireResult = await query<SendIdempotencyRecord>(`
     UPDATE send_idempotency
        SET status = 'processing',
@@ -146,19 +167,26 @@ export const acquireSendClaim = async (
          OR status = 'failed'
          OR (status = 'processing' AND updated_at < NOW() - make_interval(secs => $4))
        )
-        AND expires_at > NOW()
-     RETURNING user_id as \"userId\", idempotency_key as \"idempotencyKey\", identity_id as \"identityId\", request_hash as \"requestHash\", status, result, error_message as \"errorMessage\", attempts
+       AND expires_at > NOW()
+     RETURNING user_id as \"userId\", idempotency_key as \"idempotencyKey\", identity_id as \"identityId\", request_hash as \"requestHash\",
+               request_meta as \"requestMeta\", status, result, error_message as \"errorMessage\", attempts
   `, [userId, idempotencyKey, identityId, STALE_PROCESSING_INTERVAL_SECONDS]);
 
   if (acquireResult.rows[0]) {
-    return acquireResult.rows[0];
+    return {
+      ...acquireResult.rows[0],
+      leaseAcquired: true,
+    };
   }
 
   const current = await findSendIdempotency(userId, idempotencyKey);
   if (!current) {
     throw new Error('send idempotency row missing');
   }
-  return current;
+  return {
+    ...current,
+    leaseAcquired: false,
+  };
 };
 
 export const finalizeSendSuccess = async (

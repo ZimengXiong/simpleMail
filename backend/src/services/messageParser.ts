@@ -6,9 +6,59 @@ import { scanBuffer } from './clamav.js';
 import { emitSyncEvent } from './imapEvents.js';
 import { getAttachmentScanDecision } from './scanPolicy.js';
 import { enqueueAttachmentScan } from './queue.js';
+import { env } from '../config/env.js';
 
-const parser = new PostalMime();
 const sanitizeFilename = (value?: string | null) => value?.replace(/[/\\]/g, '_') ?? 'attachment';
+
+const isLikelyTextAttachment = (mimeType: string, filename: string): boolean => {
+  const normalizedMime = mimeType.toLowerCase();
+  if (normalizedMime.startsWith('text/')) return true;
+  if (normalizedMime === 'application/json' || normalizedMime === 'application/xml') return true;
+
+  const extension = filename.toLowerCase().split('.').pop();
+  if (!extension) return false;
+
+  return new Set([
+    'txt',
+    'md',
+    'json',
+    'xml',
+    'csv',
+    'log',
+    'yaml',
+    'yml',
+    'ini',
+    'cfg',
+    'env',
+    'conf',
+    'js',
+    'ts',
+    'tsx',
+    'jsx',
+    'html',
+    'htm',
+    'css',
+    'scss',
+    'less',
+    'sql',
+    'sqls',
+  ]).has(extension);
+};
+
+const extractAttachmentSearchText = (filename: string, mimeType: string, data: Buffer): string | null => {
+  if (!isLikelyTextAttachment(mimeType, filename)) {
+    return null;
+  }
+  if (data.length > env.scan.maxAttachmentBytesForScan) {
+    return null;
+  }
+
+  const decoded = data.toString('utf8');
+  if (!decoded.trim()) {
+    return null;
+  }
+  return decoded.replace(/<[^>]*>/g, ' ');
+};
 
 const headersToObject = (headers: Array<{ key: string; value: string }> | undefined) => {
   const normalized: Record<string, string> = {};
@@ -39,6 +89,8 @@ export const parseAndPersistMessage = async (
   messageId: string,
   source: Buffer,
 ): Promise<ParsedMessageSummary> => {
+  // PostalMime parser instances are single-use; create a fresh one per message.
+  const parser = new PostalMime();
   const parsed = await parser.parse(source);
 
   const text = parsed.text ?? null;
@@ -90,6 +142,23 @@ export const parseAndPersistMessage = async (
     disposition?: string;
   }>;
 
+  const existingAttachments = await query<{ blob_key: string | null }>(
+    `SELECT blob_key
+       FROM attachments
+      WHERE message_id = $1`,
+    [messageId],
+  );
+
+  if (existingAttachments.rows.length > 0) {
+    await query('DELETE FROM attachments WHERE message_id = $1', [messageId]);
+    await Promise.allSettled(
+      existingAttachments.rows
+        .map((row) => row.blob_key)
+        .filter((value): value is string => Boolean(value))
+        .map((blobKey) => blobStore.deleteObject(blobKey)),
+    );
+  }
+
   for (const attachment of attachments) {
     attachmentCount += 1;
     const attachmentBuffer = Buffer.isBuffer(attachment.content)
@@ -98,9 +167,11 @@ export const parseAndPersistMessage = async (
         ? Buffer.from(attachment.content, attachment.encoding === 'base64' ? 'base64' : 'utf8')
         : Buffer.from(new Uint8Array(attachment.content));
 
-      const filename = sanitizeFilename(attachment.filename);
+    const filename = sanitizeFilename(attachment.filename);
+    const contentType = attachment.mimeType || attachment.contentType || 'application/octet-stream';
     const attachmentKey = `attachments/${messageId}/${uuidv4()}-${filename}`;
-    await blobStore.putObject(attachmentKey, attachmentBuffer, attachment.mimeType || 'application/octet-stream');
+    await blobStore.putObject(attachmentKey, attachmentBuffer, contentType);
+    const searchText = extractAttachmentSearchText(filename, contentType, attachmentBuffer);
 
     const decision = getAttachmentScanDecision(attachmentBuffer.length);
     let scanStatus = decision.status;
@@ -116,28 +187,29 @@ export const parseAndPersistMessage = async (
       }
     }
 
-      const attachmentInsert = await query<{ id: string }>(
-        `INSERT INTO attachments
-         (message_id, filename, content_type, size_bytes, blob_key, is_inline, scan_status, scan_result)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-         RETURNING id`,
-        [
-          messageId,
-          attachment.filename ?? 'attachment',
-          attachment.mimeType ?? 'application/octet-stream',
-          attachmentBuffer.length,
-          attachmentKey,
-          attachment.disposition === 'inline',
-          scanStatus,
-          scanResult,
-        ],
-      );
+    const attachmentInsert = await query<{ id: string }>(
+      `INSERT INTO attachments
+       (message_id, filename, content_type, size_bytes, blob_key, is_inline, scan_status, scan_result, search_text)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       RETURNING id`,
+      [
+        messageId,
+        attachment.filename ?? 'attachment',
+        contentType,
+        attachmentBuffer.length,
+        attachmentKey,
+        attachment.disposition === 'inline',
+        scanStatus,
+        scanResult,
+        searchText,
+      ],
+    );
 
-      const attachmentId = attachmentInsert.rows[0]?.id;
-      if (decision.disposition === 'queued' && attachmentId) {
-        await enqueueAttachmentScan(messageId, attachmentId);
-      }
+    const attachmentId = attachmentInsert.rows[0]?.id;
+    if (decision.disposition === 'queued' && attachmentId) {
+      await enqueueAttachmentScan(messageId, attachmentId);
     }
+  }
 
   const incomingConnectorId = await getConnectorFromMessage(messageId);
   if (incomingConnectorId) {

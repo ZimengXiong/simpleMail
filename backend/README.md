@@ -2,7 +2,7 @@
 
 Backend implementation for Gmail + generic SMTP clients with:
 - Connector-first model for incoming IMAP and outgoing SMTP
-- OAuth2 for Gmail IMAP/SMTP
+- OAuth2 for Gmail API (incoming sync/actions + send) and IMAP/SMTP for generic providers
 - Postgres metadata + FTS search + threading
 - SeaweedFS S3-compatible storage for raw messages and attachments
 - Rules engine and sync event stream API
@@ -22,6 +22,17 @@ npm run dev
 ```
 
 API is available at `http://localhost:3000`.
+
+### Development default user
+
+To avoid manual DB seeding, set these env vars in `backend/.env` and restart the API:
+
+- `DEV_USER_BOOTSTRAP=true`
+- `DEV_USER_EMAIL=you@local.test`
+- `DEV_USER_NAME=You`
+- `DEV_USER_TOKEN=dev-bettermail-token`
+
+These values create/update a user on startup with a deterministic token you can use in the frontend as `VITE_BETTERMAIL_USER_TOKEN`.
 
 ## Docker compose
 

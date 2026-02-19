@@ -2,7 +2,12 @@ import { createRequire } from 'node:module';
 import nodemailer from 'nodemailer';
 import { query } from '../db/pool.js';
 import { appendMessageToMailbox } from './imap.js';
-import { ensureValidGoogleAccessToken } from './googleOAuth.js';
+import { enqueueSync } from './queue.js';
+import {
+  ensureValidGoogleAccessToken,
+  isGoogleTokenExpiringSoon,
+} from './googleOAuth.js';
+import { gmailApiRequest } from './gmailApi.js';
 
 const require = createRequire(import.meta.url);
 const MailComposer = require('nodemailer/lib/mail-composer/index.js');
@@ -52,6 +57,45 @@ const getTransport = (connector: any, authConfig: Record<string, any>) => {
   });
 };
 
+export const verifyOutgoingConnectorCredentials = async (input: {
+  provider: string;
+  fromAddress: string;
+  host?: string | null;
+  port?: number | null;
+  tlsMode?: string | null;
+  authType?: string | null;
+  authConfig?: Record<string, any> | null;
+}) => {
+  const provider = String(input.provider || '').trim().toLowerCase();
+  const authConfig: Record<string, any> = {
+    authType: input.authType ?? input.authConfig?.authType ?? 'password',
+    ...(input.authConfig ?? {}),
+  };
+
+  if ((authConfig.authType ?? 'password') !== 'oauth2') {
+    const username = String(authConfig.username ?? '').trim();
+    const password = String(authConfig.password ?? '');
+    if (!username || !password) {
+      throw new Error('SMTP username and password are required');
+    }
+  }
+
+  const connector = {
+    provider,
+    from_address: String(input.fromAddress || '').trim(),
+    host: input.host ?? null,
+    port: input.port ?? null,
+    tls_mode: input.tlsMode ?? 'starttls',
+  };
+
+  const transport = getTransport(connector, authConfig);
+  try {
+    await transport.verify();
+  } finally {
+    transport.close();
+  }
+};
+
 const isRecoverableSmtpError = (error: unknown) => {
   const asError = error as { responseCode?: number; code?: string; command?: string };
   const message = String(error).toLowerCase();
@@ -68,6 +112,17 @@ const isRecoverableSmtpError = (error: unknown) => {
   );
 };
 
+const isFatalOAuthRefreshError = (error: unknown) => {
+  const message = String(error).toLowerCase();
+  return (
+    message.includes('invalid_grant') ||
+    message.includes('oauth2 error') ||
+    message.includes('invalid client') ||
+    message.includes('bad access token') ||
+    message.includes('user revoked')
+  );
+};
+
 const isRecoverableOauth2Error = (error: unknown) => {
   const message = String(error).toLowerCase();
   return (
@@ -81,6 +136,38 @@ const isRecoverableOauth2Error = (error: unknown) => {
   );
 };
 
+const normalizeMessageIdHeader = (value?: string | null): string | undefined => {
+  if (!value) return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  const angleMatch = trimmed.match(/<[^>]+>/);
+  if (angleMatch?.[0]) return angleMatch[0];
+  const token = trimmed.split(/\s+/)[0];
+  if (!token) return undefined;
+  return `<${token.replace(/[<>]/g, '')}>`;
+};
+
+const normalizeReferencesHeader = (value?: string | null): string | undefined => {
+  if (!value) return undefined;
+  const parts = value
+    .trim()
+    .split(/\s+/)
+    .map((part) => normalizeMessageIdHeader(part))
+    .filter((part): part is string => Boolean(part));
+  if (parts.length === 0) return undefined;
+  return Array.from(new Set(parts)).join(' ');
+};
+
+const parseEnvelopeRecipients = (value: string | undefined, extra: string[] = []) => {
+  const parsed = [
+    ...(value ? value.split(/[,\n;]/).map((entry) => entry.trim()) : []),
+    ...extra,
+  ]
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  return Array.from(new Set(parsed));
+};
+
 export const sendThroughConnector = async (
   userId: string,
   identityId: string,
@@ -91,6 +178,9 @@ export const sendThroughConnector = async (
     subject: string;
     bodyText?: string;
     bodyHtml?: string;
+    threadId?: string;
+    inReplyTo?: string;
+    references?: string;
     attachments?: Array<{
       filename: string;
       contentType: string;
@@ -108,7 +198,7 @@ export const sendThroughConnector = async (
   if (!identity) throw new Error('Identity not found');
 
   const outgoingResult = await query<any>(
-    `SELECT oc.*, i.from_envelope_defaults
+    `SELECT oc.*
        FROM identities i
        JOIN outgoing_connectors oc ON oc.id = i.outgoing_connector_id
       WHERE i.id = $1
@@ -119,6 +209,10 @@ export const sendThroughConnector = async (
 
   const outgoing = outgoingResult.rows[0];
   if (!outgoing) throw new Error('Outgoing connector not found');
+
+  const sentBehavior = outgoing.sent_copy_behavior ?? {};
+  let saveSentToConnectorId: string | null =
+    sentBehavior.saveSentToIncomingConnectorId || identity.sent_to_incoming_connector_id || null;
 
   const resolvedAuth =
     outgoing.provider === 'gmail' && (outgoing.auth_config?.authType ?? 'password') === 'oauth2'
@@ -137,6 +231,8 @@ export const sendThroughConnector = async (
 
   const signature = (identity.signature ?? '').trim();
   const replyTo = identity.reply_to || outgoing.from_envelope_defaults?.replyTo;
+  const inReplyTo = normalizeMessageIdHeader(payload.inReplyTo);
+  const references = normalizeReferencesHeader(payload.references);
   const composedBodyText = payload.bodyText ?? '';
   const composedBodyHtml = payload.bodyHtml ?? '';
   const bodyTextWithSignature = signature
@@ -153,6 +249,8 @@ export const sendThroughConnector = async (
     bcc: payload.bcc?.join(','),
     subject: payload.subject,
     replyTo,
+    inReplyTo,
+    references,
     text: bodyTextWithSignature,
     html: bodyHtmlWithSignature,
     attachments,
@@ -167,21 +265,95 @@ export const sendThroughConnector = async (
       resolve(Buffer.from(msg));
     });
   });
+  const rawHeaderPreview = message.toString('utf8', 0, Math.min(message.length, 65536));
+  const generatedMessageId = normalizeMessageIdHeader(
+    rawHeaderPreview.match(/^Message-ID:\s*(.+)$/im)?.[1] ?? undefined,
+  ) ?? null;
 
   let activeAuth = resolvedAuth;
   let attempts = 0;
   const maxAttempts = 4;
+  let sentCopyError: string | null = null;
+  let gmailApiThreadId: string | null = null;
+  const useGmailApiSend = outgoing.provider === 'gmail' && (outgoing.auth_config?.authType ?? 'password') === 'oauth2';
+  if (useGmailApiSend) {
+    if (inReplyTo) {
+      const byMessageId = await query<{ gmail_thread_id: string | null }>(
+        `SELECT m.gmail_thread_id
+           FROM messages m
+           INNER JOIN incoming_connectors ic ON ic.id = m.incoming_connector_id
+          WHERE ic.user_id = $1
+            AND m.gmail_thread_id IS NOT NULL
+            AND m.message_id = $2
+          ORDER BY m.received_at DESC
+          LIMIT 1`,
+        [userId, inReplyTo],
+      );
+      gmailApiThreadId = byMessageId.rows[0]?.gmail_thread_id ?? null;
+    }
+    if (!gmailApiThreadId && payload.threadId) {
+      const byLocalThread = await query<{ gmail_thread_id: string | null }>(
+        `SELECT m.gmail_thread_id
+           FROM messages m
+           INNER JOIN incoming_connectors ic ON ic.id = m.incoming_connector_id
+          WHERE ic.user_id = $1
+            AND m.thread_id = $2
+            AND m.gmail_thread_id IS NOT NULL
+          ORDER BY m.received_at DESC
+          LIMIT 1`,
+        [userId, payload.threadId],
+      );
+      gmailApiThreadId = byLocalThread.rows[0]?.gmail_thread_id ?? null;
+    }
+  }
   while (attempts < maxAttempts) {
     attempts += 1;
-    const useOauth2 = outgoing.provider === 'gmail' && (outgoing.auth_config?.authType ?? 'password') === 'oauth2';
+    const useOauth2 = useGmailApiSend;
     try {
-      const transport = getTransport(outgoing, activeAuth ?? {});
-      await transport.sendMail({ raw: message });
+      if (useOauth2 && isGoogleTokenExpiringSoon(activeAuth as Record<string, any>)) {
+        activeAuth = await ensureValidGoogleAccessToken('outgoing', outgoing.id, activeAuth as Record<string, any>, {
+          forceRefresh: true,
+        });
+        outgoing.auth_config = activeAuth;
+      }
+
+      if (useGmailApiSend) {
+        await gmailApiRequest(
+          'outgoing',
+          { id: outgoing.id, auth_config: activeAuth },
+          '/messages/send',
+          {
+            method: 'POST',
+            body: JSON.stringify({
+              raw: message.toString('base64url'),
+              ...(gmailApiThreadId ? { threadId: gmailApiThreadId } : {}),
+            }),
+          },
+        );
+      } else {
+        const transport = getTransport(outgoing, activeAuth ?? {});
+        const envelopeRecipients = parseEnvelopeRecipients(payload.to, [
+          ...(payload.cc ?? []),
+          ...(payload.bcc ?? []),
+        ]);
+        await transport.sendMail({
+          envelope: {
+            from: identity.email_address,
+            to: envelopeRecipients,
+          },
+          raw: message,
+        });
+      }
       break;
     } catch (error) {
       if (!isRecoverableSmtpError(error)) {
         throw error;
       }
+
+      if (isFatalOAuthRefreshError(error)) {
+        throw error;
+      }
+
       if (useOauth2 && isRecoverableOauth2Error(error)) {
         if (attempts >= maxAttempts) {
           throw error;
@@ -199,9 +371,21 @@ export const sendThroughConnector = async (
     }
   }
 
-  const sentBehavior = outgoing.sent_copy_behavior ?? {};
-  const saveSentToConnectorId = sentBehavior.saveSentToIncomingConnectorId || identity.sent_to_incoming_connector_id;
-  if (sentBehavior.mode === 'imap_append' || sentBehavior.mode === 'imap_append_preferred') {
+  if (useGmailApiSend && !saveSentToConnectorId) {
+    const inferredIncoming = await query<{ id: string }>(
+      `SELECT id
+         FROM incoming_connectors
+        WHERE user_id = $1
+          AND provider = 'gmail'
+          AND lower(email_address) = lower($2)
+        ORDER BY created_at DESC
+        LIMIT 1`,
+      [userId, identity.email_address],
+    );
+    saveSentToConnectorId = inferredIncoming.rows[0]?.id ?? null;
+  }
+
+  if (!useGmailApiSend && (sentBehavior.mode === 'imap_append' || sentBehavior.mode === 'imap_append_preferred')) {
     if (!saveSentToConnectorId) {
       throw new Error('No incoming connector configured for sent-copy append');
     }
@@ -217,12 +401,30 @@ export const sendThroughConnector = async (
     }
 
     const folder = sentBehavior.mailbox || 'Sent';
-    await appendMessageToMailbox(userId, incomingConnector.id, folder, message);
+    try {
+      await appendMessageToMailbox(userId, incomingConnector.id, folder, message);
+      try {
+        await enqueueSync(userId, incomingConnector.id, incomingConnector.provider === 'gmail' ? 'SENT' : folder);
+      } catch {
+        // Sent copy append succeeded; sync enqueue failure should not fail outbound send.
+      }
+    } catch (error) {
+      sentCopyError = String(error);
+    }
+  }
+
+  if (useGmailApiSend && saveSentToConnectorId) {
+    try {
+      await enqueueSync(userId, saveSentToConnectorId, 'SENT');
+    } catch {
+      // Sending already succeeded; background sync failure is non-fatal.
+    }
   }
 
   return {
     accepted: true,
-    messageId: identity.id,
-    threadTag: null,
+    messageId: generatedMessageId,
+    threadTag: gmailApiThreadId,
+    sentCopyError,
   };
 };
