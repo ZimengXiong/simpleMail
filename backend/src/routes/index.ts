@@ -255,6 +255,15 @@ const parseOptionalHeaderValue = (value: unknown): string | undefined => {
   return normalized.length > 0 ? normalized : undefined;
 };
 
+const sanitizeDispositionFilename = (value: unknown, fallback: string): string => {
+  const normalized = String(value ?? '')
+    .replace(/[\r\n";\\]/g, '_')
+    .replace(/[^\x20-\x7E]/g, '_')
+    .trim();
+  const filename = normalized.length > 0 ? normalized : fallback;
+  return filename.slice(0, 180);
+};
+
 const GOOGLE_IDENTITY_ISSUERS = new Set(['https://accounts.google.com', 'accounts.google.com']);
 const pubSubTokenVerifier = new OAuth2Client();
 
@@ -481,6 +490,10 @@ export const registerRoutes = async (app: FastifyInstance) => {
     }
 
     const authType = body.authType ?? (body.provider === 'gmail' ? 'oauth2' : 'password');
+    const normalizedProvider = String(body.provider ?? '').trim().toLowerCase();
+    if (String(authType).toLowerCase() === 'oauth2' && normalizedProvider !== 'gmail') {
+      return reply.code(400).send({ error: 'oauth2 is only supported for provider=gmail for outgoing connectors' });
+    }
     if (authType === 'oauth2') {
       const existing = await query<{ id: string }>(
         `SELECT id
@@ -579,6 +592,9 @@ export const registerRoutes = async (app: FastifyInstance) => {
       ? body.authConfig
       : (existing.authConfig ?? existing.auth_config ?? {});
     const mergedAuthType = mergedAuthConfig?.authType ?? 'password';
+    if (String(mergedAuthType).toLowerCase() === 'oauth2' && String(existing.provider ?? '').toLowerCase() !== 'gmail') {
+      return reply.code(400).send({ error: 'oauth2 is only supported for provider=gmail for outgoing connectors' });
+    }
     if (hasSmtpConnectivityChange && mergedAuthType !== 'oauth2') {
       try {
         await verifyOutgoingConnectorCredentials({
@@ -624,21 +640,31 @@ export const registerRoutes = async (app: FastifyInstance) => {
     const authConfig = connector.authConfig ?? connector.auth_config ?? {};
     const authType = authConfig.authType ?? 'password';
     const provider = String(connector.provider ?? '').toLowerCase();
+    if (String(authType).toLowerCase() === 'oauth2' && provider !== 'gmail') {
+      return reply.code(400).send({ error: 'oauth2 is only supported for provider=gmail for outgoing connectors' });
+    }
 
     try {
       const resolvedAuthConfig = authType === 'oauth2' && provider === 'gmail'
         ? await ensureValidGoogleAccessToken('outgoing', connectorId, authConfig, { forceRefresh: true })
         : authConfig;
-
-      await verifyOutgoingConnectorCredentials({
-        provider,
-        fromAddress: String(connector.fromAddress ?? connector.from_address ?? ''),
-        host: connector.host ?? null,
-        port: connector.port ?? null,
-        tlsMode: connector.tlsMode ?? connector.tls_mode ?? 'starttls',
-        authType,
-        authConfig: resolvedAuthConfig,
-      });
+      if (provider === 'gmail' && String(authType).toLowerCase() === 'oauth2') {
+        await gmailApiRequest(
+          'outgoing',
+          { id: connectorId, auth_config: resolvedAuthConfig },
+          '/profile',
+        );
+      } else {
+        await verifyOutgoingConnectorCredentials({
+          provider,
+          fromAddress: String(connector.fromAddress ?? connector.from_address ?? ''),
+          host: connector.host ?? null,
+          port: connector.port ?? null,
+          tlsMode: connector.tlsMode ?? connector.tls_mode ?? 'starttls',
+          authType,
+          authConfig: resolvedAuthConfig,
+        });
+      }
     } catch (error) {
       return reply.code(400).send({ error: `smtp test failed: ${String(error)}` });
     }
@@ -649,6 +675,21 @@ export const registerRoutes = async (app: FastifyInstance) => {
   app.delete('/api/connectors/incoming/:connectorId', async (req, reply) => {
     const userId = getUserId(req);
     const connectorId = String((req.params as any).connectorId);
+    const connector = await getIncomingConnector(userId, connectorId);
+    if (connector) {
+      const configuredWatchMailboxes = Array.isArray(connector.sync_settings?.watchMailboxes)
+        ? connector.sync_settings.watchMailboxes.map((value: unknown) => String(value || '').trim()).filter(Boolean)
+        : [];
+      const fallbackMailbox = isGmailLikeConnector(connector)
+        ? normalizeGmailMailboxPath(env.sync.defaultMailbox)
+        : env.sync.defaultMailbox;
+      const watchMailboxes = configuredWatchMailboxes.length > 0
+        ? configuredWatchMailboxes
+        : [fallbackMailbox];
+      for (const mailbox of watchMailboxes) {
+        await stopIncomingConnectorIdleWatch(userId, connectorId, mailbox).catch(() => undefined);
+      }
+    }
     await deleteIncomingConnector(userId, connectorId);
     return { status: 'deleted', id: connectorId };
   });
@@ -1416,12 +1457,7 @@ export const registerRoutes = async (app: FastifyInstance) => {
     }
 
     try {
-      const protoHeader = req.headers['x-forwarded-proto'];
-      const hostHeader = req.headers.host;
-      const proto = Array.isArray(protoHeader) ? protoHeader[0] : (protoHeader || 'https');
-      const host = Array.isArray(hostHeader) ? hostHeader[0] : hostHeader;
-      const derivedAudience = host ? `${proto}://${host}${env.gmailPush.webhookPath}` : '';
-      await verifyPubSubPushToken(req.headers.authorization, derivedAudience ? [derivedAudience] : []);
+      await verifyPubSubPushToken(req.headers.authorization);
     } catch (error) {
       req.log.warn({ error }, 'gmail push token verification failed');
       return reply.code(401).send({ error: 'unauthorized' });
@@ -1477,6 +1513,12 @@ export const registerRoutes = async (app: FastifyInstance) => {
             syncCompletedAt: null,
             syncError: null,
             syncProgress: { inserted: 0, updated: 0, reconciledRemoved: 0, metadataRefreshed: 0 },
+          });
+        } else {
+          void syncIncomingConnector(connector.user_id, connector.id, mailbox, {
+            gmailHistoryIdHint: decoded.historyId ?? null,
+          }).catch((error) => {
+            req.log.warn({ error, connectorId: connector.id, mailbox }, 'gmail push fallback sync failed');
           });
         }
       }
@@ -2269,8 +2311,9 @@ export const registerRoutes = async (app: FastifyInstance) => {
       return reply.code(404).send({ error: 'message source not found' });
     }
 
+    const filename = sanitizeDispositionFilename(`${messageId}.eml`, 'message.eml');
     reply.header('Content-Type', 'message/rfc822');
-    reply.header('Content-Disposition', `attachment; filename="${messageId}.eml"`);
+    reply.header('Content-Disposition', `attachment; filename="${filename}"`);
     return reply.send(data);
   });
 
@@ -2465,7 +2508,10 @@ export const registerRoutes = async (app: FastifyInstance) => {
     const userId = getUserId(req);
     const attachmentId = String((req.params as any).attachmentId);
     const attachmentResult = await query<any>(
-      `SELECT a.filename, a.blob_key, a.content_type as "contentType"
+      `SELECT a.filename,
+              a.blob_key,
+              a.content_type as "contentType",
+              a.scan_status as "scanStatus"
          FROM attachments a
          INNER JOIN messages m ON m.id = a.message_id
          INNER JOIN incoming_connectors ic ON ic.id = m.incoming_connector_id
@@ -2476,14 +2522,18 @@ export const registerRoutes = async (app: FastifyInstance) => {
     if (!attachment) {
       return reply.code(404).send({ error: 'attachment not found' });
     }
+    if (attachment.scanStatus === 'infected') {
+      return reply.code(403).send({ error: 'attachment blocked: malware detected' });
+    }
 
     const data = await blobStore.getObject(attachment.blob_key);
     if (!data) {
       return reply.code(404).send({ error: 'attachment blob not found' });
     }
 
+    const filename = sanitizeDispositionFilename(attachment.filename, 'attachment');
     reply.header('Content-Type', attachment.contentType || 'application/octet-stream');
-    reply.header('Content-Disposition', `attachment; filename="${attachment.filename}"`);
+    reply.header('Content-Disposition', `attachment; filename="${filename}"`);
     return reply.send(data);
   });
 
@@ -2491,7 +2541,10 @@ export const registerRoutes = async (app: FastifyInstance) => {
     const userId = getUserId(req);
     const attachmentId = String((req.params as any).attachmentId);
     const attachmentResult = await query<any>(
-      `SELECT a.filename, a.blob_key, a.content_type as "contentType"
+      `SELECT a.filename,
+              a.blob_key,
+              a.content_type as "contentType",
+              a.scan_status as "scanStatus"
          FROM attachments a
          INNER JOIN messages m ON m.id = a.message_id
          INNER JOIN incoming_connectors ic ON ic.id = m.incoming_connector_id
@@ -2502,16 +2555,20 @@ export const registerRoutes = async (app: FastifyInstance) => {
     if (!attachment) {
       return reply.code(404).send({ error: 'attachment not found' });
     }
+    if (attachment.scanStatus === 'infected') {
+      return reply.code(403).send({ error: 'attachment blocked: malware detected' });
+    }
 
     const data = await blobStore.getObject(attachment.blob_key);
     if (!data) {
       return reply.code(404).send({ error: 'attachment blob not found' });
     }
 
+    const filename = sanitizeDispositionFilename(attachment.filename, 'attachment');
     reply.header('Content-Type', attachment.contentType || 'application/octet-stream');
     reply.header('X-Content-Type-Options', 'nosniff');
     reply.header('Content-Security-Policy', "sandbox; default-src 'none'; img-src data: blob: https:; media-src data: blob: https:; style-src 'unsafe-inline'");
-    reply.header('Content-Disposition', `inline; filename="${attachment.filename}"`);
+    reply.header('Content-Disposition', `inline; filename="${filename}"`);
     return reply.send(data);
   });
 

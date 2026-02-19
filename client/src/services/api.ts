@@ -43,6 +43,17 @@ const triggerBrowserDownload = (blob: Blob, filename: string) => {
   URL.revokeObjectURL(url);
 };
 
+const openBlobInNewTab = (blob: Blob, fallbackFilename: string) => {
+  const url = URL.createObjectURL(blob);
+  const popup = window.open(url, '_blank', 'noopener,noreferrer');
+  if (!popup) {
+    triggerBrowserDownload(blob, fallbackFilename);
+  }
+  window.setTimeout(() => {
+    URL.revokeObjectURL(url);
+  }, 60_000);
+};
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const token = getAuthToken();
   
@@ -202,16 +213,14 @@ export const api = {
         method: 'POST',
         body: JSON.stringify({ messageIds, ...data }),
       }),
-    getRawUrl: (messageId: string) => {
-      const token = getAuthToken();
-      if (!token) {
-        return `/api/messages/${messageId}/raw`;
-      }
-      return `/api/messages/${messageId}/raw?token=${encodeURIComponent(token)}`;
-    },
+    getRawUrl: (messageId: string) => `/api/messages/${messageId}/raw`,
     downloadRaw: async (messageId: string) => {
       const { blob, filename } = await requestBlob(`/messages/${messageId}/raw`);
       triggerBrowserDownload(blob, filename ?? `${messageId}.eml`);
+    },
+    viewRaw: async (messageId: string) => {
+      const { blob, filename } = await requestBlob(`/messages/${messageId}/raw`);
+      openBlobInNewTab(blob, filename ?? `${messageId}.eml`);
     },
     search: (params: { q: string; folder?: string; connectorId?: string; limit?: number; offset?: number }) => {
       return request<{ messages: MessageRecord[]; totalCount: number }>('/messages/search', { 
@@ -279,23 +288,15 @@ export const api = {
   },
 
   attachments: {
-    getDownloadUrl: (attachmentId: string) => {
-      const token = getAuthToken();
-      if (!token) {
-        return `/api/attachments/${attachmentId}/download`;
-      }
-      return `/api/attachments/${attachmentId}/download?token=${encodeURIComponent(token)}`;
-    },
-    getPreviewUrl: (attachmentId: string) => {
-      const token = getAuthToken();
-      if (!token) {
-        return `/api/attachments/${attachmentId}/view`;
-      }
-      return `/api/attachments/${attachmentId}/view?token=${encodeURIComponent(token)}`;
-    },
+    getDownloadUrl: (attachmentId: string) => `/api/attachments/${attachmentId}/download`,
+    getPreviewUrl: (attachmentId: string) => `/api/attachments/${attachmentId}/view`,
     download: async (attachmentId: string, fallbackFilename = 'attachment') => {
       const { blob, filename } = await requestBlob(`/attachments/${attachmentId}/download`);
       triggerBrowserDownload(blob, filename ?? fallbackFilename);
+    },
+    preview: async (attachmentId: string, fallbackFilename = 'attachment') => {
+      const { blob, filename } = await requestBlob(`/attachments/${attachmentId}/view`);
+      openBlobInNewTab(blob, filename ?? fallbackFilename);
     },
   }
 };

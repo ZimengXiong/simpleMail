@@ -69,11 +69,15 @@ export const useTheme = () => {
     let adjustedAccent = accentColor;
     let contrast = getContrast(adjustedAccent, bg);
     
-    // Enforce AA contrast (4.5:1)
+    // Enforce high contrast for accessibility and to prevent "disabled" look
+    // Using 7.0 (AAA) for dark mode to make it really pop, 4.5 (AA) for light mode
+    const targetContrast = theme === 'dark' ? 7.0 : 4.5;
+    
     let iterations = 0;
-    while (contrast < 4.5 && iterations < 20) {
+    while (contrast < targetContrast && iterations < 20) {
       // Lighten for dark mode, darken for light mode
-      const direction = theme === 'dark' ? 0.1 : -0.1;
+      // Use a slightly larger step for dark mode to reach "vibrant" territory faster
+      const direction = theme === 'dark' ? 0.15 : -0.1;
       adjustedAccent = adjustLightness(adjustedAccent, direction);
       contrast = getContrast(adjustedAccent, bg);
       iterations++;
@@ -82,9 +86,10 @@ export const useTheme = () => {
     // Apply adjusted accent color to root
     document.documentElement.style.setProperty('--accent-color', adjustedAccent);
     
-    // Derive a hover color (slightly darker/more opaque version of adjusted)
-    // For simplicity, we just darken/lighten slightly in the opposite direction of the background
-    const hoverColor = adjustLightness(adjustedAccent, theme === 'light' ? -0.1 : 0.1);
+    // Derive a hover color
+    // In dark mode, hover should usually be LIGHTER/BRIGHTER to feel interactive
+    // In light mode, hover is usually DARKER
+    const hoverColor = adjustLightness(adjustedAccent, theme === 'light' ? -0.1 : 0.15);
     document.documentElement.style.setProperty('--accent-hover', hoverColor);
     
     // Calculate contrast color (black or white) for text on accent background

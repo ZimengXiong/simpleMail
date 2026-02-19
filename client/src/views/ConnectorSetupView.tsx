@@ -3,7 +3,7 @@ import type { IncomingConnectorRecord, OutgoingConnectorRecord } from '../types/
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { api } from '../services/api';
-import { 
+import {
   ChevronLeft, 
   Server, 
   Key, 
@@ -14,7 +14,6 @@ import {
   ShieldCheck,
   Send
 } from 'lucide-react';
-import Avatar from '../components/Avatar';
 import Select from '../components/Select';
 
 const ConnectorSetupView = () => {

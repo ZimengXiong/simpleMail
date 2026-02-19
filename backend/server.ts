@@ -16,6 +16,10 @@ if (env.nodeEnv === 'production' && !env.apiAdminToken) {
   throw new Error('API_ADMIN_TOKEN is required in production');
 }
 
+if (env.gmailPush.enabled && !env.gmailPush.pushServiceAccountEmail) {
+  throw new Error('GMAIL_PUSH_SERVICE_ACCOUNT_EMAIL is required when GMAIL_PUSH_ENABLED=true');
+}
+
 const isPublicRoute = (url: string) =>
   url === '/api/health' ||
   url.startsWith(env.gmailPush.webhookPath) ||
@@ -34,17 +38,6 @@ const extractUserToken = (request: FastifyRequest) => {
   const headerToken = Array.isArray(userToken) ? userToken[0] : userToken;
   if (headerToken) {
     return headerToken;
-  }
-
-  const rawUrl = request.raw.url ?? request.url;
-  const queryIndex = rawUrl.indexOf('?');
-  if (queryIndex >= 0) {
-    const search = rawUrl.slice(queryIndex + 1);
-    const params = new URLSearchParams(search);
-    const queryToken = params.get('token') || params.get('userToken');
-    if (queryToken) {
-      return queryToken;
-    }
   }
 
   return undefined;
@@ -130,6 +123,12 @@ server.addHook('onRequest', async (request, reply) => {
   }
 
   (request as AuthenticatedRequest).user = user;
+});
+
+server.addHook('onSend', async (_request, reply, payload) => {
+  reply.header('Referrer-Policy', 'no-referrer');
+  reply.header('X-Content-Type-Options', 'nosniff');
+  return payload;
 });
 
 server.setErrorHandler((error, request: FastifyRequest, reply: FastifyReply) => {

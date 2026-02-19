@@ -164,6 +164,7 @@ export const enqueueSend = async (payload: {
       maxAttempts: 3,
       jobKey: `send:${payload.userId}:${payload.idempotencyKey}`,
       jobKeyMode: 'unsafe_dedupe',
+      priority: -100,
     },
   );
 };

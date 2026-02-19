@@ -3156,13 +3156,11 @@ export const startIncomingConnectorIdleWatch = async (userId: string, connectorI
   // of IDLE return behavior so silent server-side drops cannot stall delivery.
   const idleFallbackSyncIntervalMs = Math.max(env.sync.idleIntervalMs * 3, 6_000);
   let fallbackTimer: NodeJS.Timeout | null = null;
-  let syncInFlight = false;
 
   const ensureSync = async () => {
-    if (syncInFlight || state.stop) {
+    if (state.stop) {
       return;
     }
-    syncInFlight = true;
     try {
       updateWatchActivity(state);
       await syncIncomingConnector(userId, connectorId, normalizedMailbox);
@@ -3174,8 +3172,6 @@ export const startIncomingConnectorIdleWatch = async (userId: string, connectorI
         mailbox: normalizedMailbox,
         error: String(error),
       });
-    } finally {
-      syncInFlight = false;
     }
   };
 

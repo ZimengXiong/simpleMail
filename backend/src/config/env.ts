@@ -63,6 +63,10 @@ export const env = {
     gmailBootstrapConcurrency: Number(process.env.GMAIL_BOOTSTRAP_CONCURRENCY ?? '10'),
     gmailBackgroundHydrateBatchSize: Number(process.env.GMAIL_BACKGROUND_HYDRATE_BATCH_SIZE ?? '200'),
     gmailBackgroundHydrateConcurrency: Number(process.env.GMAIL_BACKGROUND_HYDRATE_CONCURRENCY ?? '4'),
+    syncEventsRetentionDays: Number(process.env.SYNC_EVENTS_RETENTION_DAYS ?? '14'),
+    syncEventsPruneBatchSize: Number(process.env.SYNC_EVENTS_PRUNE_BATCH_SIZE ?? '2000'),
+    syncEventsPruneMaxBatches: Number(process.env.SYNC_EVENTS_PRUNE_MAX_BATCHES ?? '3'),
+    syncEventsPruneIntervalMs: Number(process.env.SYNC_EVENTS_PRUNE_INTERVAL_MS ?? '300000'),
   },
   scan: {
     enabled: process.env.CLAMAV_ENABLED === 'true',

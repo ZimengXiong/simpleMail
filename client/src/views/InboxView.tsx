@@ -74,6 +74,7 @@ const InboxView = () => {
   const activeConnector = isSendOnlyMode
     ? null
     : ((connectors ?? []).find((connector) => connector.id === effectiveConnectorId) ?? null);
+  const activeMailboxForPriority = folder || 'INBOX';
 
   useEffect(() => {
     if (!isSendOnlyMode || folder) {
@@ -93,6 +94,22 @@ const InboxView = () => {
     params.delete('folder');
     setSearchParams(params, { replace: true });
   }, [connectorIdFromParams, firstConnectorId, isSendOnlyMode, searchParams, setSearchParams]);
+
+  useEffect(() => {
+    if (isSendOnlyMode || !effectiveConnectorId || !isTabVisible) {
+      return;
+    }
+
+    const reportActiveMailbox = () => {
+      void api.sync.setActiveMailbox(effectiveConnectorId, activeMailboxForPriority).catch(() => {
+        // best effort: prioritization heartbeat should not affect inbox rendering
+      });
+    };
+
+    reportActiveMailbox();
+    const timer = window.setInterval(reportActiveMailbox, 30_000);
+    return () => window.clearInterval(timer);
+  }, [isSendOnlyMode, effectiveConnectorId, activeMailboxForPriority, isTabVisible]);
 
   const { data: result, isLoading: loadingMessages } = useQuery({
     queryKey: ['messages', isSendOnlyMode ? `send-only:${sendOnlyEmail}` : effectiveConnectorId, folder, query, page],
@@ -629,13 +646,16 @@ type ListItemProps = {
 
 const MemoColumnItem = memo(({ msg, selectedThreadId, isSelected, onSelect, onToggleSelect, participants, formattedDate, disableActions }: ListItemProps) => {
   const threadId = msg.threadId || msg.id;
+  const subjectText = (msg.subject || '(no subject)').trim();
+  const snippetText = String(msg.snippet || '').trim();
+
   return (
     <div
       onClick={() => onSelect(threadId)}
       className={`
-        px-3 py-1.5 cursor-pointer transition-colors group relative border-l-2 flex gap-2
+        px-3 py-2.5 cursor-pointer transition-colors group relative border-l-2 flex gap-2
         ${selectedThreadId === threadId ? 'bg-accent/5 border-l-accent' : 'hover:bg-sidebar/40 border-l-transparent'}
-        ${!msg.isRead ? 'bg-bg-card' : 'bg-black/[0.02] dark:bg-white/[0.02]'}
+        ${!msg.isRead ? 'bg-bg-card' : 'bg-black/[0.02] dark:bg-white/[0.02] opacity-60'}
         ${isSelected ? 'bg-accent/[0.08]' : ''}
       `}
     >
@@ -647,15 +667,22 @@ const MemoColumnItem = memo(({ msg, selectedThreadId, isSelected, onSelect, onTo
         </div>
       )}
       <div className="flex-1 min-w-0">
-        <div className="flex justify-between items-baseline mb-0">
-          <div className="flex items-center gap-1.5 truncate max-w-[200px] flex-1">
-            {!msg.isRead && <div className="w-1.5 h-1.5 shrink-0 rounded-full bg-blue-500 shadow-sm" />}
-            <div className="truncate">{participants}</div>
+        <div className="flex justify-between items-baseline mb-1">
+          <div className="flex items-center gap-1.5 truncate flex-1">
+            <div className={`truncate text-xs ${!msg.isRead ? 'font-bold text-text-primary' : 'font-normal text-text-secondary opacity-70'}`}>{participants}</div>
           </div>
-          <span className="text-[10px] text-text-secondary whitespace-nowrap opacity-70 font-medium">{formattedDate}</span>
+          <span className={`text-[10px] whitespace-nowrap font-medium ml-2 ${!msg.isRead ? 'text-text-primary opacity-80' : 'text-text-secondary opacity-40'}`}>{formattedDate}</span>
         </div>
-        <div className={`text-sm leading-tight truncate mb-0 pr-4 ${!msg.isRead ? 'font-semibold text-text-primary' : 'text-text-primary/90 font-medium'}`}>{msg.subject || '(no subject)'}</div>
-        <div className="text-xs text-text-secondary line-clamp-1 font-normal opacity-60">{msg.snippet}</div>
+        <div className="flex items-baseline gap-1.5 min-w-0 overflow-hidden">
+          <span className={`text-[13px] leading-snug truncate shrink-0 max-w-[85%] ${!msg.isRead ? 'font-bold text-text-primary' : 'text-text-secondary font-normal opacity-70'}`}>
+            {subjectText}
+          </span>
+          {snippetText && (
+            <span className={`text-xs font-normal truncate flex-1 min-w-0 ${!msg.isRead ? 'text-text-secondary opacity-50' : 'text-text-secondary opacity-30'}`}>
+              — {snippetText}
+            </span>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -667,23 +694,13 @@ const MemoListItem = memo(({ msg, isSelected, onSelect, onToggleSelect, onUpdate
   const threadId = msg.threadId || msg.id;
   const subjectText = (msg.subject || '(no subject)').trim();
   const snippetText = String(msg.snippet || '').trim();
-  const normalizedSubject = subjectText.replace(/\s+/g, ' ').toLowerCase();
-  let previewText = snippetText;
-  if (previewText) {
-    const normalizedPreview = previewText.replace(/\s+/g, ' ').toLowerCase();
-    if (normalizedPreview === normalizedSubject) {
-      previewText = '';
-    } else if (normalizedSubject && normalizedPreview.startsWith(`${normalizedSubject} `)) {
-      previewText = previewText.slice(subjectText.length).trim();
-    }
-  }
 
   return (
     <div
       onClick={() => onSelect(threadId)}
       className={`
-        flex items-center px-4 h-9 cursor-pointer border-b border-border/40 transition-colors group
-        ${!msg.isRead ? 'bg-bg-card text-text-primary' : 'bg-black/[0.01] dark:bg-white/[0.01] text-text-secondary/80 hover:bg-black/[0.03] dark:hover:bg-white/[0.03]'}
+        flex items-center px-4 h-10 cursor-pointer border-b border-border/40 transition-colors group
+        ${!msg.isRead ? 'bg-bg-card text-text-primary' : 'bg-black/[0.01] dark:bg-white/[0.01] text-text-secondary opacity-40 hover:opacity-70 hover:bg-black/[0.03] dark:hover:bg-white/[0.03]'}
         ${isSelected ? 'bg-accent/[0.08]' : ''}
       `}
     >
@@ -695,7 +712,6 @@ const MemoListItem = memo(({ msg, isSelected, onSelect, onToggleSelect, onUpdate
         </div>
       )}
       <div className="flex items-center gap-3 shrink-0 mr-4 w-48">
-        {!msg.isRead && <div className="w-2 h-2 shrink-0 rounded-full bg-blue-500 shadow-sm -ml-2" />}
         {!disableActions && (
           <button
             className="p-0.5 rounded hover:bg-black/10 dark:hover:bg-white/10"
@@ -705,15 +721,15 @@ const MemoListItem = memo(({ msg, isSelected, onSelect, onToggleSelect, onUpdate
             <Star className={`w-3.5 h-3.5 ${msg.isStarred ? 'fill-yellow-400 text-yellow-400' : 'text-text-secondary opacity-60 group-hover:opacity-100'}`} />
           </button>
         )}
-        <div className="flex-1 min-w-0">{participants}</div>
+        <div className={`flex-1 min-w-0 ${!msg.isRead ? 'font-bold' : 'font-normal'}`}>{participants}</div>
       </div>
       <div className="min-w-0 flex-1 flex items-baseline gap-2 pr-4">
-        <span className={`text-sm truncate max-w-[48%] ${!msg.isRead ? 'font-semibold text-text-primary' : 'text-text-primary/90 font-medium'}`}>{subjectText}</span>
-        {previewText && (
-          <span className="text-sm text-text-secondary font-normal opacity-50 truncate min-w-0 flex-1">— {previewText}</span>
+        <span className={`text-sm truncate shrink-0 max-w-[45%] ${!msg.isRead ? 'font-bold text-text-primary' : 'font-normal'}`}>{subjectText}</span>
+        {snippetText && (
+          <span className={`text-sm font-normal truncate min-w-0 flex-1 ${!msg.isRead ? 'text-text-secondary opacity-50' : 'opacity-60'}`}>— {snippetText}</span>
         )}
       </div>
-      <div className="text-xs text-text-secondary/70 font-medium whitespace-nowrap shrink-0 group-hover:hidden ml-3 min-w-[3.25rem] text-right">{formattedDate}</div>
+      <div className={`text-xs font-medium whitespace-nowrap shrink-0 group-hover:hidden ml-3 min-w-[3.25rem] text-right ${!msg.isRead ? 'text-text-primary' : 'opacity-40'}`}>{formattedDate}</div>
       {!disableActions && (
         <div className="hidden group-hover:flex items-center gap-1 shrink-0">
           <button

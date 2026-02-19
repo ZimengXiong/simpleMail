@@ -198,6 +198,7 @@ const ComposeModal = ({
     }
     setSendErrorMessage(null);
     setSendStatus('sending');
+    const shouldAttachToThread = Boolean(initialThreadId && (initialInReplyTo || initialReferences));
     sendMutation.mutate({
       identityId,
       to: normalizedTo,
@@ -205,7 +206,7 @@ const ComposeModal = ({
       bcc: bcc.split(',').map(e => e.trim()).filter(Boolean),
       subject: normalizedSubject,
       bodyText,
-      threadId: initialThreadId,
+      threadId: shouldAttachToThread ? initialThreadId : undefined,
       inReplyTo: initialInReplyTo,
       references: initialReferences,
       attachments: attachments.map(({ filename, contentType, contentBase64 }) => ({ filename, contentType, contentBase64 })),

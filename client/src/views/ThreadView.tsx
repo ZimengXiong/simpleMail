@@ -1,9 +1,10 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { api } from '../services/api';
 import ComposeModal from '../components/ComposeModal';
 import { format } from 'date-fns';
+import { sanitizeEmailHtml } from '../services/htmlSanitizer';
 import {
   ChevronLeft,
   Loader2,
@@ -18,6 +19,7 @@ import {
 } from 'lucide-react';
 
 import type { MessageRecord } from '../types/index';
+import { buildReplyReferencesHeader, normalizeMessageIdHeader, orderThreadMessages } from '../services/threading';
 type MessagesQueryResult = { messages: MessageRecord[]; totalCount: number };
 
 const isStarredFolderToken = (value: unknown) => String(value ?? '').trim().toUpperCase().includes('STARRED');
@@ -102,23 +104,9 @@ const splitAddressHeader = (header: string | null | undefined): string[] => {
     .filter(Boolean);
 };
 
-const normalizeMessageIdHeader = (value: string | null | undefined): string | null => {
-  if (!value) return null;
-  const trimmed = value.trim();
-  if (!trimmed) return null;
-  const angleMatch = trimmed.match(/<[^>]+>/);
-  if (angleMatch?.[0]) return angleMatch[0];
-  const token = trimmed.split(/\s+/)[0];
-  if (!token) return null;
-  return token.startsWith('<') && token.endsWith('>') ? token : `<${token.replace(/[<>]/g, '')}>`;
-};
-
-const buildReplyReferences = (message: MessageRecord): string | undefined => {
-  const currentMessageId = normalizeMessageIdHeader(message.messageId);
-  if (!currentMessageId) return undefined;
-  const existing = (message.referencesHeader ?? '').trim();
-  if (!existing) return currentMessageId;
-  return existing.includes(currentMessageId) ? existing : `${existing} ${currentMessageId}`;
+const sortableTimestamp = (value: string | null | undefined) => {
+  const parsed = Date.parse(value ?? '');
+  return Number.isFinite(parsed) ? parsed : Number.NEGATIVE_INFINITY;
 };
 
 const quoteForReply = (text: string): string => {
@@ -157,13 +145,14 @@ const ThreadView = () => {
     bcc: string;
     subject: string;
     bodyText: string;
+    threadId?: string;
     inReplyTo?: string;
     references?: string;
   } | null>(null);
 
   const { data: messages, isLoading } = useQuery({
     queryKey: ['thread', threadId, connectorId ?? 'all'],
-    queryFn: () => api.messages.getThread(threadId!, connectorId),
+    queryFn: () => api.messages.getThread(threadId!),
     enabled: !!threadId,
     staleTime: 30_000,
   });
@@ -206,8 +195,23 @@ const ThreadView = () => {
     },
   });
 
-  const firstMsg = messages?.[0];
-  const threadSubject = firstMsg?.subject || '(no subject)';
+  const orderedThreadNodes = useMemo(
+    () => orderThreadMessages(messages ?? []),
+    [messages],
+  );
+  const newestNode = useMemo(() => {
+    if (orderedThreadNodes.length === 0) {
+      return null;
+    }
+    return orderedThreadNodes.reduce((latest, node) => {
+      const latestTs = sortableTimestamp(latest.message.receivedAt);
+      const nodeTs = sortableTimestamp(node.message.receivedAt);
+      return nodeTs > latestTs ? node : latest;
+    });
+  }, [orderedThreadNodes]);
+  const newestMessage = newestNode?.message ?? null;
+  const newestMessageId = newestMessage?.id ?? null;
+  const threadSubject = newestMessage?.subject || '(no subject)';
   const threadConversationId = threadId || '';
 
   const openReplyComposer = (mode: 'reply' | 'replyAll' | 'forward', message: MessageRecord | null) => {
@@ -230,8 +234,9 @@ const ThreadView = () => {
       bcc: '',
       subject: makeReplySubject(message.subject, mode),
       bodyText: makeInitialBodyText(message, mode),
+      threadId: mode === 'forward' ? undefined : threadConversationId,
       inReplyTo: mode === 'forward' ? undefined : (normalizeMessageIdHeader(message.messageId) ?? undefined),
-      references: mode === 'forward' ? undefined : buildReplyReferences(message),
+      references: mode === 'forward' ? undefined : buildReplyReferencesHeader(message.referencesHeader, message.messageId),
     });
   };
 
@@ -243,29 +248,29 @@ const ThreadView = () => {
 
   return (
     <div className="flex-1 flex flex-col h-full bg-white overflow-hidden">
-      <div className="h-12 border-b border-border flex items-center px-4 gap-4 shrink-0">
+      <div className="h-14 border-b border-border flex items-center px-4 gap-4 shrink-0 bg-bg-card">
         <button onClick={() => navigate(-1)} className="p-1.5 hover:bg-black/5 rounded-md text-text-secondary">
           <ChevronLeft className="w-5 h-5" />
         </button>
-        <h2 className="text-sm font-semibold truncate flex-1">
+        <h2 className="text-lg font-bold text-text-primary truncate flex-1">
           {threadSubject}
         </h2>
         <div className="flex items-center gap-1">
           <button
-            onClick={() => firstMsg && updateMutation.mutate({ messageId: firstMsg.id, data: { isStarred: !firstMsg.isStarred } })}
+            onClick={() => newestMessage && updateMutation.mutate({ messageId: newestMessage.id, data: { isStarred: !newestMessage.isStarred } })}
             className="p-1.5 hover:bg-black/5 rounded-md text-text-secondary"
           >
-            <Star className="w-4 h-4" />
+            <Star className={`w-4 h-4 ${newestMessage?.isStarred ? 'fill-yellow-400 text-yellow-400' : ''}`} />
           </button>
           <button
-            onClick={() => firstMsg && updateMutation.mutate({ messageId: firstMsg.id, data: { isRead: !firstMsg.isRead } })}
+            onClick={() => newestMessage && updateMutation.mutate({ messageId: newestMessage.id, data: { isRead: !newestMessage.isRead } })}
             className="p-1.5 hover:bg-black/5 rounded-md text-text-secondary"
-            title={firstMsg?.isRead ? 'Mark as Unread' : 'Mark as Read'}
+            title={newestMessage?.isRead ? 'Mark as Unread' : 'Mark as Read'}
           >
-            {firstMsg?.isRead ? <Mail className="w-4 h-4" /> : <MailOpen className="w-4 h-4" />}
+            {newestMessage?.isRead ? <Mail className="w-4 h-4" /> : <MailOpen className="w-4 h-4" />}
           </button>
           <button
-            onClick={() => firstMsg && api.messages.downloadRaw(firstMsg.id)}
+            onClick={() => newestMessage && api.messages.downloadRaw(newestMessage.id)}
             className="p-1.5 hover:bg-black/5 rounded-md text-text-secondary"
             title="Download raw message"
           >
@@ -274,16 +279,20 @@ const ThreadView = () => {
         </div>
       </div>
 
-      <div className="flex-1 overflow-y-auto bg-[#fbfbfa] p-8">
+      <div className="flex-1 overflow-y-auto bg-[#fbfbfa] p-8 pt-12">
         <div className="max-w-4xl mx-auto space-y-6">
-          <div className="mb-8">
-            <h1 className="text-2xl font-bold text-text-primary tracking-tight">
+          <div className="pb-6 mb-8">
+            <h1 className="text-3xl md:text-4xl font-extrabold text-text-primary tracking-tight leading-tight">
               {threadSubject}
             </h1>
           </div>
 
-          {messages?.map((msg) => (
-            <div key={msg.id} className="bg-white border border-border rounded-lg shadow-sm overflow-hidden">
+          {orderedThreadNodes.map((node) => {
+            const msg = node.message;
+            const depthOffsetPx = Math.min(node.depth, 6) * 20;
+            const safeBodyHtml = msg.bodyHtml ? sanitizeEmailHtml(msg.bodyHtml) : null;
+            return (
+            <div key={msg.id} className={`bg-white border border-border rounded-lg shadow-sm overflow-hidden ${msg.id === newestMessageId ? 'ring-1 ring-accent/15' : ''}`} style={depthOffsetPx > 0 ? { marginLeft: `${depthOffsetPx}px` } : undefined}>
               <div className="px-4 py-3 border-b border-border bg-sidebar/30 flex justify-between items-center">
                 <div className="flex items-center gap-3">
                   <div className="w-8 h-8 rounded-full bg-accent/10 text-accent flex items-center justify-center font-bold text-xs">
@@ -322,18 +331,19 @@ const ThreadView = () => {
                 </div>
               </div>
               <div className="p-6 text-sm leading-relaxed whitespace-pre-wrap font-sans">
-                {msg.bodyHtml ? (
-                  <div dangerouslySetInnerHTML={{ __html: msg.bodyHtml }} className="mail-content" />
+                {safeBodyHtml ? (
+                  <div dangerouslySetInnerHTML={{ __html: safeBodyHtml }} className="mail-content" />
                 ) : (
                   msg.bodyText
                 )}
               </div>
             </div>
-          ))}
+            );
+          })}
 
           <div className="pt-8 flex justify-center">
             <button
-              onClick={() => openReplyComposer('reply', firstMsg || null)}
+              onClick={() => openReplyComposer('reply', newestMessage)}
               className="flex items-center gap-2 px-6 py-2 border border-border rounded-full text-sm font-bold text-text-secondary hover:bg-sidebar hover:text-text-primary transition-all"
             >
               <CornerUpLeft className="w-4 h-4" />
@@ -351,7 +361,7 @@ const ThreadView = () => {
           initialBcc={replyContext.bcc}
           initialSubject={replyContext.subject}
           initialBodyText={replyContext.bodyText}
-          initialThreadId={threadConversationId}
+          initialThreadId={replyContext.threadId}
           initialInReplyTo={replyContext.inReplyTo}
           initialReferences={replyContext.references}
         />

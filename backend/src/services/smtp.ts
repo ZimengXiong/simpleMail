@@ -8,6 +8,7 @@ import {
   isGoogleTokenExpiringSoon,
 } from './googleOAuth.js';
 import { gmailApiRequest } from './gmailApi.js';
+import { messageIdVariants, normalizeMessageId } from './threadingUtils.js';
 
 const require = createRequire(import.meta.url);
 const MailComposer = require('nodemailer/lib/mail-composer/index.js');
@@ -71,8 +72,13 @@ export const verifyOutgoingConnectorCredentials = async (input: {
     authType: input.authType ?? input.authConfig?.authType ?? 'password',
     ...(input.authConfig ?? {}),
   };
+  const authType = String(authConfig.authType ?? 'password').toLowerCase();
 
-  if ((authConfig.authType ?? 'password') !== 'oauth2') {
+  if (authType === 'oauth2' && provider !== 'gmail') {
+    throw new Error('oauth2 outgoing auth is currently only supported for provider=gmail');
+  }
+
+  if (authType !== 'oauth2') {
     const username = String(authConfig.username ?? '').trim();
     const password = String(authConfig.password ?? '');
     if (!username || !password) {
@@ -136,26 +142,33 @@ const isRecoverableOauth2Error = (error: unknown) => {
   );
 };
 
-const normalizeMessageIdHeader = (value?: string | null): string | undefined => {
-  if (!value) return undefined;
+const extractNormalizedMessageIds = (value?: string | null): string[] => {
+  if (!value) return [];
   const trimmed = value.trim();
-  if (!trimmed) return undefined;
-  const angleMatch = trimmed.match(/<[^>]+>/);
-  if (angleMatch?.[0]) return angleMatch[0];
-  const token = trimmed.split(/\s+/)[0];
-  if (!token) return undefined;
-  return `<${token.replace(/[<>]/g, '')}>`;
+  if (!trimmed) return [];
+
+  const angleTokens = trimmed.match(/<[^>\s]+>/g) ?? [];
+  const candidates = angleTokens.length > 0 ? angleTokens : trimmed.split(/\s+/);
+
+  const dedupe = new Set<string>();
+  for (const candidate of candidates) {
+    const normalized = normalizeMessageId(candidate);
+    if (normalized) {
+      dedupe.add(normalized);
+    }
+  }
+  return Array.from(dedupe);
+};
+
+const normalizeMessageIdHeader = (value?: string | null): string | undefined => {
+  const [first] = extractNormalizedMessageIds(value);
+  return first ? `<${first}>` : undefined;
 };
 
 const normalizeReferencesHeader = (value?: string | null): string | undefined => {
-  if (!value) return undefined;
-  const parts = value
-    .trim()
-    .split(/\s+/)
-    .map((part) => normalizeMessageIdHeader(part))
-    .filter((part): part is string => Boolean(part));
+  const parts = extractNormalizedMessageIds(value);
   if (parts.length === 0) return undefined;
-  return Array.from(new Set(parts)).join(' ');
+  return parts.map((part) => `<${part}>`).join(' ');
 };
 
 const parseEnvelopeRecipients = (value: string | undefined, extra: string[] = []) => {
@@ -233,6 +246,7 @@ export const sendThroughConnector = async (
   const replyTo = identity.reply_to || outgoing.from_envelope_defaults?.replyTo;
   const inReplyTo = normalizeMessageIdHeader(payload.inReplyTo);
   const references = normalizeReferencesHeader(payload.references);
+  const referenceMessageIds = extractNormalizedMessageIds(references);
   const composedBodyText = payload.bodyText ?? '';
   const composedBodyHtml = payload.bodyHtml ?? '';
   const bodyTextWithSignature = signature
@@ -278,18 +292,41 @@ export const sendThroughConnector = async (
   const useGmailApiSend = outgoing.provider === 'gmail' && (outgoing.auth_config?.authType ?? 'password') === 'oauth2';
   if (useGmailApiSend) {
     if (inReplyTo) {
+      const inReplyVariants = messageIdVariants(inReplyTo);
       const byMessageId = await query<{ gmail_thread_id: string | null }>(
         `SELECT m.gmail_thread_id
            FROM messages m
            INNER JOIN incoming_connectors ic ON ic.id = m.incoming_connector_id
           WHERE ic.user_id = $1
             AND m.gmail_thread_id IS NOT NULL
-            AND m.message_id = $2
+            AND LOWER(COALESCE(m.message_id, '')) = ANY($2::text[])
           ORDER BY m.received_at DESC
           LIMIT 1`,
-        [userId, inReplyTo],
+        [userId, inReplyVariants],
       );
       gmailApiThreadId = byMessageId.rows[0]?.gmail_thread_id ?? null;
+    }
+    if (!gmailApiThreadId && referenceMessageIds.length > 0) {
+      const referenceVariants = Array.from(new Set(referenceMessageIds.flatMap((value) => messageIdVariants(value))));
+      const byReferences = await query<{ gmail_thread_id: string | null; message_id: string }>(
+        `SELECT m.gmail_thread_id,
+                LOWER(COALESCE(m.message_id, '')) as message_id
+           FROM messages m
+           INNER JOIN incoming_connectors ic ON ic.id = m.incoming_connector_id
+          WHERE ic.user_id = $1
+            AND m.gmail_thread_id IS NOT NULL
+            AND LOWER(COALESCE(m.message_id, '')) = ANY($2::text[])
+          ORDER BY m.received_at DESC`,
+        [userId, referenceVariants],
+      );
+
+      for (let refIdx = referenceMessageIds.length - 1; refIdx >= 0 && !gmailApiThreadId; refIdx -= 1) {
+        const variants = new Set(messageIdVariants(referenceMessageIds[refIdx]));
+        const match = byReferences.rows.find((row) => variants.has(row.message_id));
+        if (match?.gmail_thread_id) {
+          gmailApiThreadId = match.gmail_thread_id;
+        }
+      }
     }
     if (!gmailApiThreadId && payload.threadId) {
       const byLocalThread = await query<{ gmail_thread_id: string | null }>(

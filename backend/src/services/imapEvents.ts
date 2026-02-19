@@ -42,3 +42,46 @@ export const listSyncEvents = async (userId: string, since = 0, limit = 100) => 
   );
   return result.rows;
 };
+
+export const pruneSyncEvents = async (options?: {
+  retentionDays?: number;
+  batchSize?: number;
+  maxBatches?: number;
+}) => {
+  const toPositiveInt = (value: unknown, fallback: number) => {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      return fallback;
+    }
+    return Math.floor(parsed);
+  };
+
+  const retentionDays = toPositiveInt(options?.retentionDays, 14);
+  const batchSize = toPositiveInt(options?.batchSize, 2000);
+  const maxBatches = toPositiveInt(options?.maxBatches, 3);
+
+  let pruned = 0;
+  for (let batch = 0; batch < maxBatches; batch += 1) {
+    const deleteResult = await query<{ id: string }>(
+      `WITH stale AS (
+         SELECT id
+           FROM sync_events
+          WHERE created_at < (NOW() - make_interval(days => $1::int))
+          ORDER BY id ASC
+          LIMIT $2
+       )
+       DELETE FROM sync_events se
+        USING stale
+        WHERE se.id = stale.id
+      RETURNING se.id`,
+      [retentionDays, batchSize],
+    );
+    const deletedRows = deleteResult.rows.length;
+    pruned += deletedRows;
+    if (deletedRows < batchSize) {
+      break;
+    }
+  }
+
+  return { pruned };
+};

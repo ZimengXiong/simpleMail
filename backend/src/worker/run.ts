@@ -3,6 +3,7 @@ import { env } from '../config/env.js';
 import { query } from '../db/pool.js';
 import { reapStaleSyncStates, runIdleWatchdog } from '../services/imap.js';
 import { renewExpiringGmailPushWatches } from '../services/gmailPush.js';
+import { pruneSyncEvents } from '../services/imapEvents.js';
 import {
   hydrateGmailMailboxContentTask,
   scanAttachmentTask,
@@ -51,6 +52,10 @@ const GMAIL_PUSH_RENEW_INTERVAL_MS = 5 * 60_000;
 const startMaintenanceLoops = () => {
   let running = false;
   let lastGmailPushRenewAt = 0;
+  let lastSyncEventsPruneAt = 0;
+  const syncEventsPruneIntervalMs = Number.isFinite(env.sync.syncEventsPruneIntervalMs) && env.sync.syncEventsPruneIntervalMs > 0
+    ? Math.floor(env.sync.syncEventsPruneIntervalMs)
+    : 300_000;
 
   const runMaintenanceTick = async () => {
     if (running) {
@@ -69,6 +74,15 @@ const startMaintenanceLoops = () => {
         lastGmailPushRenewAt = nowMs;
         gmailResult = await renewExpiringGmailPushWatches();
       }
+      let syncEventsPruneResult: { pruned: number } | null = null;
+      if ((nowMs - lastSyncEventsPruneAt) >= syncEventsPruneIntervalMs) {
+        lastSyncEventsPruneAt = nowMs;
+        syncEventsPruneResult = await pruneSyncEvents({
+          retentionDays: env.sync.syncEventsRetentionDays,
+          batchSize: env.sync.syncEventsPruneBatchSize,
+          maxBatches: env.sync.syncEventsPruneMaxBatches,
+        });
+      }
 
       if ((staleResult.reaped ?? 0) > 0) {
         console.info(`[maintenance] reaped stale sync states: ${staleResult.reaped}`);
@@ -80,6 +94,9 @@ const startMaintenanceLoops = () => {
         console.info(
           `[maintenance] gmail push renewals: renewed=${gmailResult.renewed} failed=${gmailResult.failed} skipped=${gmailResult.skipped}`,
         );
+      }
+      if (syncEventsPruneResult && syncEventsPruneResult.pruned > 0) {
+        console.info(`[maintenance] pruned sync events: ${syncEventsPruneResult.pruned}`);
       }
     } catch (error) {
       console.warn('[maintenance] tick failed', error);

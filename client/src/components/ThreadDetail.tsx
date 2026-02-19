@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { api } from '../services/api';
 import { format, isToday, isYesterday } from 'date-fns';
@@ -22,6 +22,8 @@ import {
 } from 'lucide-react';
 import type { AttachmentRecord, MessageRecord } from '../types/index';
 import Avatar from './Avatar';
+import { sanitizeEmailHtml } from '../services/htmlSanitizer';
+import { buildReplyReferencesHeader, normalizeMessageIdHeader, orderThreadMessages } from '../services/threading';
 
 interface ThreadDetailProps {
   threadId: string;
@@ -37,6 +39,7 @@ interface ReplyContext {
   subject: string;
   bodyText: string;
   identityId?: string;
+  threadId?: string;
   inReplyTo?: string;
   references?: string;
   initialFocus: 'to' | 'body';
@@ -57,6 +60,11 @@ const parseEmails = (header: string | null | undefined): string[] => {
   if (!header) return [];
   const matches = header.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g) ?? [];
   return Array.from(new Set(matches.map(e => e.toLowerCase())));
+};
+
+const sortableTimestamp = (value: string | null | undefined) => {
+  const parsed = Date.parse(value ?? '');
+  return Number.isFinite(parsed) ? parsed : Number.NEGATIVE_INFINITY;
 };
 
 const makeReplySubject = (subject: string | null, mode: ComposeMode) => {
@@ -86,22 +94,6 @@ const buildQuotedBody = (message: MessageRecord, mode: ComposeMode) => {
   const header = `\n\nOn ${dateLine}, ${message.fromHeader || 'Unknown'} wrote:\n`;
   const quotedLines = body ? body.split('\n').map(line => `> ${line}`) : ['> '];
   return header + quotedLines.join('\n');
-};
-
-const normalizeMessageIdHeader = (id: string | null | undefined): string | undefined => {
-  if (!id) return undefined;
-  const trimmed = id.trim();
-  if (!trimmed) return undefined;
-  if (trimmed.startsWith('<') && trimmed.endsWith('>')) return trimmed;
-  return `<${trimmed}>`;
-};
-
-const buildReplyReferences = (message: MessageRecord): string | undefined => {
-  const currentMessageId = normalizeMessageIdHeader(message.messageId);
-  if (!currentMessageId) return undefined;
-  const existing = (message.referencesHeader ?? '').trim();
-  if (!existing) return currentMessageId;
-  return existing.includes(currentMessageId) ? existing : `${existing} ${currentMessageId}`;
 };
 
 const applyThreadPatch = (
@@ -170,12 +162,30 @@ const ThreadDetail = ({ threadId, connectorId, onActionComplete }: ThreadDetailP
 
   const { data: messages, isLoading, isError } = useQuery({
     queryKey: threadQueryKey,
-    queryFn: () => api.messages.getThread(threadId, connectorId),
+    queryFn: () => api.messages.getThread(threadId),
     enabled: !!threadId,
   });
 
+  const orderedThreadNodes = useMemo(
+    () => orderThreadMessages(messages ?? []),
+    [messages],
+  );
+
+  const newestNode = useMemo(() => {
+    if (orderedThreadNodes.length === 0) {
+      return null;
+    }
+    return orderedThreadNodes.reduce((latest, node) => {
+      const latestTs = sortableTimestamp(latest.message.receivedAt);
+      const nodeTs = sortableTimestamp(node.message.receivedAt);
+      return nodeTs > latestTs ? node : latest;
+    });
+  }, [orderedThreadNodes]);
+  const newestMessage = newestNode?.message ?? null;
+  const newestMessageId = newestMessage?.id ?? null;
+
   useEffect(() => {
-    if (!isLoading && messages && newestMessageRef.current && scrollContainerRef.current) {
+    if (!isLoading && orderedThreadNodes.length > 0 && newestMessageRef.current && scrollContainerRef.current) {
       const timer = setTimeout(() => {
         if (newestMessageRef.current && scrollContainerRef.current) {
           scrollContainerRef.current.scrollTo({
@@ -186,7 +196,7 @@ const ThreadDetail = ({ threadId, connectorId, onActionComplete }: ThreadDetailP
       }, 150);
       return () => clearTimeout(timer);
     }
-  }, [isLoading, messages, threadId]);
+  }, [isLoading, orderedThreadNodes, threadId]);
 
   const updateMutation = useMutation({
     mutationFn: (payload: { messageId: string; data: { delete?: boolean; isRead?: boolean; isStarred?: boolean } }) =>
@@ -237,7 +247,7 @@ const ThreadDetail = ({ threadId, connectorId, onActionComplete }: ThreadDetailP
     const toRecipients = parseEmails(message.toHeader);
     const ccRecipients = parseEmails(message.ccHeader ?? null);
     const inReplyTo = normalizeMessageIdHeader(message.messageId) ?? undefined;
-    const references = buildReplyReferences(message);
+    const references = buildReplyReferencesHeader(message.referencesHeader, message.messageId);
 
     // Try to find the best identity to reply FROM
     const allRecipients = new Set([...toRecipients, ...ccRecipients].map(e => e.toLowerCase()));
@@ -254,6 +264,7 @@ const ThreadDetail = ({ threadId, connectorId, onActionComplete }: ThreadDetailP
         subject: makeReplySubject(message.subject, mode),
         bodyText: buildQuotedBody(message, mode),
         identityId,
+        threadId: undefined,
         initialFocus: 'to'
       });
       return;
@@ -266,6 +277,7 @@ const ThreadDetail = ({ threadId, connectorId, onActionComplete }: ThreadDetailP
         subject: makeReplySubject(message.subject, mode),
         bodyText: buildQuotedBody(message, mode),
         identityId,
+        threadId,
         inReplyTo,
         references,
         initialFocus: 'body'
@@ -273,13 +285,15 @@ const ThreadDetail = ({ threadId, connectorId, onActionComplete }: ThreadDetailP
       return;
     }
 
-    const others = Array.from(new Set([...toRecipients, ...ccRecipients].filter(e => e !== from)));
+    const excluded = new Set([from, bestIdentity?.emailAddress ?? ''].map((value) => value.toLowerCase()).filter(Boolean));
+    const others = Array.from(new Set([...toRecipients, ...ccRecipients].filter((email) => !excluded.has(email.toLowerCase()))));
     setReplyContext({
       to: from,
       cc: others.join(', '),
       subject: makeReplySubject(message.subject, mode),
       bodyText: buildQuotedBody(message, mode),
       identityId,
+      threadId,
       inReplyTo,
       references,
       initialFocus: 'body'
@@ -287,36 +301,40 @@ const ThreadDetail = ({ threadId, connectorId, onActionComplete }: ThreadDetailP
   };
 
   if (isLoading) return <div className="flex-1 flex items-center justify-center bg-bg-card"><Loader2 className="w-6 h-6 animate-spin text-text-secondary" /></div>;
-  if (isError || !messages || messages.length === 0) return <div className="flex-1 flex flex-col items-center justify-center text-text-secondary p-8 text-center bg-bg-card"><AlertCircle className="w-12 h-12 mb-4 text-red-400 opacity-50" /><h3 className="text-base font-bold text-text-primary mb-1">Thread not found</h3></div>;
-
-  const chronMessages = [...messages].reverse();
-  const newestMsg = chronMessages[chronMessages.length - 1];
+  if (isError || !messages || orderedThreadNodes.length === 0 || !newestMessage) return <div className="flex-1 flex flex-col items-center justify-center text-text-secondary p-8 text-center bg-bg-card"><AlertCircle className="w-12 h-12 mb-4 text-red-400 opacity-50" /><h3 className="text-base font-bold text-text-primary mb-1">Thread not found</h3></div>;
 
   return (
     <div className="flex flex-col h-full bg-bg-card overflow-hidden font-sans">
       <div className="h-11 border-b border-border/60 flex items-center px-4 gap-2 shrink-0 bg-bg-card">
         <div className="flex items-center gap-1 border-r border-border/40 pr-2 mr-1">
-          <button onClick={() => updateMutation.mutate({ messageId: messages[0].id, data: { delete: true } })} className="p-1.5 hover:bg-red-50 dark:hover:bg-red-900/20 hover:text-red-500 rounded-md text-text-secondary transition-colors" title="Delete"><Trash2 className="w-4 h-4" /></button>
+          <button onClick={() => updateMutation.mutate({ messageId: newestMessage.id, data: { delete: true } })} className="p-1.5 hover:bg-red-50 dark:hover:bg-red-900/20 hover:text-red-500 rounded-md text-text-secondary transition-colors" title="Delete"><Trash2 className="w-4 h-4" /></button>
         </div>
         <div className="flex items-center gap-1">
-          <button onClick={() => updateMutation.mutate({ messageId: messages[0].id, data: { isRead: !messages[0].isRead } })} className="p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-md text-text-secondary transition-colors" title={messages[0].isRead ? "Mark as Unread" : "Mark as Read"}>{messages[0].isRead ? <MailIcon className="w-4 h-4" /> : <MailOpen className="w-4 h-4" />}</button>
+          <button onClick={() => updateMutation.mutate({ messageId: newestMessage.id, data: { isRead: !newestMessage.isRead } })} className="p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-md text-text-secondary transition-colors" title={newestMessage.isRead ? "Mark as Unread" : "Mark as Read"}>{newestMessage.isRead ? <MailIcon className="w-4 h-4" /> : <MailOpen className="w-4 h-4" />}</button>
         </div>
         <div className="flex-1 min-w-0" />
         <div className="flex items-center gap-1 text-text-secondary">
-          <button className="p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-md" onClick={() => window.open(api.messages.getRawUrl(messages[0].id), '_blank')}><ExternalLink className="w-4 h-4" /></button>
+          <button className="p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-md" onClick={() => { void api.messages.viewRaw(newestMessage.id); }}><ExternalLink className="w-4 h-4" /></button>
         </div>
       </div>
 
       <div ref={scrollContainerRef} className="flex-1 overflow-y-auto bg-sidebar/30 p-4 pt-6 custom-scrollbar">
         <div className="w-full max-w-4xl mx-auto space-y-4 pb-32">
-          <div className="px-1 mb-6"><h1 className="text-xl font-bold text-text-primary tracking-tight leading-tight">{newestMsg.subject || '(no subject)'}</h1></div>
+          <div className="px-1 mb-8 pb-6 border-b border-border/40">
+            <h1 className="text-2xl md:text-3xl font-extrabold text-text-primary tracking-tight leading-tight">
+              {newestMessage.subject || '(no subject)'}
+            </h1>
+          </div>
           <div className="space-y-4">
-            {chronMessages.map((msg, index) => {
-              const isNewest = index === chronMessages.length - 1;
+            {orderedThreadNodes.map((node) => {
+              const msg = node.message;
+              const isNewest = msg.id === newestMessageId;
+              const depthOffsetPx = Math.min(node.depth, 6) * 20;
               return (
-                <div key={msg.id} ref={isNewest ? newestMessageRef : null}>
+                <div key={msg.id} ref={isNewest ? newestMessageRef : null} style={depthOffsetPx > 0 ? { marginLeft: `${depthOffsetPx}px` } : undefined}>
                   <MessageItem
                     msg={msg}
+                    depth={node.depth}
                     defaultExpanded={isNewest}
                     onReply={() => openComposer('reply', msg)}
                     onToggleStar={() => updateMutation.mutate({ messageId: msg.id, data: { isStarred: !msg.isStarred } })}
@@ -326,8 +344,8 @@ const ThreadDetail = ({ threadId, connectorId, onActionComplete }: ThreadDetailP
             })}
           </div>
           <div className="pt-8 flex justify-center gap-3">
-            <button onClick={() => openComposer('replyAll', newestMsg)} className="flex items-center gap-2 px-5 py-1.5 bg-bg-card border border-border rounded-md text-size-sm font-semibold text-text-secondary hover:text-text-primary hover:border-accent/40 transition-all active:scale-[0.98] shadow-xs"><CornerUpLeft className="w-3.5 h-3.5 text-accent" />Reply all</button>
-            <button onClick={() => openComposer('forward', newestMsg)} className="flex items-center gap-2 px-5 py-1.5 bg-bg-card border border-border rounded-md text-size-sm font-semibold text-text-secondary hover:text-text-primary hover:border-accent/40 transition-all active:scale-[0.98] shadow-xs"><Forward className="w-3.5 h-3.5 text-text-secondary" />Forward</button>
+            <button onClick={() => openComposer('replyAll', newestMessage)} className="flex items-center gap-2 px-5 py-1.5 bg-bg-card border border-border rounded-md text-size-sm font-semibold text-text-secondary hover:text-text-primary hover:border-accent/40 transition-all active:scale-[0.98] shadow-xs"><CornerUpLeft className="w-3.5 h-3.5 text-accent" />Reply all</button>
+            <button onClick={() => openComposer('forward', newestMessage)} className="flex items-center gap-2 px-5 py-1.5 bg-bg-card border border-border rounded-md text-size-sm font-semibold text-text-secondary hover:text-text-primary hover:border-accent/40 transition-all active:scale-[0.98] shadow-xs"><Forward className="w-3.5 h-3.5 text-text-secondary" />Forward</button>
           </div>
         </div>
       </div>
@@ -340,7 +358,7 @@ const ThreadDetail = ({ threadId, connectorId, onActionComplete }: ThreadDetailP
           initialSubject={replyContext.subject}
           initialBodyText={replyContext.bodyText}
           initialIdentityId={replyContext.identityId}
-          initialThreadId={threadId}
+          initialThreadId={replyContext.threadId}
           initialInReplyTo={replyContext.inReplyTo}
           initialReferences={replyContext.references}
           initialFocus={replyContext.initialFocus}
@@ -350,16 +368,19 @@ const ThreadDetail = ({ threadId, connectorId, onActionComplete }: ThreadDetailP
   );
 };
 
-const MessageItem = ({ msg, defaultExpanded, onReply, onToggleStar }: { msg: any, defaultExpanded: boolean, onReply: () => void, onToggleStar: () => void }) => {
+const MessageItem = ({ msg, depth, defaultExpanded, onReply, onToggleStar }: { msg: MessageRecord; depth: number, defaultExpanded: boolean, onReply: () => void, onToggleStar: () => void }) => {
   const [isExpanded, setIsExpanded] = useState(defaultExpanded);
   const [showDetails, setShowDetails] = useState(false);
+  const safeBodyHtml = useMemo(
+    () => (msg.bodyHtml ? sanitizeEmailHtml(msg.bodyHtml) : null),
+    [msg.bodyHtml],
+  );
   const from = parseFromHeader(msg.fromHeader);
-  const rawHeaders = msg.raw_headers || {};
-  const cc = rawHeaders.cc || null;
-  const bcc = rawHeaders.bcc || null;
+  const cc = msg.ccHeader || null;
+  const bcc = msg.bccHeader || null;
 
   return (
-    <div className={`bg-bg-card border border-border rounded-md shadow-xs overflow-hidden transition-all ${!isExpanded ? 'hover:border-accent/30 cursor-pointer' : ''}`}>
+    <div className={`bg-bg-card border border-border rounded-md shadow-xs overflow-hidden transition-all ${depth > 0 ? 'border-l-4 border-l-accent/20' : ''} ${!isExpanded ? 'hover:border-accent/30 cursor-pointer' : ''}`}>
       <div className={`px-4 py-3 flex items-center justify-between transition-colors relative ${isExpanded ? 'border-b border-border/40 bg-black/[0.01] dark:bg-white/[0.01]' : 'hover:bg-black/[0.02] dark:hover:bg-white/[0.02]'}`}>
         <div className="absolute inset-0 cursor-pointer z-0" onClick={() => setIsExpanded(!isExpanded)} />
         <div className="flex items-center gap-3 flex-1 min-w-0 z-10 pointer-events-none">
@@ -402,6 +423,7 @@ const MessageItem = ({ msg, defaultExpanded, onReply, onToggleStar }: { msg: any
             {cc && <><span className="text-text-secondary font-semibold text-right opacity-60">cc:</span><span className="text-text-primary font-medium">{cc}</span></>}
             {bcc && <><span className="text-text-secondary font-semibold text-right opacity-60">bcc:</span><span className="text-text-primary font-medium">{bcc}</span></>}
             <span className="text-text-secondary font-semibold text-right opacity-60">date:</span><span className="text-text-primary font-medium">{msg.receivedAt && format(new Date(msg.receivedAt), 'MMMM d, yyyy, h:mm a')}</span>
+            <span className="text-text-secondary font-semibold text-right opacity-60">subject:</span><span className="text-text-primary font-medium">{msg.subject || '(no subject)'}</span>
           </div>
         </div>
       )}
@@ -409,13 +431,15 @@ const MessageItem = ({ msg, defaultExpanded, onReply, onToggleStar }: { msg: any
       {isExpanded && (
         <>
           <div className="bg-white p-6 text-base leading-relaxed selection:bg-accent/10 text-[#222]">
-            {msg.bodyHtml ? (
+            {safeBodyHtml ? (
               <div className="w-full min-w-0 overflow-hidden">
                 <iframe
                   title={`msg-${msg.id}`}
                   scrolling="no"
-                  srcDoc={`<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-size: 14px; color: #222 !important; line-height: 1.5; margin: 0; padding: 0; padding-bottom: 24px; width: 100% !important; overflow: hidden !important; background-color: #ffffff !important; } img { max-width: 100%; height: auto; display: block; } table { max-width: 100% !important; height: auto !important; border-collapse: collapse; } a { color: #2383e2 !important; text-decoration: none; } a:hover { text-decoration: underline; }</style></head><body><div id="content-wrapper">${msg.bodyHtml}</div></body></html>`}
+                  srcDoc={`<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-size: 14px; color: #222 !important; line-height: 1.5; margin: 0; padding: 0; padding-bottom: 24px; width: 100% !important; overflow: hidden !important; background-color: #ffffff !important; } img { max-width: 100%; height: auto; display: block; } table { max-width: 100% !important; height: auto !important; border-collapse: collapse; } a { color: #2383e2 !important; text-decoration: none; } a:hover { text-decoration: underline; }</style></head><body><div id="content-wrapper">${safeBodyHtml}</div></body></html>`}
                   className="w-full border-none transition-all duration-200"
+                  sandbox="allow-popups allow-popups-to-escape-sandbox allow-same-origin"
+                  referrerPolicy="no-referrer"
                   onLoad={(e) => {
                     const iframe = e.currentTarget;
                     const updateHeight = () => {
@@ -427,9 +451,9 @@ const MessageItem = ({ msg, defaultExpanded, onReply, onToggleStar }: { msg: any
                     updateHeight();
 
                     // Real-time height updates as content (like images) loads
-                    if (iframe.contentWindow) {
+                    if (iframe.contentWindow && typeof window.ResizeObserver !== 'undefined') {
                       const win = iframe.contentWindow;
-                      const observer = new win.ResizeObserver(updateHeight);
+                      const observer = new window.ResizeObserver(updateHeight);
                       observer.observe(win.document.body);
                     }
 
@@ -465,7 +489,7 @@ const AttachmentItem = ({ messageId, attachment }: { messageId: string; attachme
     || contentType === 'application/pdf'
     || contentType.startsWith('audio/')
     || contentType.startsWith('video/');
-  const handleOpenInNewTab = () => {
+  const handleOpenInNewTab = async () => {
     if (attachment.scanStatus === 'infected') {
       alert('Flagged as infected.');
       return;
@@ -474,7 +498,11 @@ const AttachmentItem = ({ messageId, attachment }: { messageId: string; attachme
       alert('Preview is not supported for this file type.');
       return;
     }
-    window.open(api.attachments.getPreviewUrl(attachment.id), '_blank', 'noopener,noreferrer');
+    try {
+      await api.attachments.preview(attachment.id, attachment.filename || 'attachment');
+    } catch (error) {
+      alert(`Preview failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
   };
   const handleDownload = async () => {
     if (attachment.scanStatus === 'infected') {
