@@ -3041,25 +3041,29 @@ export const reapStaleSyncStates = async () => {
     ? Math.floor(env.sync.syncClaimHeartbeatStaleMs)
     : 45000;
   const reaperStaleMs = Math.max(staleMs + (heartbeatStaleMs * 8), staleMs);
+  const staleRecoveryMessage = 'previous sync stalled and was auto-restarted';
 
   try {
     const result = await query<{
       incoming_connector_id: string;
+      user_id: string;
       mailbox: string;
       status: string;
       sync_started_at: string | null;
       updated_at: string | null;
     }>(
-      `UPDATE sync_states
+      `UPDATE sync_states AS ss
           SET status = 'error',
               sync_completed_at = NOW(),
-              sync_error = COALESCE(NULLIF(sync_error, ''), 'stale sync state reaped by maintenance'),
+              sync_error = COALESCE(NULLIF(ss.sync_error, ''), $2),
               updated_at = NOW()
-        WHERE status IN ('syncing', 'cancel_requested')
-          AND COALESCE(updated_at, sync_started_at) IS NOT NULL
-          AND COALESCE(updated_at, sync_started_at) < NOW() - ($1::double precision * INTERVAL '1 millisecond')
-      RETURNING incoming_connector_id, mailbox, status, sync_started_at, updated_at`,
-      [reaperStaleMs],
+       FROM incoming_connectors AS ic
+       WHERE ss.incoming_connector_id = ic.id
+         AND ss.status IN ('syncing', 'cancel_requested')
+         AND COALESCE(ss.updated_at, ss.sync_started_at) IS NOT NULL
+         AND COALESCE(ss.updated_at, ss.sync_started_at) < NOW() - ($1::double precision * INTERVAL '1 millisecond')
+      RETURNING ss.incoming_connector_id, ic.user_id, ss.mailbox, ss.status, ss.sync_started_at, ss.updated_at`,
+      [reaperStaleMs, staleRecoveryMessage],
     );
 
     for (const row of result.rows) {
@@ -3069,6 +3073,16 @@ export const reapStaleSyncStates = async () => {
         previousStatus: row.status,
         syncStartedAt: row.sync_started_at,
         updatedAt: row.updated_at,
+      }).catch(() => undefined);
+      scheduleMailboxSyncRetry(
+        String(row.user_id ?? ''),
+        row.incoming_connector_id,
+        row.mailbox,
+        new Error(staleRecoveryMessage),
+      );
+      await emitSyncEvent(row.incoming_connector_id, 'sync_info', {
+        mailbox: row.mailbox,
+        phase: 'stale-sync-reaper-retry-scheduled',
       }).catch(() => undefined);
     }
 
@@ -3138,6 +3152,7 @@ const scheduleMailboxSyncRetry = (userId: string, connectorId: string, mailbox: 
     scheduledMailboxSyncRetries.delete(key);
     void syncIncomingConnector(normalizedUserId, connectorId, mailbox).catch(() => undefined);
   }, MAILBOX_SYNC_RETRY_DELAY_MS);
+  timer.unref?.();
   scheduledMailboxSyncRetries.set(key, timer);
 };
 

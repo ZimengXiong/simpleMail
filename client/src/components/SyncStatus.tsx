@@ -73,7 +73,24 @@ const SyncStatus = () => {
     return `${Math.floor(seconds / 86400)}d ago`;
   };
 
-  const statusLabel = (value: MailboxSyncState['status']) => {
+  const isAutoRecoveryErrorMessage = (value: string | null | undefined) => {
+    const message = String(value ?? '').trim().toLowerCase();
+    if (!message) {
+      return false;
+    }
+    return message.includes('stale sync state reaped by maintenance')
+      || message.includes('previous sync stalled and was auto-restarted');
+  };
+
+  const formatSyncErrorMessage = (value: string | null | undefined) => {
+    if (isAutoRecoveryErrorMessage(value)) {
+      return 'Previous sync stalled. Auto-recovery is in progress.';
+    }
+    const message = String(value ?? '').trim();
+    return message.length > 0 ? message : null;
+  };
+
+  const statusLabel = (value: MailboxSyncState['status'], syncError?: string | null) => {
     switch (value) {
       case 'syncing':
         return 'Syncing';
@@ -86,6 +103,9 @@ const SyncStatus = () => {
       case 'completed':
         return 'Completed';
       case 'error':
+        if (isAutoRecoveryErrorMessage(syncError)) {
+          return 'Recovering';
+        }
         return 'Error';
       case 'idle':
       default:
@@ -93,11 +113,14 @@ const SyncStatus = () => {
     }
   };
 
-  const statusBadgeClass = (value: MailboxSyncState['status']) => {
+  const statusBadgeClass = (value: MailboxSyncState['status'], syncError?: string | null) => {
     if (value === 'syncing' || value === 'queued' || value === 'cancel_requested') {
       return 'bg-accent/10 text-accent border-accent/25';
     }
     if (value === 'error') {
+      if (isAutoRecoveryErrorMessage(syncError)) {
+        return 'bg-amber-50 text-amber-700 border-amber-200';
+      }
       return 'bg-red-50 text-red-600 border-red-200';
     }
     if (value === 'completed') {
@@ -112,11 +135,16 @@ const SyncStatus = () => {
   const summarizeStates = (states: Array<MailboxSyncState & { mailbox?: string }> = []) => {
     const total = states.length;
     const active = countActiveSyncStates(states);
-    const errors = states.filter((state) => state.status === 'error');
+    const transientRecovering = states.filter((state) =>
+      state.status === 'error' && isAutoRecoveryErrorMessage(state.syncError),
+    );
+    const errors = states.filter((state) =>
+      state.status === 'error' && !isAutoRecoveryErrorMessage(state.syncError),
+    );
     const queued = states.filter((state) => state.status === 'queued' || state.status === 'cancel_requested').length;
-    const firstError = errors
-      .map((state) => (typeof state.syncError === 'string' ? state.syncError.trim() : ''))
-      .find((value) => value.length > 0) ?? null;
+    const firstError = [...errors, ...transientRecovering]
+      .map((state) => formatSyncErrorMessage(state.syncError))
+      .find((value): value is string => Boolean(value)) ?? null;
     const lastCompletedAt = states
       .map((state) => state.syncCompletedAt ?? null)
       .filter((value): value is string => Boolean(value))
@@ -129,7 +157,16 @@ const SyncStatus = () => {
         reconciled: acc.reconciled + (progress.reconciledRemoved ?? 0),
       };
     }, { inserted: 0, updated: 0, reconciled: 0 });
-    return { total, active, queued, errors, firstError, lastCompletedAt, ...totals };
+    return {
+      total,
+      active,
+      queued,
+      errors,
+      recovering: transientRecovering.length,
+      firstError,
+      lastCompletedAt,
+      ...totals,
+    };
   };
 
   return (
@@ -140,7 +177,7 @@ const SyncStatus = () => {
         const summary = summarizeStates(states);
         const status = summary.errors.length > 0
           ? 'error'
-          : (summary.active > 0 ? 'syncing' : 'completed');
+          : (summary.active > 0 ? 'syncing' : (summary.recovering > 0 ? 'recovering' : 'completed'));
         const isExpanded = (pinnedConnectorId ?? hoveredConnectorId) === connector.id;
 
         const downloaded = summary.inserted;
@@ -166,6 +203,8 @@ const SyncStatus = () => {
                   <RefreshCw className="w-3 h-3 text-accent animate-spin" />
                 ) : status === 'error' ? (
                   <AlertCircle className="w-3 h-3 text-red-500" />
+                ) : status === 'recovering' ? (
+                  <RefreshCw className="w-3 h-3 text-amber-600 animate-spin" />
                 ) : (
                   <CheckCircle2 className="w-3 h-3 text-green-600 opacity-60" />
                 )}
@@ -185,6 +224,11 @@ const SyncStatus = () => {
                 {status === 'error' && (
                   <span className="text-[9px] text-red-500 font-medium truncate max-w-[180px]" title={summary.firstError ?? 'Sync failed'}>
                     {summary.firstError ?? 'Sync failed (no details)'}
+                  </span>
+                )}
+                {status === 'recovering' && (
+                  <span className="text-[9px] text-amber-700 font-medium truncate max-w-[180px]" title={summary.firstError ?? 'Recovery in progress'}>
+                    {summary.firstError ?? 'Recovery in progress'}
                   </span>
                 )}
                 {status === 'completed' && (
@@ -223,15 +267,17 @@ const SyncStatus = () => {
                               <div className="text-[10px] font-bold text-text-primary truncate">{state.mailbox}</div>
                               <div className="text-[9px] text-text-secondary">{whenText}</div>
                             </div>
-                            <span className={`text-[9px] font-semibold px-1.5 py-0.5 rounded border ${statusBadgeClass(state.status)}`}>
-                              {statusLabel(state.status)}
+                            <span className={`text-[9px] font-semibold px-1.5 py-0.5 rounded border ${statusBadgeClass(state.status, state.syncError)}`}>
+                              {statusLabel(state.status, state.syncError)}
                             </span>
                           </div>
                           {progressLabel ? (
                             <div className="mt-1 text-[9px] text-text-secondary">{progressLabel}</div>
                           ) : null}
-                          {state.status === 'error' && state.syncError ? (
-                            <div className="mt-1 text-[9px] text-red-500 break-words">{state.syncError}</div>
+                          {state.status === 'error' && formatSyncErrorMessage(state.syncError) ? (
+                            <div className={`mt-1 text-[9px] break-words ${isAutoRecoveryErrorMessage(state.syncError) ? 'text-amber-700' : 'text-red-500'}`}>
+                              {formatSyncErrorMessage(state.syncError)}
+                            </div>
                           ) : null}
                         </div>
                       );
