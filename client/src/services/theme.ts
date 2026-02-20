@@ -56,7 +56,7 @@ const adjustLightness = (hex: string, percent: number) => {
 
 export const useTheme = () => {
   const [theme, setTheme] = useState<Theme>(() => 
-    safeStorageGet('theme') === 'dark' ? 'dark' : 'light'
+    safeStorageGet('theme') === 'light' ? 'light' : 'dark'
   );
   const [accentColor, setAccentColor] = useState<string>(() => 
     safeStorageGet('accentColor') || '#10b981'

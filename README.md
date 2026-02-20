@@ -2,7 +2,23 @@
 
 # simpleMail
 
-simpleMail is a self-hosted mail app stack (UI + API + worker) with OIDC login.
+simpleMail is a self-hosted mail app stack (UI + API + worker). It is intentionally a simple email system focused on core workflows. Built with Fastify, Graphile Worker for background jobs, and PostgreS and SeaweedFS for storage.
+
+## Features
+
+What it supports now:
+
+- Gmail connector support
+- Generic IMAP/SMTP connector support
+- Basic mailbox sync, threading, reading, composing, sending, starring, and replying
+
+What it does not include (yet):
+
+- Drafts
+- Role-based filtering/routing
+- Advanced rule engines/automations
+- Email forwarding workflows
+- Moving mail between folders
 
 ## Quick Start
 
@@ -46,3 +62,74 @@ docker compose up -d
 
 - UI: `http://localhost:7676`
 - API health: `http://localhost:3000/api/health`
+
+### 5. Extra configuration options
+
+<details>
+  <summary>Google / Gmail API (OAuth connector)</summary>
+
+Set these when enabling Google OAuth connector flows:
+
+- `GOOGLE_CLIENT_ID`
+- `GOOGLE_CLIENT_SECRET`
+- `GOOGLE_REDIRECT_URI` (must match callback configured in Google Cloud Console)
+
+</details>
+
+<details>
+  <summary>Google Gmail Pub/Sub webhooks</summary>
+
+Gmail Pub/Sub push delivery requires a public HTTPS endpoint that Google can reach. For local/self-hosted setups, use a tunnel/domain (for example Cloudflare Tunnel) and point your webhook audience/base URL to that HTTPS endpoint.
+
+Set these when enabling push sync:
+
+- `GMAIL_PUSH_ENABLED=true`
+- `GMAIL_PUSH_TOPIC_NAME`
+- `GMAIL_PUSH_WEBHOOK_PATH`
+- `GMAIL_PUSH_WEBHOOK_AUDIENCE`
+- `GMAIL_PUSH_SERVICE_ACCOUNT_EMAIL`
+
+Notes:
+
+- Webhook endpoint must be publicly reachable over HTTPS.
+- Pub/Sub OIDC audience should match your webhook URL/audience expectation.
+
+</details>
+
+## Developer
+
+<details>
+  <summary>Developer setup and repo workflow</summary>
+
+Environment files:
+
+- User/deploy template: `.env.example`
+- Local runtime env (manual): `.env`
+- Dev-script env (optional): `.env.dev`
+- Docker deploy bootstrap: `scripts/bootstrap-env.sh .env`
+
+Development scripts:
+
+- Start dev workflow: `./scripts/dev.sh start`
+- Attach tmux session: `./scripts/dev.sh attach`
+- Stop: `./scripts/dev.sh stop`
+- Restart: `./scripts/dev.sh restart`
+- Logs: `./scripts/dev.sh logs`
+
+Dev stack notes:
+
+- `docker-compose.dev.yml` is aligned with production requirements, but app services build from local source.
+- `docker-compose.yml` is for image-based deploy flow (pulls configured repositories/tags).
+
+Bundled Keycloak:
+
+- A bundled Keycloak service exists for development/testing and is started via `dev-oidc` profile.
+- End-user/production OIDC is expected to be external (BYO provider).
+
+Where to find key config docs:
+
+- Full env variable descriptions: `.env.example`
+- Release flow/local vs GitHub publish toggle: `scripts/release.sh`
+- CI/release pipeline: `.github/workflows/release.yml`
+
+</details>
