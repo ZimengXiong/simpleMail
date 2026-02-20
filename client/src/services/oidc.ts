@@ -97,6 +97,7 @@ export const logoutOidc = async () => {
   try {
     keycloak.clearToken();
   } catch {
+    void 0;
   }
   api.auth.logout();
 };

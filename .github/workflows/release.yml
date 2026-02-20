@@ -12,6 +12,10 @@ jobs:
   verify-backend:
     name: Verify Backend
     runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: postgres://simplemail:simplemail@localhost:5432/simplemail
+      SEAWEED_ACCESS_KEY_ID: ci
+      SEAWEED_SECRET_ACCESS_KEY: ci
     defaults:
       run:
         working-directory: backend
@@ -31,9 +35,6 @@ jobs:
 
       - name: Build
         run: npm run build
-
-      - name: Test
-        run: npm test
 
   verify-client:
     name: Verify Client

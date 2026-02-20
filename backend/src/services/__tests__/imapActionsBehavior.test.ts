@@ -38,7 +38,18 @@ const withMockedQueryHandler = async (
     const call: QueryCall = { text: String(text), params: Array.isArray(params) ? params : [] };
     calls.push(call);
     const rows = await handler(call);
-    return { rows: rows ?? [] };
+    const normalizedRows = Array.isArray(rows) ? rows.map((row) => {
+      if (
+        row
+        && typeof row === 'object'
+        && !('status' in row)
+        && call.text.includes('FROM incoming_connectors')
+      ) {
+        return { ...row, status: 'active' };
+      }
+      return row;
+    }) : rows;
+    return { rows: normalizedRows ?? [] };
   };
 
   try {

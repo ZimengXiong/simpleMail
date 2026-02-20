@@ -118,7 +118,8 @@ await test('createOAuthState persists state token with connector metadata', asyn
           assert.equal(call.params[1], 'connector-1');
           assert.equal(call.params[2], 'incoming');
           assert.equal(call.params[3], 'user-1');
-          assert.ok(typeof call.params[4] === 'number');
+          assert.equal(call.params[4], 'null');
+          assert.ok(typeof call.params[5] === 'number');
         },
       },
     ],
@@ -145,6 +146,7 @@ await test('consumeOAuthState returns mapped state payload when token is valid',
       assert.deepEqual(consumed, {
         type: 'outgoing',
         connectorId: 'connector-2',
+        connectorPayload: undefined,
         userId: 'user-2',
       });
     },

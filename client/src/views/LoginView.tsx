@@ -14,7 +14,7 @@ const LoginView = () => {
     return value || '';
   }, [searchParams]);
   const [error, setError] = useState(initialError);
-  const [isVerifying, setIsVerifying] = useState(false);
+  const [isVerifying, setIsVerifying] = useState(() => api.auth.isAuthenticated());
 
   const nextFromState = useMemo(() => {
     const state = (location.state as { from?: { pathname?: string; search?: string; hash?: string } } | null) ?? null;
@@ -70,7 +70,6 @@ const LoginView = () => {
         cancelled = true;
       };
     }
-    setIsVerifying(true);
     void verifyBackendSession().then(({ ok, message }) => {
       if (cancelled) {
         return;

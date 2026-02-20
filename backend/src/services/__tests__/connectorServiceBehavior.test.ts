@@ -199,12 +199,6 @@ await test('creates incoming connector with defaults and updates auth with optio
           assert.deepEqual(call.params, ['inc-created', JSON.stringify({ authType: 'password' })]);
         },
       },
-      {
-        check: (call) => {
-          assert.equal(call.text, 'DELETE FROM incoming_connectors WHERE id = $1 AND user_id = $2');
-          assert.deepEqual(call.params, ['inc-created', 'user-1']);
-        },
-      },
     ],
     async () => {
       const created = await createIncomingConnector('user-1', {
@@ -218,9 +212,63 @@ await test('creates incoming connector with defaults and updates auth with optio
 
       await updateIncomingConnectorAuth('inc-created', { authType: 'oauth2' }, 'user-1');
       await updateIncomingConnectorAuth('inc-created', { authType: 'password' });
-      await deleteIncomingConnector('user-1', 'inc-created');
     },
   );
+});
+
+await test('deleteIncomingConnector runs transactional cleanup and rolls back on failure', async () => {
+  const originalConnect = pool.connect.bind(pool);
+  const happyCalls: Array<{ text: string; params?: any[] }> = [];
+  let releasedHappy = false;
+
+  (pool as any).connect = async () => ({
+    query: async (text: string, params?: any[]) => {
+      happyCalls.push({ text: String(text), params });
+      return { rows: [] };
+    },
+    release: () => {
+      releasedHappy = true;
+    },
+  });
+
+  try {
+    await deleteIncomingConnector('user-1', 'inc-1');
+    assert.equal(happyCalls[0]?.text, 'BEGIN');
+    assert.match(happyCalls[1]?.text ?? '', /DELETE FROM oauth_states/);
+    assert.deepEqual(happyCalls[1]?.params, ['user-1', 'inc-1']);
+    assert.match(happyCalls[2]?.text ?? '', /DELETE FROM incoming_connectors/);
+    assert.deepEqual(happyCalls[2]?.params, ['inc-1', 'user-1']);
+    assert.equal(happyCalls[3]?.text, 'COMMIT');
+    assert.equal(releasedHappy, true);
+  } finally {
+    (pool as any).connect = originalConnect;
+  }
+
+  const rollbackCalls: Array<{ text: string; params?: any[] }> = [];
+  let releasedRollback = false;
+  (pool as any).connect = async () => ({
+    query: async (text: string, params?: any[]) => {
+      rollbackCalls.push({ text: String(text), params });
+      if (String(text).includes('DELETE FROM incoming_connectors')) {
+        throw new Error('delete incoming failed');
+      }
+      return { rows: [] };
+    },
+    release: () => {
+      releasedRollback = true;
+    },
+  });
+
+  try {
+    await assert.rejects(
+      deleteIncomingConnector('user-1', 'inc-1'),
+      /delete incoming failed/,
+    );
+    assert.equal(rollbackCalls.some((call) => call.text === 'ROLLBACK'), true);
+    assert.equal(releasedRollback, true);
+  } finally {
+    (pool as any).connect = originalConnect;
+  }
 });
 
 await test('lists, fetches, updates, and auth-updates outgoing connectors', async () => {
@@ -348,10 +396,11 @@ await test('deleteOutgoingConnector runs transactional cleanup and rolls back on
   try {
     await deleteOutgoingConnector('user-1', 'out-1');
     assert.equal(happyCalls[0]?.text, 'BEGIN');
-    assert.match(happyCalls[1]?.text ?? '', /DELETE FROM send_idempotency/);
-    assert.match(happyCalls[2]?.text ?? '', /DELETE FROM identities/);
-    assert.match(happyCalls[3]?.text ?? '', /DELETE FROM outgoing_connectors/);
-    assert.equal(happyCalls[4]?.text, 'COMMIT');
+    assert.match(happyCalls[1]?.text ?? '', /DELETE FROM oauth_states/);
+    assert.match(happyCalls[2]?.text ?? '', /DELETE FROM send_idempotency/);
+    assert.match(happyCalls[3]?.text ?? '', /DELETE FROM identities/);
+    assert.match(happyCalls[4]?.text ?? '', /DELETE FROM outgoing_connectors/);
+    assert.equal(happyCalls[5]?.text, 'COMMIT');
     assert.equal(releasedHappy, true);
   } finally {
     (pool as any).connect = originalConnect;
