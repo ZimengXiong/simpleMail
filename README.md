@@ -1,15 +1,14 @@
 # simpleMail
 
-simpleMail is a self-hosted mail app stack with:
-- React client (`client/`)
-- Fastify API (`backend/`)
-- Postgres storage
-- SeaweedFS S3-compatible object storage
-- OIDC auth (Keycloak dev defaults, bring-your-own provider supported)
+simpleMail is a simple self-hosted webmail client stack with:
+
+It is built with
+
+- Postgres
+- SeaweedFS
+- Required OIDC auth
 - Gmail OAuth (incoming + outgoing)
 - Optional Gmail Pub/Sub push sync
-
-This guide is the complete setup reference for local development and production-style cloud setup.
 
 ## 1. Prerequisites
 
@@ -32,6 +31,7 @@ scripts/dev.sh start
 ```
 
 What `scripts/dev.sh start` does:
+
 - Starts infra from `docker-compose.dev.yml`:
   - Postgres
   - SeaweedFS
@@ -76,6 +76,7 @@ Dev Keycloak is auto-imported from `deploy/keycloak/simplemail-realm.json`.
 - OIDC client ID: `simplemail-web`
 
 Default dev env values:
+
 - Backend `.env`:
   - `OIDC_ISSUER_URL=http://localhost:8080/realms/simplemail`
   - `OIDC_CLIENT_ID=simplemail-web`
@@ -90,10 +91,12 @@ Default dev env values:
 Client already binds to `0.0.0.0` via `scripts/dev.sh`. API listens on `0.0.0.0:3000`.
 
 Use your machine LAN IP from phone, for example:
+
 - `http://192.168.1.25:5173`
 - OIDC server should then be reachable at `http://192.168.1.25:8080`
 
 For Keycloak client (`simplemail-web`), add:
+
 - Redirect URIs:
   - `http://localhost:5173/*`
   - `http://<LAN_IP>:5173/*`
@@ -115,6 +118,7 @@ SIMPLEMAIL_CLIENT_HOST=0.0.0.0 scripts/dev.sh start
 You can use Auth0, Okta, Entra ID, Cognito, another Keycloak, etc.
 
 Backend requirements:
+
 - Access tokens must be JWTs signed with asymmetric algs (`RS*`, `PS*`, `ES*`, `EdDSA`).
 - Issuer must match `OIDC_ISSUER_URL`.
 - Audience/authorized party must match `OIDC_CLIENT_ID` (comma-separated list allowed).
@@ -124,6 +128,7 @@ Backend requirements:
 - If `OIDC_REQUIRE_EMAIL_VERIFIED=true`, token must have `email_verified=true`.
 
 Required backend OIDC env:
+
 - `OIDC_ISSUER_URL`
 - `OIDC_CLIENT_ID`
 - `OIDC_REQUIRED_EMAIL` (single-user gate; required by server)
@@ -132,6 +137,7 @@ Required backend OIDC env:
 - Optional: `OIDC_REQUIRE_EMAIL_VERIFIED`
 
 Frontend OIDC env:
+
 - `VITE_OIDC_BASE_URL`
 - `VITE_OIDC_REALM` (for Keycloak-style config)
 - `VITE_OIDC_CLIENT_ID`
@@ -141,12 +147,14 @@ Frontend OIDC env:
 ### 6.1 Enable APIs
 
 In Google Cloud Console, enable:
+
 - Gmail API
 - Pub/Sub API (if using Gmail push)
 
 ### 6.2 OAuth Consent Screen
 
 Configure OAuth consent screen in your Google Cloud project.
+
 - External or internal app type is fine for dev.
 - Add test users if app is not published.
 - Scopes used by simpleMail include Gmail read/send and user email.
@@ -156,10 +164,12 @@ Configure OAuth consent screen in your Google Cloud project.
 Create OAuth 2.0 Client ID (`Web application`).
 
 Add authorized redirect URI:
+
 - `http://localhost:3000/api/oauth/google/callback` (dev)
 - `https://<your-api-domain>/api/oauth/google/callback` (prod)
 
 Then set in `.env`:
+
 - `GOOGLE_CLIENT_ID=<client-id>`
 - `GOOGLE_CLIENT_SECRET=<client-secret>`
 - `GOOGLE_REDIRECT_URI=<same redirect URI configured above>`
@@ -167,6 +177,7 @@ Then set in `.env`:
 ### 6.4 In-App OAuth Flow
 
 When you add a Gmail connector in UI:
+
 1. simpleMail creates connector(s).
 2. Backend calls `/api/oauth/google/authorize`.
 3. You sign in/consent at Google.
@@ -180,9 +191,11 @@ This section is required only if you want push notifications instead of polling-
 ### 7.1 One-Time Project Setup
 
 Create a Pub/Sub topic, e.g.:
+
 - `projects/<PROJECT_ID>/topics/simplemail-gmail-push`
 
 Grant publisher role on that topic to Gmail push service identity:
+
 - `gmail-api-push@system.gserviceaccount.com`
 - Role: `Pub/Sub Publisher` on the topic
 
@@ -191,6 +204,7 @@ This project/topic setup is one-time per project/environment.
 ### 7.2 Push Subscription to simpleMail Webhook
 
 Create push subscription for that topic:
+
 - Push endpoint: `https://<your-api-domain>/api/gmail/push`
 - Use authenticated push (OIDC token)
 - Audience should match simpleMail expectation:
@@ -200,6 +214,7 @@ Create push subscription for that topic:
   - `pubsub-push@<PROJECT_ID>.iam.gserviceaccount.com`
 
 Then set backend env:
+
 - `GMAIL_PUSH_ENABLED=true`
 - `GMAIL_PUSH_TOPIC_NAME=projects/<PROJECT_ID>/topics/<TOPIC_NAME>`
 - `GMAIL_PUSH_WEBHOOK_PATH=/api/gmail/push`
@@ -207,6 +222,7 @@ Then set backend env:
 - `GMAIL_PUSH_SERVICE_ACCOUNT_EMAIL=<push service account email>`
 
 Important:
+
 - simpleMail verifies bearer token issuer, audience, and service account email.
 - If these do not match, webhook returns 401.
 
@@ -250,6 +266,7 @@ Most values are already documented in `.env.example`. Key groups:
   - `CLAMAV_*`, `WEB_PUSH_*`, `ALLOW_INSECURE_MAIL_TRANSPORT`, `ALLOW_PRIVATE_NETWORK_TARGETS`
 
 Frontend env (`client/.env`):
+
 - `VITE_OIDC_BASE_URL`
 - `VITE_OIDC_REALM`
 - `VITE_OIDC_CLIENT_ID`
