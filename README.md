@@ -25,8 +25,6 @@ Set these values:
 - `VITE_OIDC_BASE_URL`
 - `VITE_OIDC_REALM`
 - `VITE_OIDC_CLIENT_ID`
-- `SEAWEED_ACCESS_KEY_ID`
-- `SEAWEED_SECRET_ACCESS_KEY`
 
 Image settings are already defaulted to Docker Hub:
 
