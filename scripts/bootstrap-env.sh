@@ -50,6 +50,8 @@ postgres_password="$(read_env_var POSTGRES_PASSWORD)"
 database_url="$(read_env_var DATABASE_URL)"
 api_admin_token="$(read_env_var API_ADMIN_TOKEN)"
 seaweed_endpoint="$(read_env_var SEAWEED_S3_ENDPOINT)"
+seaweed_access_key_id="$(read_env_var SEAWEED_ACCESS_KEY_ID)"
+seaweed_secret_access_key="$(read_env_var SEAWEED_SECRET_ACCESS_KEY)"
 
 postgres_db="${postgres_db:-simplemail}"
 postgres_user="${postgres_user:-simplemail}"
@@ -74,6 +76,16 @@ fi
 if [[ -z "${seaweed_endpoint}" || "${seaweed_endpoint}" == *"localhost"* || "${seaweed_endpoint}" == *"127.0.0.1"* ]]; then
   upsert_env_var SEAWEED_S3_ENDPOINT "http://seaweed-filer:8333"
   echo "Set SEAWEED_S3_ENDPOINT for docker compose"
+fi
+
+if [[ -z "${seaweed_access_key_id}" || "${seaweed_access_key_id}" == "simplemail-internal" ]]; then
+  upsert_env_var SEAWEED_ACCESS_KEY_ID "sm_$(gen_secret)"
+  echo "Generated SEAWEED_ACCESS_KEY_ID"
+fi
+
+if [[ -z "${seaweed_secret_access_key}" || "${seaweed_secret_access_key}" == "simplemail-internal-secret" ]]; then
+  upsert_env_var SEAWEED_SECRET_ACCESS_KEY "sm_$(gen_secret)"
+  echo "Generated SEAWEED_SECRET_ACCESS_KEY"
 fi
 
 echo "Prepared ${ENV_FILE}"
