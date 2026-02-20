@@ -26,6 +26,8 @@ Set these values:
 - `VITE_OIDC_REALM`
 - `VITE_OIDC_CLIENT_ID`
 
+No internal infrastructure variables are required for first boot. Seaweed and other internal defaults are prewired.
+
 Image settings are already defaulted to Docker Hub:
 
 - `SIMPLEMAIL_BACKEND_REPOSITORY=docker.io/zimengxiong/simplemail-backend`
