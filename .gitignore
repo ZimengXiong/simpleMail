@@ -16,6 +16,7 @@ backend/node_modules/
 .env.development.local
 .env.test.local
 .env.backup-*
+.env.dev
 
 # Logs
 *.log

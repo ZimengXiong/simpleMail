@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMPOSE_FILE="${ROOT_DIR}/docker-compose.dev.yml"
 BACKEND_DIR="${ROOT_DIR}/backend"
 CLIENT_DIR="${ROOT_DIR}/client"
+ENV_FILE="${SIMPLEMAIL_ENV_FILE:-${ROOT_DIR}/.env.dev}"
 CLIENT_HOST="${SIMPLEMAIL_CLIENT_HOST:-0.0.0.0}"
 SESSION_NAME="${SIMPLEMAIL_TMUX_SESSION:-simplemail-dev}"
 DOCKER_DOWN_ON_STOP="${DOCKER_DOWN_ON_STOP:-false}"
@@ -13,6 +14,20 @@ TUNNEL_NAME="${SIMPLEMAIL_TUNNEL_NAME:-simplemail-api}"
 TUNNEL_CONFIG="${SIMPLEMAIL_TUNNEL_CONFIG:-${HOME}/.cloudflared/config.yml}"
 KEYCLOAK_WELL_KNOWN_URL="${SIMPLEMAIL_KEYCLOAK_WELL_KNOWN_URL:-http://localhost:8080/realms/simplemail/.well-known/openid-configuration}"
 ENV_PREPARE_SCRIPT="${ROOT_DIR}/scripts/prepare-env.sh"
+
+ensure_env_file() {
+  if [[ -f "${ENV_FILE}" ]]; then
+    return
+  fi
+  if [[ -f "${ROOT_DIR}/.env.example" ]]; then
+    cp "${ROOT_DIR}/.env.example" "${ENV_FILE}"
+    chmod 600 "${ENV_FILE}" || true
+    echo "Created ${ENV_FILE} from .env.example"
+    return
+  fi
+  echo "Missing env file: ${ENV_FILE}" >&2
+  exit 1
+}
 
 require_cmd() {
   local name="$1"
@@ -27,11 +42,12 @@ session_exists() {
 }
 
 start_infra() {
+  ensure_env_file
   if [[ -x "${ENV_PREPARE_SCRIPT}" ]]; then
-    "${ENV_PREPARE_SCRIPT}" "${ROOT_DIR}/.env"
+    "${ENV_PREPARE_SCRIPT}" "${ENV_FILE}"
   fi
   echo "Starting docker services via ${COMPOSE_FILE}..."
-  docker compose -f "${COMPOSE_FILE}" up -d
+  docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" up -d
 }
 
 wait_for_postgres() {
@@ -85,19 +101,19 @@ create_tmux_session() {
   fi
 
   tmux new-session -d -s "${SESSION_NAME}" -n api -c "${BACKEND_DIR}" \
-    "bash -lc 'npm run dev; code=\$?; echo \"api exited with code \$code\"; exec bash'"
+    "bash -lc 'set -a; source \"${ENV_FILE}\"; set +a; npm run dev; code=\$?; echo \"api exited with code \$code\"; exec bash'"
   tmux new-window -t "${SESSION_NAME}" -n worker -c "${BACKEND_DIR}" \
-    "bash -lc 'npm run worker; code=\$?; echo \"worker exited with code \$code\"; exec bash'"
+    "bash -lc 'set -a; source \"${ENV_FILE}\"; set +a; npm run worker; code=\$?; echo \"worker exited with code \$code\"; exec bash'"
 
   if [[ -d "${CLIENT_DIR}" ]]; then
     tmux new-window -t "${SESSION_NAME}" -n client -c "${CLIENT_DIR}" \
-      "bash -lc 'npm run dev -- --host ${CLIENT_HOST}; code=\$?; echo \"client exited with code \$code\"; exec bash'"
+      "bash -lc 'set -a; source \"${ENV_FILE}\"; set +a; npm run dev -- --host ${CLIENT_HOST}; code=\$?; echo \"client exited with code \$code\"; exec bash'"
   else
     tmux new-window -t "${SESSION_NAME}" -n client "printf '%s\n' 'Client directory not found: ${CLIENT_DIR}'; exec bash"
   fi
 
   tmux new-window -t "${SESSION_NAME}" -n infra -c "${ROOT_DIR}" \
-    "docker compose -f \"${COMPOSE_FILE}\" logs -f postgres seaweed-master seaweed-volume seaweed-filer keycloak"
+    "docker compose --env-file \"${ENV_FILE}\" -f \"${COMPOSE_FILE}\" logs -f postgres seaweed-master seaweed-volume seaweed-filer keycloak"
 
   if [[ "${TUNNEL_ENABLED}" == "true" ]]; then
     if command -v cloudflared >/dev/null 2>&1 && [[ -f "${TUNNEL_CONFIG}" ]]; then
@@ -139,7 +155,7 @@ stop_session() {
   fi
 
   if [[ "${DOCKER_DOWN_ON_STOP}" == "true" ]]; then
-    docker compose -f "${COMPOSE_FILE}" down --remove-orphans
+    docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" down --remove-orphans
     echo "Docker services stopped."
   fi
 }
@@ -195,6 +211,7 @@ Environment:
   SIMPLEMAIL_TUNNEL_NAME=<name>         Tunnel name to run (default: simplemail-api)
   SIMPLEMAIL_TUNNEL_CONFIG=<path>       cloudflared config path (default: ~/.cloudflared/config.yml)
   SIMPLEMAIL_CLIENT_HOST=<host>         Vite dev host bind address (default: 0.0.0.0)
+  SIMPLEMAIL_ENV_FILE=<path>            Dev env file path (default: ${ROOT_DIR}/.env.dev)
   SIMPLEMAIL_KEYCLOAK_WELL_KNOWN_URL    OIDC readiness URL (default: http://localhost:8080/realms/simplemail/.well-known/openid-configuration)
 EOF
 }
@@ -237,7 +254,7 @@ main() {
       echo "Attach with: tmux attach -t ${SESSION_NAME}"
       ;;
     logs)
-      docker compose -f "${COMPOSE_FILE}" logs -f "$@"
+      docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" logs -f "$@"
       ;;
     *)
       print_usage
