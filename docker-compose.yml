@@ -167,9 +167,15 @@ services:
   worker-migrate:
     image: ${SIMPLEMAIL_BACKEND_REPOSITORY:?SIMPLEMAIL_BACKEND_REPOSITORY is required}:${SIMPLEMAIL_VERSION:-latest}
     container_name: simplemail-worker-migrate
-    command: ["node", "dist/worker/migrate.js"]
+    command: ["node", "dist/scripts/worker-migrate.js"]
     environment:
       DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
+      SEAWEED_S3_ENDPOINT: ${SEAWEED_S3_ENDPOINT:-http://seaweed-filer:8333}
+      SEAWEED_REGION: ${SEAWEED_REGION:-us-east-1}
+      SEAWEED_BUCKET: ${SEAWEED_BUCKET:-simplemail}
+      SEAWEED_ACCESS_KEY_ID: ${SEAWEED_ACCESS_KEY_ID:-simplemail-internal}
+      SEAWEED_SECRET_ACCESS_KEY: ${SEAWEED_SECRET_ACCESS_KEY:-simplemail-internal-secret}
+      SEAWEED_FORCE_PATH_STYLE: 'true'
     depends_on:
       postgres:
         condition: service_healthy
@@ -181,6 +187,12 @@ services:
     command: ["node", "dist/scripts/migrate.js"]
     environment:
       DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
+      SEAWEED_S3_ENDPOINT: ${SEAWEED_S3_ENDPOINT:-http://seaweed-filer:8333}
+      SEAWEED_REGION: ${SEAWEED_REGION:-us-east-1}
+      SEAWEED_BUCKET: ${SEAWEED_BUCKET:-simplemail}
+      SEAWEED_ACCESS_KEY_ID: ${SEAWEED_ACCESS_KEY_ID:-simplemail-internal}
+      SEAWEED_SECRET_ACCESS_KEY: ${SEAWEED_SECRET_ACCESS_KEY:-simplemail-internal-secret}
+      SEAWEED_FORCE_PATH_STYLE: 'true'
     depends_on:
       postgres:
         condition: service_healthy
