@@ -57,6 +57,25 @@ case "${bump_type}" in
     ;;
 esac
 
+publish_mode="${RELEASE_PUBLISH_MODE:-}"
+if [[ -z "${publish_mode}" ]]; then
+  echo "Select image publish mode:"
+  select option in github local; do
+    if [[ -n "${option:-}" ]]; then
+      publish_mode="${option}"
+      break
+    fi
+  done
+fi
+
+case "${publish_mode}" in
+  github|local) ;;
+  *)
+    echo "Invalid publish mode: ${publish_mode}. Use github or local." >&2
+    exit 1
+    ;;
+esac
+
 next_version="$(
   node - "${current_backend}" "${bump_type}" <<'NODE'
 const [current, bump] = process.argv.slice(2);
@@ -87,6 +106,7 @@ fi
 
 echo "Current backend version: ${current_backend}"
 echo "Next version: ${next_version} (${bump_type})"
+echo "Image publish mode: ${publish_mode}"
 read -r -p "Proceed with release ${tag}? [y/N] " confirm
 if [[ ! "${confirm}" =~ ^[Yy]$ ]]; then
   echo "Release cancelled."
@@ -111,55 +131,58 @@ npm --prefix client install --package-lock-only --ignore-scripts >/dev/null
 
 git add backend/package.json backend/package-lock.json client/package.json client/package-lock.json
 git commit -m "chore(release): ${tag}"
-git tag -a "${tag}" -m "${tag}"
+tag_message="$(printf '%s\n%s\n' "${tag}" "docker_publish=${publish_mode}")"
+git tag -a "${tag}" -m "${tag_message}"
 
 echo "Pushing release commit and tag..."
 git push origin HEAD
 git push origin "${tag}"
 
 echo "Release ${tag} created and pushed."
-echo "GitHub Actions can publish Docker images and create the GitHub Release."
-
-read -r -p "Build and push Docker images locally now? [y/N] " local_publish_confirm
-if [[ "${local_publish_confirm}" =~ ^[Yy]$ ]]; then
-  if ! command -v docker >/dev/null 2>&1; then
-    echo "docker is required for local publish." >&2
-    exit 1
-  fi
-
-  if ! docker buildx version >/dev/null 2>&1; then
-    echo "docker buildx is required for local publish." >&2
-    exit 1
-  fi
-
-  env_file="${RELEASE_ENV_FILE:-.env}"
-  backend_repo="$(read_env_value SIMPLEMAIL_BACKEND_REPOSITORY "${env_file}")"
-  client_repo="$(read_env_value SIMPLEMAIL_CLIENT_REPOSITORY "${env_file}")"
-  backend_repo="${backend_repo:-docker.io/zimengxiong/simplemail-backend}"
-  client_repo="${client_repo:-docker.io/zimengxiong/simplemail-client}"
-  docker_platforms="${RELEASE_DOCKER_PLATFORMS:-linux/amd64,linux/arm64}"
-
-  echo "Local Docker publish configuration:"
-  echo "  Backend repo: ${backend_repo}"
-  echo "  Client repo : ${client_repo}"
-  echo "  Platforms   : ${docker_platforms}"
-  echo "Building and pushing backend image..."
-  docker buildx build \
-    --platform "${docker_platforms}" \
-    -f backend/Dockerfile \
-    -t "${backend_repo}:${next_version}" \
-    -t "${backend_repo}:latest" \
-    --push \
-    backend
-
-  echo "Building and pushing client image..."
-  docker buildx build \
-    --platform "${docker_platforms}" \
-    -f client/Dockerfile \
-    -t "${client_repo}:${next_version}" \
-    -t "${client_repo}:latest" \
-    --push \
-    client
-
-  echo "Local Docker publish complete."
+if [[ "${publish_mode}" == "github" ]]; then
+  echo "GitHub Actions will publish Docker images and create the GitHub Release."
+  exit 0
 fi
+
+echo "GitHub Actions will skip Docker image builds and only create the GitHub Release."
+echo "Running local Docker publish..."
+if ! command -v docker >/dev/null 2>&1; then
+  echo "docker is required for local publish." >&2
+  exit 1
+fi
+
+if ! docker buildx version >/dev/null 2>&1; then
+  echo "docker buildx is required for local publish." >&2
+  exit 1
+fi
+
+env_file="${RELEASE_ENV_FILE:-.env}"
+backend_repo="$(read_env_value SIMPLEMAIL_BACKEND_REPOSITORY "${env_file}")"
+client_repo="$(read_env_value SIMPLEMAIL_CLIENT_REPOSITORY "${env_file}")"
+backend_repo="${backend_repo:-docker.io/zimengxiong/simplemail-backend}"
+client_repo="${client_repo:-docker.io/zimengxiong/simplemail-client}"
+docker_platforms="${RELEASE_DOCKER_PLATFORMS:-linux/amd64,linux/arm64}"
+
+echo "Local Docker publish configuration:"
+echo "  Backend repo: ${backend_repo}"
+echo "  Client repo : ${client_repo}"
+echo "  Platforms   : ${docker_platforms}"
+echo "Building and pushing backend image..."
+docker buildx build \
+  --platform "${docker_platforms}" \
+  -f backend/Dockerfile \
+  -t "${backend_repo}:${next_version}" \
+  -t "${backend_repo}:latest" \
+  --push \
+  backend
+
+echo "Building and pushing client image..."
+docker buildx build \
+  --platform "${docker_platforms}" \
+  -f client/Dockerfile \
+  -t "${client_repo}:${next_version}" \
+  -t "${client_repo}:latest" \
+  --push \
+  client
+
+echo "Local Docker publish complete."

@@ -71,9 +71,27 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve publish mode
+        id: publish_mode
+        run: |
+          tag_body="$(git for-each-ref "refs/tags/${GITHUB_REF_NAME}" --format='%(contents)' || true)"
+          mode="$(printf '%s\n' "${tag_body}" | awk -F= '/^docker_publish=/{print $2}' | tail -n1 | tr '[:upper:]' '[:lower:]')"
+          if [[ "${mode}" != "local" ]]; then
+            mode="github"
+          fi
+          if [[ "${mode}" == "local" ]]; then
+            echo "build_images=false" >> "${GITHUB_OUTPUT}"
+          else
+            echo "build_images=true" >> "${GITHUB_OUTPUT}"
+          fi
+          echo "mode=${mode}" >> "${GITHUB_OUTPUT}"
 
       - name: Resolve image names
         id: images
+        if: steps.publish_mode.outputs.build_images == 'true'
         env:
           DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE }}
           DOCKERHUB_BACKEND_IMAGE: ${{ vars.DOCKERHUB_BACKEND_IMAGE }}
@@ -87,6 +105,7 @@ jobs:
           echo "client_image=docker.io/${namespace}/${client_name}" >> "${GITHUB_OUTPUT}"
 
       - name: Validate Docker Hub credentials
+        if: steps.publish_mode.outputs.build_images == 'true'
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -97,18 +116,22 @@ jobs:
           fi
 
       - name: Set up QEMU
+        if: steps.publish_mode.outputs.build_images == 'true'
         uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
+        if: steps.publish_mode.outputs.build_images == 'true'
         uses: docker/setup-buildx-action@v3
 
       - name: Login to Docker Hub
+        if: steps.publish_mode.outputs.build_images == 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Docker metadata (backend)
+        if: steps.publish_mode.outputs.build_images == 'true'
         id: meta_backend
         uses: docker/metadata-action@v5
         with:
@@ -122,6 +145,7 @@ jobs:
             type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
 
       - name: Build and push backend image
+        if: steps.publish_mode.outputs.build_images == 'true'
         uses: docker/build-push-action@v6
         with:
           context: ./backend
@@ -134,6 +158,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=backend-release
 
       - name: Docker metadata (client)
+        if: steps.publish_mode.outputs.build_images == 'true'
         id: meta_client
         uses: docker/metadata-action@v5
         with:
@@ -147,6 +172,7 @@ jobs:
             type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
 
       - name: Build and push client image
+        if: steps.publish_mode.outputs.build_images == 'true'
         uses: docker/build-push-action@v6
         with:
           context: ./client
@@ -163,3 +189,5 @@ jobs:
         with:
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}
+          body: |
+            Docker publish mode: `${{ steps.publish_mode.outputs.mode }}`
