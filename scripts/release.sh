@@ -4,6 +4,15 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 
+read_env_value() {
+  local key="$1"
+  local file="$2"
+  if [[ ! -f "${file}" ]]; then
+    return
+  fi
+  awk -F= -v key="${key}" '$1 == key { print substr($0, index($0, "=") + 1) }' "${file}" | tail -n1
+}
+
 if ! command -v node >/dev/null 2>&1; then
   echo "Node.js is required." >&2
   exit 1
@@ -109,4 +118,48 @@ git push origin HEAD
 git push origin "${tag}"
 
 echo "Release ${tag} created and pushed."
-echo "GitHub Actions will publish Docker images and create the GitHub Release."
+echo "GitHub Actions can publish Docker images and create the GitHub Release."
+
+read -r -p "Build and push Docker images locally now? [y/N] " local_publish_confirm
+if [[ "${local_publish_confirm}" =~ ^[Yy]$ ]]; then
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "docker is required for local publish." >&2
+    exit 1
+  fi
+
+  if ! docker buildx version >/dev/null 2>&1; then
+    echo "docker buildx is required for local publish." >&2
+    exit 1
+  fi
+
+  env_file="${RELEASE_ENV_FILE:-.env}"
+  backend_repo="$(read_env_value SIMPLEMAIL_BACKEND_REPOSITORY "${env_file}")"
+  client_repo="$(read_env_value SIMPLEMAIL_CLIENT_REPOSITORY "${env_file}")"
+  backend_repo="${backend_repo:-docker.io/zimengxiong/simplemail-backend}"
+  client_repo="${client_repo:-docker.io/zimengxiong/simplemail-client}"
+  docker_platforms="${RELEASE_DOCKER_PLATFORMS:-linux/amd64,linux/arm64}"
+
+  echo "Local Docker publish configuration:"
+  echo "  Backend repo: ${backend_repo}"
+  echo "  Client repo : ${client_repo}"
+  echo "  Platforms   : ${docker_platforms}"
+  echo "Building and pushing backend image..."
+  docker buildx build \
+    --platform "${docker_platforms}" \
+    -f backend/Dockerfile \
+    -t "${backend_repo}:${next_version}" \
+    -t "${backend_repo}:latest" \
+    --push \
+    backend
+
+  echo "Building and pushing client image..."
+  docker buildx build \
+    --platform "${docker_platforms}" \
+    -f client/Dockerfile \
+    -t "${client_repo}:${next_version}" \
+    -t "${client_repo}:latest" \
+    --push \
+    client
+
+  echo "Local Docker publish complete."
+fi
