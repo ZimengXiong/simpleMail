@@ -30,7 +30,7 @@ import { readStorageString, writeStorageString } from '../services/storage';
 import { logoutOidc } from '../services/oidc';
 
 const readLayoutModePreference = (): 'columns' | 'list' => {
-  return readStorageString('layoutMode') === 'list' ? 'list' : 'columns';
+  return readStorageString('layoutMode') === 'columns' ? 'columns' : 'list';
 };
 
 const persistLayoutModePreference = (mode: 'columns' | 'list') => {

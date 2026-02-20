@@ -4,7 +4,7 @@ import { readStorageString } from './storage';
 export type LayoutMode = 'columns' | 'list';
 
 const readLayoutMode = (): LayoutMode => {
-  return readStorageString('layoutMode') === 'list' ? 'list' : 'columns';
+  return readStorageString('layoutMode') === 'columns' ? 'columns' : 'list';
 };
 
 export const useLayoutMode = () => {
