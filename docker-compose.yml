@@ -38,9 +38,33 @@ services:
   seaweed-filer:
     image: chrislusf/seaweedfs
     container_name: simplemail-seaweed-filer
-    command: filer -master=seaweed-master:9333 -s3 -s3.port=8333 -s3.config=/etc/seaweedfs/s3.json
+    entrypoint:
+      - /bin/sh
+      - -ec
+    command:
+      - |
+        mkdir -p /etc/seaweedfs
+        cat > /etc/seaweedfs/s3.json <<JSON
+        {
+          "identities": [
+            {
+              "name": "admin",
+              "credentials": [
+                {
+                  "accessKey": "${SEAWEED_ACCESS_KEY_ID}",
+                  "secretKey": "${SEAWEED_SECRET_ACCESS_KEY}"
+                }
+              ],
+              "actions": ["Admin", "Read", "List", "Tagging", "Write", "WriteAcp", "ReadAcp", "Delete"]
+            }
+          ]
+        }
+        JSON
+        exec weed filer -master=seaweed-master:9333 -s3 -s3.port=8333 -s3.config=/etc/seaweedfs/s3.json
+    environment:
+      SEAWEED_ACCESS_KEY_ID: ${SEAWEED_ACCESS_KEY_ID:?SEAWEED_ACCESS_KEY_ID is required}
+      SEAWEED_SECRET_ACCESS_KEY: ${SEAWEED_SECRET_ACCESS_KEY:?SEAWEED_SECRET_ACCESS_KEY is required}
     volumes:
-      - ./deploy/seaweedfs:/etc/seaweedfs:ro
       - seaweed_filer_data:/data
     depends_on:
       - seaweed-master
