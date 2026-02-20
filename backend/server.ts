@@ -1,5 +1,6 @@
 import Fastify from 'fastify';
 import { timingSafeEqual } from 'node:crypto';
+import { isIP } from 'node:net';
 import { env } from './src/config/env.js';
 import { registerRoutes } from './src/routes/index.js';
 import type { FastifyError, FastifyReply, FastifyRequest } from 'fastify';
@@ -54,6 +55,43 @@ const isSecureExternalUrl = (value: string) => {
       return false;
     }
     return parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1' || parsed.hostname === '::1';
+  } catch {
+    return false;
+  }
+};
+
+const isPrivateIpv4 = (hostname: string) => {
+  const octets = hostname.split('.').map((part) => Number(part));
+  if (octets.length !== 4 || octets.some((value) => !Number.isInteger(value) || value < 0 || value > 255)) {
+    return false;
+  }
+  if (octets[0] === 10) return true;
+  if (octets[0] === 127) return true;
+  if (octets[0] === 192 && octets[1] === 168) return true;
+  if (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31) return true;
+  return false;
+};
+
+const isPrivateOrLocalHostname = (hostname: string) => {
+  const normalized = String(hostname || '').trim().toLowerCase();
+  if (!normalized) return false;
+  if (normalized === 'localhost' || normalized === 'host.docker.internal') return true;
+  if (normalized.endsWith('.local') || normalized.endsWith('.lan') || normalized.endsWith('.internal')) return true;
+
+  const ipVersion = isIP(normalized);
+  if (ipVersion === 4) {
+    return isPrivateIpv4(normalized);
+  }
+  if (ipVersion === 6) {
+    return normalized === '::1' || normalized.startsWith('fc') || normalized.startsWith('fd') || normalized.startsWith('fe80:');
+  }
+  return false;
+};
+
+const allowsInsecureOidcUrl = (value: string) => {
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === 'http:' && isPrivateOrLocalHostname(parsed.hostname);
   } catch {
     return false;
   }
@@ -125,10 +163,14 @@ if (env.nodeEnv === 'production') {
     throw new Error('GOOGLE_REDIRECT_URI must use HTTPS in production');
   }
   if (!isSecureExternalUrl(env.oidc.issuerUrl)) {
-    throw new Error('OIDC_ISSUER_URL must use HTTPS in production');
+    if (!env.oidc.allowInsecureHttp || !allowsInsecureOidcUrl(env.oidc.issuerUrl)) {
+      throw new Error('OIDC_ISSUER_URL must use HTTPS in production unless OIDC_ALLOW_INSECURE_HTTP=true and host is local/private');
+    }
   }
   if (env.oidc.jwksUri && !isSecureExternalUrl(env.oidc.jwksUri)) {
-    throw new Error('OIDC_JWKS_URI must use HTTPS in production');
+    if (!env.oidc.allowInsecureHttp || !allowsInsecureOidcUrl(env.oidc.jwksUri)) {
+      throw new Error('OIDC_JWKS_URI must use HTTPS in production unless OIDC_ALLOW_INSECURE_HTTP=true and host is local/private');
+    }
   }
   if (looksWeakSharedCredential(env.seaweed.accessKeyId)) {
     throw new Error('SEAWEED_ACCESS_KEY_ID is too weak for production');

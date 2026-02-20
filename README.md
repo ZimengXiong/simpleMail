@@ -25,6 +25,10 @@ Set these values:
 - `VITE_OIDC_ISSUER_URL`
 - `VITE_OIDC_CLIENT_ID`
 
+Optional for non-HTTPS local/private OIDC providers:
+
+- `OIDC_ALLOW_INSECURE_HTTP=true`
+
 ### 3. Start the stack
 
 ```bash

@@ -39,6 +39,7 @@ export const env = {
     issuerUrl: process.env.OIDC_ISSUER_URL ?? 'http://localhost:8080/realms/simplemail',
     clientId: process.env.OIDC_CLIENT_ID ?? 'simplemail-web',
     jwksUri: process.env.OIDC_JWKS_URI ?? '',
+    allowInsecureHttp: process.env.OIDC_ALLOW_INSECURE_HTTP === 'true',
     allowedEmails: oidcAllowedEmails,
     requiredSubject: String(process.env.OIDC_REQUIRED_SUBJECT ?? '').trim(),
     allowedAlgs: (process.env.OIDC_ALLOWED_ALGS ?? 'RS256')
