@@ -91,7 +91,7 @@ const LoginView = () => {
     <div className="min-h-screen w-full bg-bg-app flex items-center justify-center p-4">
       <div className="w-full max-w-[360px] p-10 border border-border bg-bg-card text-center shadow-xs">
         <div className="mb-6">
-          <AppBrand className="justify-center" />
+          <AppBrand className="justify-center" accent="#39ff14" />
         </div>
         <h1 className="text-lg font-bold text-text-primary mb-8">Sign in to SimpleMail with OIDC</h1>
 

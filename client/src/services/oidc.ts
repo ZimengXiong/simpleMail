@@ -1,7 +1,7 @@
 import { api } from './api';
 
 type RuntimeConfig = Partial<Record<
-  'VITE_OIDC_ISSUER_URL' | 'VITE_OIDC_CLIENT_ID' | 'VITE_OIDC_SCOPES' | 'VITE_OIDC_BASE_URL' | 'VITE_OIDC_REALM',
+  'VITE_OIDC_ISSUER_URL' | 'VITE_OIDC_CLIENT_ID' | 'VITE_OIDC_SCOPES',
   string
 >>;
 
@@ -47,19 +47,7 @@ const resolveIssuerUrl = (): string => {
   if (issuer) {
     return issuer.replace(/\/+$/, '');
   }
-
-  // Backward compatibility for prior Keycloak-specific config.
-  const base = readEnv('VITE_OIDC_BASE_URL').replace(/\/+$/, '');
-  const realm = readEnv('VITE_OIDC_REALM');
-  if (base && realm) {
-    return `${base}/realms/${realm}`;
-  }
-  if (base) {
-    return base;
-  }
-
-  const protocol = window.location.protocol === 'https:' ? 'https:' : 'http:';
-  return `${protocol}//${window.location.hostname}:8080/realms/simplemail`;
+  throw new Error('Missing VITE_OIDC_ISSUER_URL');
 };
 
 const oidcConfig = {

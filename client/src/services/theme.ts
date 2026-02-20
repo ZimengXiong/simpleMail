@@ -59,7 +59,7 @@ export const useTheme = () => {
     safeStorageGet('theme') === 'dark' ? 'dark' : 'light'
   );
   const [accentColor, setAccentColor] = useState<string>(() => 
-    safeStorageGet('accentColor') || '#2B1D3A'
+    safeStorageGet('accentColor') || '#10b981'
   );
 
   const setThemeFavicon = (accent: string) => {

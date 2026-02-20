@@ -3,16 +3,18 @@ import { type HTMLAttributes } from 'react';
 type AppBrandProps = {
   variant?: 'default' | 'compact';
   className?: string;
+  accent?: string;
 } & Omit<HTMLAttributes<HTMLDivElement>, 'className'>;
 
-const AppBrand = ({ variant = 'default', className = '' }: AppBrandProps) => {
+const AppBrand = ({ variant = 'default', className = '', accent }: AppBrandProps) => {
   const isCompact = variant === 'compact';
   const iconSize = isCompact ? 26 : 34;
   const textClass = isCompact ? 'text-base' : 'text-lg';
-  const accentColor = 'var(--accent-color)';
+  const accentColor = accent ?? 'var(--accent-color)';
+  const textColorClass = accent ? '' : 'text-accent';
 
   return (
-    <div className={`flex items-center gap-2 text-accent ${className}`}>
+    <div className={`flex items-center gap-2 ${textColorClass} ${className}`} style={accent ? { color: accentColor } : undefined}>
       <svg
         xmlns="http://www.w3.org/2000/svg"
         width={iconSize}
