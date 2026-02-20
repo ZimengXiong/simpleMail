@@ -24,21 +24,19 @@ const AppBrand = ({ variant = 'default', className = '', accent, showText = true
         aria-hidden="true"
       >
         <defs>
-          <linearGradient id="metal-gloss" x1="0%" y1="0%" x2="0%" y2="100%">
-            <stop offset="0%" stopColor="#333" stopOpacity="1" />
-            <stop offset="50%" stopColor="#111" stopOpacity="1" />
-            <stop offset="100%" stopColor="#000" stopOpacity="1" />
+          <linearGradient id="mail-shell" x1="0%" y1="0%" x2="0%" y2="100%">
+            <stop offset="0%" stopColor="#ffffff" stopOpacity="0.95" />
+            <stop offset="100%" stopColor="#ffffff" stopOpacity="0.7" />
           </linearGradient>
         </defs>
-        <path d="M12 32 L92 32 L82 82 L22 82 Z" fill="#000" opacity="0.5" />
         <path
           d="M10 30 L90 30 L80 80 L20 80 Z"
-          fill="url(#metal-gloss)"
+          fill="url(#mail-shell)"
           stroke={accentColor}
           strokeWidth={isCompact ? '2' : '2.5'}
           strokeLinejoin="miter"
         />
-        <path d="M25 40 L40 55" stroke="#fff" strokeWidth="1" opacity="0.6" />
+        <path d="M25 40 L40 55" stroke="#fff" strokeWidth="1" opacity="0.45" />
         <path
           d="M10 30 L50 68 L90 30"
           fill="none"
