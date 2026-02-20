@@ -139,7 +139,7 @@ services:
       api:
         condition: service_started
     ports:
-      - '5173:80'
+      - '7676:80'
     restart: unless-stopped
 
   worker:

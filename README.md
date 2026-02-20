@@ -44,5 +44,5 @@ docker compose up -d
 
 ### 4. Verify
 
-- UI: `http://localhost:5173`
+- UI: `http://localhost:7676`
 - API health: `http://localhost:3000/api/health`

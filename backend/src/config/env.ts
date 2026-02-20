@@ -34,7 +34,7 @@ export const env = {
   allowAdminUserBootstrap: process.env.ALLOW_ADMIN_USER_BOOTSTRAP === 'true',
   databaseUrl: required(process.env.DATABASE_URL, 'DATABASE_URL'),
   appBaseUrl: process.env.APP_BASE_URL ?? 'http://localhost:3000',
-  frontendBaseUrl: process.env.FRONTEND_BASE_URL ?? 'http://localhost:5173',
+  frontendBaseUrl: process.env.FRONTEND_BASE_URL ?? 'http://localhost:7676',
   oidc: {
     issuerUrl: process.env.OIDC_ISSUER_URL ?? 'http://localhost:8080/realms/simplemail',
     clientId: process.env.OIDC_CLIENT_ID ?? 'simplemail-web',
