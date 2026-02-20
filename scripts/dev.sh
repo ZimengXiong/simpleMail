@@ -47,7 +47,7 @@ start_infra() {
     "${ENV_PREPARE_SCRIPT}" "${ENV_FILE}"
   fi
   echo "Starting docker services via ${COMPOSE_FILE}..."
-  docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" up -d
+  docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" --profile dev-oidc up -d postgres seaweed-master seaweed-volume seaweed-filer keycloak
 }
 
 wait_for_postgres() {
@@ -56,7 +56,7 @@ wait_for_postgres() {
   local count=0
 
   while (( count < retries )); do
-    if docker exec simplemail-postgres-dev pg_isready -U simplemail -d simplemail >/dev/null 2>&1; then
+    if docker exec simplemail-postgres pg_isready -U simplemail -d simplemail >/dev/null 2>&1; then
       return 0
     fi
     count=$((count + 1))
@@ -170,7 +170,7 @@ wipe_db() {
   fi
 
   echo "Wiping Postgres database 'simplemail' (OIDC/Keycloak data is not touched)..."
-  docker exec simplemail-postgres-dev psql -v ON_ERROR_STOP=1 -U simplemail -d postgres <<'SQL'
+  docker exec simplemail-postgres psql -v ON_ERROR_STOP=1 -U simplemail -d postgres <<'SQL'
 SELECT pg_terminate_backend(pid)
 FROM pg_stat_activity
 WHERE datname = 'simplemail'

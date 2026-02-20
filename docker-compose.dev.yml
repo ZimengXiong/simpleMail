@@ -1,70 +1,218 @@
 services:
   postgres:
     image: postgres:16
-    container_name: simplemail-postgres-dev
+    container_name: simplemail-postgres
     environment:
-      POSTGRES_DB: simplemail
-      POSTGRES_USER: simplemail
-      POSTGRES_PASSWORD: simplemail
+      POSTGRES_DB: ${POSTGRES_DB:-simplemail}
+      POSTGRES_USER: ${POSTGRES_USER:-simplemail}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
     ports:
-      - "127.0.0.1:5432:5432"
+      - '127.0.0.1:5432:5432'
     volumes:
-      - postgres_data_dev:/var/lib/postgresql/data
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-simplemail} -d ${POSTGRES_DB:-simplemail}']
+      interval: 5s
+      timeout: 5s
+      retries: 20
     restart: unless-stopped
 
   seaweed-master:
     image: chrislusf/seaweedfs
-    container_name: simplemail-seaweed-master-dev
+    container_name: simplemail-seaweed-master
     command: master -ip=seaweed-master -port=9333 -mdir=/data
     volumes:
-      - seaweed_master_data_dev:/data
+      - seaweed_master_data:/data
     restart: unless-stopped
 
   seaweed-volume:
     image: chrislusf/seaweedfs
-    container_name: simplemail-seaweed-volume-dev
+    container_name: simplemail-seaweed-volume
     command: volume -mserver=seaweed-master:9333 -port=8080 -dir=/data
     volumes:
-      - seaweed_volume_data_dev:/data
+      - seaweed_volume_data:/data
     depends_on:
       - seaweed-master
     restart: unless-stopped
 
   seaweed-filer:
     image: chrislusf/seaweedfs
-    container_name: simplemail-seaweed-filer-dev
-    command: filer -master=seaweed-master:9333 -s3 -s3.port=8333 -s3.config=/etc/seaweedfs/s3.json
+    container_name: simplemail-seaweed-filer
+    entrypoint:
+      - /bin/sh
+      - -ec
+    command:
+      - |
+        mkdir -p /etc/seaweedfs
+        cat > /etc/seaweedfs/s3.json <<JSON
+        {
+          "identities": [
+            {
+              "name": "admin",
+              "credentials": [
+                {
+                  "accessKey": "${SEAWEED_ACCESS_KEY_ID}",
+                  "secretKey": "${SEAWEED_SECRET_ACCESS_KEY}"
+                }
+              ],
+              "actions": ["Admin", "Read", "List", "Tagging", "Write", "WriteAcp", "ReadAcp", "Delete"]
+            }
+          ]
+        }
+        JSON
+        exec weed filer -master=seaweed-master:9333 -s3 -s3.port=8333 -s3.config=/etc/seaweedfs/s3.json
+    environment:
+      SEAWEED_ACCESS_KEY_ID: ${SEAWEED_ACCESS_KEY_ID:-simplemail-internal}
+      SEAWEED_SECRET_ACCESS_KEY: ${SEAWEED_SECRET_ACCESS_KEY:-simplemail-internal-secret}
     volumes:
-      - ./deploy/seaweedfs:/etc/seaweedfs:ro
-      - seaweed_filer_data_dev:/data
+      - seaweed_filer_data:/data
     depends_on:
       - seaweed-master
       - seaweed-volume
     ports:
-      - "127.0.0.1:8333:8333"
-      - "127.0.0.1:8888:8888"
+      - '127.0.0.1:8333:8333'
+      - '127.0.0.1:8888:8888'
     restart: unless-stopped
 
   keycloak:
     image: quay.io/keycloak/keycloak:26.1
-    container_name: simplemail-keycloak-dev
+    container_name: simplemail-keycloak
+    profiles:
+      - dev-oidc
     command:
       - start-dev
       - --http-port=8080
       - --import-realm
     environment:
-      KEYCLOAK_ADMIN: admin
-      KEYCLOAK_ADMIN_PASSWORD: admin
+      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN:-admin}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
     ports:
-      - "127.0.0.1:8080:8080"
+      - '127.0.0.1:8080:8080'
     volumes:
       - ./deploy/keycloak:/opt/keycloak/data/import:ro
-      - keycloak_data_dev:/opt/keycloak/data
+      - keycloak_data:/opt/keycloak/data
     restart: unless-stopped
 
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: simplemail-backend:dev
+    pull_policy: never
+    container_name: simplemail-api
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
+      PORT: 3000
+      API_ADMIN_TOKEN: ${API_ADMIN_TOKEN:?API_ADMIN_TOKEN is required}
+      NODE_ENV: ${NODE_ENV:-production}
+      APP_BASE_URL: ${APP_BASE_URL:?APP_BASE_URL is required}
+      FRONTEND_BASE_URL: ${FRONTEND_BASE_URL:?FRONTEND_BASE_URL is required}
+      OIDC_ISSUER_URL: ${OIDC_ISSUER_URL:?OIDC_ISSUER_URL is required}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:?OIDC_CLIENT_ID is required}
+      OIDC_ALLOWED_EMAILS: ${OIDC_ALLOWED_EMAILS:?OIDC_ALLOWED_EMAILS is required}
+      OIDC_REQUIRED_SUBJECT: ${OIDC_REQUIRED_SUBJECT:-}
+      OIDC_ALLOW_INSECURE_HTTP: ${OIDC_ALLOW_INSECURE_HTTP:-false}
+      SEAWEED_S3_ENDPOINT: ${SEAWEED_S3_ENDPOINT:-http://seaweed-filer:8333}
+      SEAWEED_REGION: ${SEAWEED_REGION:-us-east-1}
+      SEAWEED_BUCKET: ${SEAWEED_BUCKET:-simplemail}
+      SEAWEED_ACCESS_KEY_ID: ${SEAWEED_ACCESS_KEY_ID:-simplemail-internal}
+      SEAWEED_SECRET_ACCESS_KEY: ${SEAWEED_SECRET_ACCESS_KEY:-simplemail-internal-secret}
+      SEAWEED_FORCE_PATH_STYLE: 'true'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      seaweed-filer:
+        condition: service_started
+      migrate:
+        condition: service_completed_successfully
+      worker-migrate:
+        condition: service_completed_successfully
+    ports:
+      - '3000:3000'
+    restart: unless-stopped
+
+  client:
+    build:
+      context: ./client
+      dockerfile: Dockerfile
+    image: simplemail-client:dev
+    pull_policy: never
+    container_name: simplemail-client
+    environment:
+      VITE_OIDC_ISSUER_URL: ${VITE_OIDC_ISSUER_URL:?VITE_OIDC_ISSUER_URL is required}
+      VITE_OIDC_CLIENT_ID: ${VITE_OIDC_CLIENT_ID:?VITE_OIDC_CLIENT_ID is required}
+      VITE_OIDC_SCOPES: ${VITE_OIDC_SCOPES:-openid profile email}
+    depends_on:
+      api:
+        condition: service_started
+    ports:
+      - '5173:80'
+    restart: unless-stopped
+
+  worker:
+    image: simplemail-backend:dev
+    pull_policy: never
+    container_name: simplemail-worker
+    command: ["node", "dist/src/worker/run.js"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
+      NODE_ENV: ${NODE_ENV:-production}
+      SEAWEED_S3_ENDPOINT: ${SEAWEED_S3_ENDPOINT:-http://seaweed-filer:8333}
+      SEAWEED_REGION: ${SEAWEED_REGION:-us-east-1}
+      SEAWEED_BUCKET: ${SEAWEED_BUCKET:-simplemail}
+      SEAWEED_ACCESS_KEY_ID: ${SEAWEED_ACCESS_KEY_ID:-simplemail-internal}
+      SEAWEED_SECRET_ACCESS_KEY: ${SEAWEED_SECRET_ACCESS_KEY:-simplemail-internal-secret}
+      SEAWEED_FORCE_PATH_STYLE: 'true'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      seaweed-filer:
+        condition: service_started
+      api:
+        condition: service_started
+      worker-migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  worker-migrate:
+    image: simplemail-backend:dev
+    pull_policy: never
+    container_name: simplemail-worker-migrate
+    command: ["node", "dist/scripts/worker-migrate.js"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
+      SEAWEED_S3_ENDPOINT: ${SEAWEED_S3_ENDPOINT:-http://seaweed-filer:8333}
+      SEAWEED_REGION: ${SEAWEED_REGION:-us-east-1}
+      SEAWEED_BUCKET: ${SEAWEED_BUCKET:-simplemail}
+      SEAWEED_ACCESS_KEY_ID: ${SEAWEED_ACCESS_KEY_ID:-simplemail-internal}
+      SEAWEED_SECRET_ACCESS_KEY: ${SEAWEED_SECRET_ACCESS_KEY:-simplemail-internal-secret}
+      SEAWEED_FORCE_PATH_STYLE: 'true'
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: 'no'
+
+  migrate:
+    image: simplemail-backend:dev
+    pull_policy: never
+    container_name: simplemail-migrate
+    command: ["node", "dist/scripts/migrate.js"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
+      SEAWEED_S3_ENDPOINT: ${SEAWEED_S3_ENDPOINT:-http://seaweed-filer:8333}
+      SEAWEED_REGION: ${SEAWEED_REGION:-us-east-1}
+      SEAWEED_BUCKET: ${SEAWEED_BUCKET:-simplemail}
+      SEAWEED_ACCESS_KEY_ID: ${SEAWEED_ACCESS_KEY_ID:-simplemail-internal}
+      SEAWEED_SECRET_ACCESS_KEY: ${SEAWEED_SECRET_ACCESS_KEY:-simplemail-internal-secret}
+      SEAWEED_FORCE_PATH_STYLE: 'true'
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: 'no'
+
 volumes:
-  postgres_data_dev:
-  seaweed_master_data_dev:
-  seaweed_volume_data_dev:
-  seaweed_filer_data_dev:
-  keycloak_data_dev:
+  postgres_data:
+  seaweed_master_data:
+  seaweed_volume_data:
+  seaweed_filer_data:
+  keycloak_data:
