@@ -1,20 +1,23 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: bettermail-worker-migrate
+  name: simplemail-worker-migrate
 spec:
   backoffLimit: 3
   ttlSecondsAfterFinished: 120
   template:
     metadata:
-      name: bettermail-worker-migrate
+      name: simplemail-worker-migrate
     spec:
       restartPolicy: Never
       containers:
         - name: worker-migrate
-          image: bettermail:latest
+          image: simplemail:latest
           imagePullPolicy: IfNotPresent
           command: ["node", "dist/worker/migrate.js"]
           env:
             - name: DATABASE_URL
-              value: postgres://bettermail:bettermail@postgres:5432/bettermail
+              valueFrom:
+                secretKeyRef:
+                  name: simplemail-secrets
+                  key: database_url

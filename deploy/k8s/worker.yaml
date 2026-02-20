@@ -1,34 +1,43 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: bettermail-worker
+  name: simplemail-worker
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: bettermail-worker
+      app: simplemail-worker
   template:
     metadata:
       labels:
-        app: bettermail-worker
+        app: simplemail-worker
     spec:
       containers:
         - name: worker
-          image: bettermail:latest
+          image: simplemail:latest
           imagePullPolicy: IfNotPresent
           env:
             - name: NODE_ENV
               value: production
             - name: DATABASE_URL
-              value: postgres://bettermail:bettermail@postgres:5432/bettermail
+              valueFrom:
+                secretKeyRef:
+                  name: simplemail-secrets
+                  key: database_url
             - name: SEAWEED_S3_ENDPOINT
               value: http://seaweed-filer:8333
             - name: SEAWEED_BUCKET
-              value: bettermail
+              value: simplemail
             - name: SEAWEED_ACCESS_KEY_ID
-              value: seaweed_admin
+              valueFrom:
+                secretKeyRef:
+                  name: simplemail-secrets
+                  key: seaweed_access_key_id
             - name: SEAWEED_SECRET_ACCESS_KEY
-              value: seaweed_admin_secret
+              valueFrom:
+                secretKeyRef:
+                  name: simplemail-secrets
+                  key: seaweed_secret_access_key
             - name: SEAWEED_FORCE_PATH_STYLE
               value: "true"
           command: ["node", "dist/worker/run.js"]

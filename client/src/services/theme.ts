@@ -1,8 +1,16 @@
 import { useState, useEffect } from 'react';
+import { readStorageString, writeStorageString } from './storage';
 
 export type Theme = 'light' | 'dark';
 
-// Color utilities for accessibility
+const safeStorageGet = (key: string): string | null => {
+  return readStorageString(key);
+};
+
+const safeStorageSet = (key: string, value: string): void => {
+  writeStorageString(key, value);
+};
+
 const hexToRgb = (hex: string) => {
   const cleanHex = hex.replace('#', '');
   const r = parseInt(cleanHex.substring(0, 2), 16);
@@ -36,7 +44,6 @@ const getContrast = (hex1: string, hex2: string) => {
 
 const adjustLightness = (hex: string, percent: number) => {
   const { r, g, b } = hexToRgb(hex);
-  // Simple linear interpolation towards white (positive percent) or black (negative percent)
   const target = percent > 0 ? 255 : 0;
   const p = Math.abs(percent);
   
@@ -49,52 +56,37 @@ const adjustLightness = (hex: string, percent: number) => {
 
 export const useTheme = () => {
   const [theme, setTheme] = useState<Theme>(() => 
-    (localStorage.getItem('theme') as Theme) || 'light'
+    safeStorageGet('theme') === 'dark' ? 'dark' : 'light'
   );
   const [accentColor, setAccentColor] = useState<string>(() => 
-    localStorage.getItem('accentColor') || '#2B1D3A'
+    safeStorageGet('accentColor') || '#2B1D3A'
   );
 
   useEffect(() => {
-    // Apply theme attribute to html element
     document.documentElement.setAttribute('data-theme', theme);
-    localStorage.setItem('theme', theme);
+    safeStorageSet('theme', theme);
   }, [theme]);
 
   useEffect(() => {
-    // Determine background color based on theme
-    // Matching CSS variables: light=#ffffff, dark=#191919
     const bg = theme === 'light' ? '#ffffff' : '#191919';
     
     let adjustedAccent = accentColor;
     let contrast = getContrast(adjustedAccent, bg);
     
-    // Enforce high contrast for accessibility and to prevent "disabled" look
-    // Using 7.0 (AAA) for dark mode to make it really pop, 4.5 (AA) for light mode
     const targetContrast = theme === 'dark' ? 7.0 : 4.5;
     
     let iterations = 0;
     while (contrast < targetContrast && iterations < 20) {
-      // Lighten for dark mode, darken for light mode
-      // Use a slightly larger step for dark mode to reach "vibrant" territory faster
       const direction = theme === 'dark' ? 0.15 : -0.1;
       adjustedAccent = adjustLightness(adjustedAccent, direction);
       contrast = getContrast(adjustedAccent, bg);
       iterations++;
     }
 
-    // Apply adjusted accent color to root
     document.documentElement.style.setProperty('--accent-color', adjustedAccent);
-    
-    // Derive a hover color
-    // In dark mode, hover should usually be LIGHTER/BRIGHTER to feel interactive
-    // In light mode, hover is usually DARKER
     const hoverColor = adjustLightness(adjustedAccent, theme === 'light' ? -0.1 : 0.15);
     document.documentElement.style.setProperty('--accent-hover', hoverColor);
-    
-    // Calculate contrast color (black or white) for text on accent background
     const getContrastColor = (hexcolor: string) => {
-      // Remove # if present
       const hex = hexcolor.replace('#', '');
       const r = parseInt(hex.substr(0, 2), 16);
       const g = parseInt(hex.substr(2, 2), 16);
@@ -105,7 +97,7 @@ export const useTheme = () => {
     
     document.documentElement.style.setProperty('--accent-contrast', getContrastColor(adjustedAccent));
     
-    localStorage.setItem('accentColor', accentColor);
+    safeStorageSet('accentColor', accentColor);
   }, [accentColor, theme]);
 
   return { theme, setTheme, accentColor, setAccentColor };

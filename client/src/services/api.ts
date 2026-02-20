@@ -8,40 +8,16 @@ import type {
   MailboxSyncState,
   ConnectorSyncStatesResponse,
 } from '../types/index';
+import { redirectToLogin } from './authRedirect';
 
 const API_BASE = '/api';
-const TOKEN_STORAGE_KEY = 'BETTERMAIL_USER_TOKEN';
 let runtimeToken: string | null = null;
+type JsonObject = Record<string, unknown>;
 
-const resolveToken = () => {
-  const envToken = ((import.meta as { env?: Record<string, string | undefined> }).env?.VITE_BETTERMAIL_USER_TOKEN ?? '').trim();
-  if (runtimeToken) {
-    return runtimeToken;
-  }
-
-  try {
-    const sessionToken = sessionStorage.getItem(TOKEN_STORAGE_KEY);
-    if (sessionToken) {
-      runtimeToken = sessionToken;
-      return sessionToken;
-    }
-
-    // One-time migration path for older clients that used localStorage.
-    const legacyLocalToken = localStorage.getItem(TOKEN_STORAGE_KEY);
-    if (legacyLocalToken) {
-      sessionStorage.setItem(TOKEN_STORAGE_KEY, legacyLocalToken);
-      localStorage.removeItem(TOKEN_STORAGE_KEY);
-      runtimeToken = legacyLocalToken;
-      return legacyLocalToken;
-    }
-  } catch {
-    // ignore browser storage availability issues and fall through to env token.
-  }
-
-  return envToken || null;
+export const getAuthToken = () => runtimeToken;
+const clearRuntimeAuth = () => {
+  runtimeToken = null;
 };
-
-const getAuthToken = () => resolveToken();
 
 const parseDownloadFilename = (value: string | null) => {
   if (!value) return null;
@@ -53,7 +29,7 @@ const parseDownloadFilename = (value: string | null) => {
       return utf8Match[1];
     }
   }
-  const plainMatch = value.match(/filename=\"?([^\";]+)\"?/i);
+  const plainMatch = value.match(/filename="?([^";]+)"?/i);
   return plainMatch?.[1] ?? null;
 };
 
@@ -79,6 +55,66 @@ const openBlobInNewTab = (blob: Blob, fallbackFilename: string) => {
   }, 60_000);
 };
 
+const navigateToPath = (path: string) => {
+  if (typeof window.location.assign === 'function') {
+    window.location.assign(path);
+    return;
+  }
+  (window.location as unknown as { href: string }).href = path;
+};
+
+const isAbortError = (error: unknown): boolean =>
+  error instanceof DOMException && error.name === 'AbortError';
+
+const tryParseJson = (value: string): unknown | null => {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+};
+
+const parseErrorMessage = async (response: Response): Promise<string> => {
+  const contentType = response.headers.get('content-type') || '';
+  if (contentType.includes('application/json')) {
+    const payload = await response.json().catch(() => null) as { error?: unknown; message?: unknown } | null;
+    const errorMessage = typeof payload?.error === 'string'
+      ? payload.error
+      : (typeof payload?.message === 'string' ? payload.message : '');
+    if (errorMessage) {
+      return errorMessage;
+    }
+  }
+
+  const text = (await response.text().catch(() => '')).trim();
+  if (text) {
+    return text;
+  }
+  return response.statusText || 'Request failed';
+};
+
+const parseSuccessResponse = async <T>(response: Response): Promise<T> => {
+  if (response.status === 204 || response.status === 205 || response.status === 304) {
+    return undefined as T;
+  }
+
+  const bodyText = await response.text();
+  if (!bodyText) {
+    return undefined as T;
+  }
+
+  const contentType = response.headers.get('content-type') || '';
+  if (contentType.includes('application/json')) {
+    return JSON.parse(bodyText) as T;
+  }
+
+  const maybeJson = tryParseJson(bodyText);
+  if (maybeJson !== null) {
+    return maybeJson as T;
+  }
+  return bodyText as T;
+};
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const token = getAuthToken();
   
@@ -90,29 +126,30 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     headers.set('Authorization', `Bearer ${token}`);
   }
 
-  const response = await fetch(`${API_BASE}${path}`, {
-    ...options,
-    headers,
-  });
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE}${path}`, {
+      ...options,
+      headers,
+    });
+  } catch (error) {
+    if (isAbortError(error)) {
+      throw error;
+    }
+    throw new Error('Network request failed');
+  }
 
   if (response.status === 401) {
-    runtimeToken = null;
-    try {
-      sessionStorage.removeItem(TOKEN_STORAGE_KEY);
-      localStorage.removeItem(TOKEN_STORAGE_KEY);
-    } catch {
-      // ignore storage failures
-    }
-    window.location.href = '/login';
+    clearRuntimeAuth();
+    redirectToLogin();
     throw new Error('Unauthorized');
   }
 
   if (!response.ok) {
-    const error = await response.json().catch(() => ({ error: 'Unknown error' }));
-    throw new Error(error.error || response.statusText);
+    throw new Error(await parseErrorMessage(response));
   }
 
-  return response.json();
+  return parseSuccessResponse<T>(response);
 }
 
 async function requestBlob(path: string, options?: RequestInit): Promise<{ blob: Blob; filename: string | null }> {
@@ -122,25 +159,26 @@ async function requestBlob(path: string, options?: RequestInit): Promise<{ blob:
     headers.set('Authorization', `Bearer ${token}`);
   }
 
-  const response = await fetch(`${API_BASE}${path}`, {
-    ...options,
-    headers,
-  });
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE}${path}`, {
+      ...options,
+      headers,
+    });
+  } catch (error) {
+    if (isAbortError(error)) {
+      throw error;
+    }
+    throw new Error('Network request failed');
+  }
 
   if (response.status === 401) {
-    runtimeToken = null;
-    try {
-      sessionStorage.removeItem(TOKEN_STORAGE_KEY);
-      localStorage.removeItem(TOKEN_STORAGE_KEY);
-    } catch {
-      // ignore storage failures
-    }
-    window.location.href = '/login';
+    clearRuntimeAuth();
+    redirectToLogin();
     throw new Error('Unauthorized');
   }
   if (!response.ok) {
-    const error = await response.json().catch(() => ({ error: 'Unknown error' }));
-    throw new Error(error.error || response.statusText);
+    throw new Error(await parseErrorMessage(response));
   }
 
   return {
@@ -152,39 +190,31 @@ async function requestBlob(path: string, options?: RequestInit): Promise<{ blob:
 export const api = {
   auth: {
     login: (token: string) => {
-      runtimeToken = token;
-      try {
-        sessionStorage.setItem(TOKEN_STORAGE_KEY, token);
-        localStorage.removeItem(TOKEN_STORAGE_KEY);
-      } catch {
-        // ignore storage failures
-      }
+      runtimeToken = String(token || '').trim() || null;
+    },
+    clear: () => {
+      clearRuntimeAuth();
     },
     logout: () => {
-      runtimeToken = null;
-      try {
-        sessionStorage.removeItem(TOKEN_STORAGE_KEY);
-        localStorage.removeItem(TOKEN_STORAGE_KEY);
-      } catch {
-        // ignore storage failures
-      }
-      window.location.href = '/login';
+      clearRuntimeAuth();
+      navigateToPath('/login');
     },
-    isAuthenticated: () => !!getAuthToken(),
+    isAuthenticated: () => Boolean(getAuthToken()),
+    session: () => request<{ id: string; email: string; name: string }>('/session'),
   },
 
   connectors: {
     getIncoming: (id: string) => request<IncomingConnectorRecord>(`/connectors/incoming/${id}`),
     listIncoming: () => request<IncomingConnectorRecord[]>('/connectors/incoming'),
-    updateIncoming: (id: string, data: any) => request<IncomingConnectorRecord>(`/connectors/incoming/${id}`, {
+    updateIncoming: (id: string, data: JsonObject) => request<IncomingConnectorRecord>(`/connectors/incoming/${id}`, {
       method: 'PATCH',
       body: JSON.stringify(data),
     }),
     listOutgoing: () => request<OutgoingConnectorRecord[]>('/connectors/outgoing'),
     getOutgoing: (id: string) => request<OutgoingConnectorRecord>(`/connectors/outgoing/${id}`),
-    createIncoming: (data: any) => request<IncomingConnectorRecord>('/connectors/incoming', { method: 'POST', body: JSON.stringify(data) }),
-    createOutgoing: (data: any) => request<OutgoingConnectorRecord>('/connectors/outgoing', { method: 'POST', body: JSON.stringify(data) }),
-    updateOutgoing: (id: string, data: any) => request<OutgoingConnectorRecord>(`/connectors/outgoing/${id}`, {
+    createIncoming: (data: JsonObject) => request<IncomingConnectorRecord>('/connectors/incoming', { method: 'POST', body: JSON.stringify(data) }),
+    createOutgoing: (data: JsonObject) => request<OutgoingConnectorRecord>('/connectors/outgoing', { method: 'POST', body: JSON.stringify(data) }),
+    updateOutgoing: (id: string, data: JsonObject) => request<OutgoingConnectorRecord>(`/connectors/outgoing/${id}`, {
       method: 'PATCH',
       body: JSON.stringify(data),
     }),
@@ -197,21 +227,21 @@ export const api = {
   identities: {
     get: (id: string) => request<IdentityRecord>(`/identities/${id}`),
     list: () => request<IdentityRecord[]>('/identities'),
-    create: (data: any) => request<IdentityRecord>('/identities', { method: 'POST', body: JSON.stringify(data) }),
-    update: (id: string, data: any) => request<IdentityRecord>(`/identities/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
+    create: (data: JsonObject) => request<IdentityRecord>('/identities', { method: 'POST', body: JSON.stringify(data) }),
+    update: (id: string, data: JsonObject) => request<IdentityRecord>(`/identities/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
     delete: (id: string) => request(`/identities/${id}`, { method: 'DELETE' }),
   },
 
   rules: {
-    list: () => request<any[]>('/rules'),
-    create: (data: any) => request<any>('/rules', { method: 'POST', body: JSON.stringify(data) }),
+    list: () => request<JsonObject[]>('/rules'),
+    create: (data: JsonObject) => request<JsonObject>('/rules', { method: 'POST', body: JSON.stringify(data) }),
     delete: (id: string) => request(`/rules/${id}`, { method: 'DELETE' }),
     runAll: () => request<{ status: string }>('/rules/run', { method: 'POST' }),
   },
 
   labels: {
-    list: () => request<any[]>('/labels'),
-    create: (name: string, key?: string) => request<any>('/labels', { method: 'POST', body: JSON.stringify({ name, key }) }),
+    list: () => request<JsonObject[]>('/labels'),
+    create: (name: string, key?: string) => request<JsonObject>('/labels', { method: 'POST', body: JSON.stringify({ name, key }) }),
     delete: (id: string) => request(`/labels/${id}`, { method: 'DELETE' }),
     addToMessage: (messageId: string, labelKeys: string[]) => 
       request(`/messages/${messageId}/labels`, { method: 'POST', body: JSON.stringify({ addLabelKeys: labelKeys }) }),
@@ -220,43 +250,47 @@ export const api = {
   },
 
   savedSearches: {
-    list: () => request<any[]>('/saved-searches'),
-    create: (data: { name: string, queryText: string }) => request<any>('/saved-searches', { method: 'POST', body: JSON.stringify(data) }),
+    list: () => request<JsonObject[]>('/saved-searches'),
+    create: (data: { name: string, queryText: string }) => request<JsonObject>('/saved-searches', { method: 'POST', body: JSON.stringify(data) }),
     delete: (id: string) => request(`/saved-searches/${id}`, { method: 'DELETE' }),
   },
 
   search: {
-    quickFilters: () => request<any>('/search/quick-filters'),
-    suggestions: (q: string) => request<any>(`/search/suggestions?q=${encodeURIComponent(q)}`),
+    quickFilters: () => request<JsonObject>('/search/quick-filters'),
+    suggestions: (q: string) => request<JsonObject>(`/search/suggestions?q=${encodeURIComponent(q)}`),
   },
 
   messages: {
-    list: (params?: { folder?: string; connectorId?: string; limit?: number; offset?: number }) => {
+    list: (params?: { folder?: string; connectorId?: string; limit?: number; offset?: number; signal?: AbortSignal }) => {
       const query = new URLSearchParams();
       if (params?.folder) query.append('folder', params.folder);
       if (params?.connectorId) query.append('connectorId', params.connectorId);
       if (params?.limit) query.append('limit', String(params.limit));
       if (typeof params?.offset === 'number') query.append('offset', String(params.offset));
-      return request<{ messages: MessageRecord[]; totalCount: number }>(`/messages?${query.toString()}`);
+      return request<{ messages: MessageRecord[]; totalCount: number }>(`/messages?${query.toString()}`, {
+        signal: params?.signal,
+      });
     },
-    listSendOnly: (params: { emailAddress: string; folder?: string; q?: string; limit?: number; offset?: number }) => {
+    listSendOnly: (params: { emailAddress: string; folder?: string; q?: string; limit?: number; offset?: number; signal?: AbortSignal }) => {
       const query = new URLSearchParams();
       query.append('emailAddress', params.emailAddress);
       if (params.folder) query.append('folder', params.folder);
       if (params.q) query.append('q', params.q);
       if (params.limit) query.append('limit', String(params.limit));
       if (typeof params.offset === 'number') query.append('offset', String(params.offset));
-      return request<{ messages: MessageRecord[]; totalCount: number }>(`/messages/send-only?${query.toString()}`);
+      return request<{ messages: MessageRecord[]; totalCount: number }>(`/messages/send-only?${query.toString()}`, {
+        signal: params.signal,
+      });
     },
-    getThread: (threadId: string, connectorId?: string) => {
+    getThread: (threadId: string, connectorId?: string, signal?: AbortSignal) => {
       const query = connectorId
         ? `?connectorId=${encodeURIComponent(connectorId)}`
         : '';
-      return request<MessageRecord[]>(`/messages/thread/${threadId}${query}`);
+      return request<MessageRecord[]>(`/messages/thread/${threadId}${query}`, { signal });
     },
-    getLabels: (messageId: string) => request<any[]>(`/messages/${messageId}/labels`),
+    getLabels: (messageId: string) => request<JsonObject[]>(`/messages/${messageId}/labels`),
     update: (messageId: string, data: { isRead?: boolean, isStarred?: boolean, moveToFolder?: string, delete?: boolean, scope?: 'single' | 'thread' }) =>
-      request<any>(`/messages/${messageId}`, { method: 'PATCH', body: JSON.stringify(data) }),
+      request<JsonObject>(`/messages/${messageId}`, { method: 'PATCH', body: JSON.stringify(data) }),
     bulkUpdate: (messageIds: string[], data: { isRead?: boolean, isStarred?: boolean, moveToFolder?: string, delete?: boolean, scope?: 'single' | 'thread' }) =>
       request<{ results: { id: string; status: string }[] }>('/messages/bulk', {
         method: 'POST',
@@ -271,13 +305,15 @@ export const api = {
       const { blob, filename } = await requestBlob(`/messages/${messageId}/raw`);
       openBlobInNewTab(blob, filename ?? `${messageId}.eml`);
     },
-    search: (params: { q: string; folder?: string; connectorId?: string; limit?: number; offset?: number }) => {
+    search: (params: { q: string; folder?: string; connectorId?: string; limit?: number; offset?: number; signal?: AbortSignal }) => {
+      const { signal, ...payload } = params;
       return request<{ messages: MessageRecord[]; totalCount: number }>('/messages/search', { 
         method: 'POST', 
-        body: JSON.stringify(params) 
+        signal,
+        body: JSON.stringify(payload) 
       });
     },
-    send: (data: any, idempotencyKey: string) => {
+    send: (data: JsonObject, idempotencyKey: string) => {
       return request<{ status: string; sendId: string }>('/messages/send', { 
         method: 'POST', 
         headers: { 'Idempotency-Key': idempotencyKey },
@@ -294,7 +330,13 @@ export const api = {
 
   oauth: {
     google: {
-      authorize: (data: { type: 'incoming' | 'outgoing'; connectorId: string; oauthClientId?: string; oauthClientSecret?: string }) =>
+      authorize: (data: {
+        type: 'incoming' | 'outgoing';
+        connectorId?: string;
+        connector?: JsonObject;
+        oauthClientId?: string;
+        oauthClientSecret?: string;
+      }) =>
         request<{ authorizeUrl: string }>('/oauth/google/authorize', { method: 'POST', body: JSON.stringify(data) }),
     },
   },
@@ -328,17 +370,19 @@ export const api = {
       const query = new URLSearchParams({ mailbox });
       return request<MailboxSyncState>(`/connectors/${connectorId}/sync-state?${query.toString()}`);
     },
-    getStates: (connectorId: string) =>
-      request<ConnectorSyncStatesResponse>(`/connectors/${connectorId}/sync-states`),
+    getStates: (connectorId: string, signal?: AbortSignal) =>
+      request<ConnectorSyncStatesResponse>(`/connectors/${connectorId}/sync-states`, { signal }),
   },
 
   events: {
-    list: (since = 0, limit = 50) => request<any[]>(`/events?since=${since}&limit=${limit}`),
+    list: (since = 0, limit = 50) => request<JsonObject[]>(`/events?since=${since}&limit=${limit}`),
   },
 
   attachments: {
-    getDownloadUrl: (attachmentId: string) => `/api/attachments/${attachmentId}/download`,
-    getPreviewUrl: (attachmentId: string) => `/api/attachments/${attachmentId}/view`,
+    getPreviewBlob: async (attachmentId: string, signal?: AbortSignal) => {
+      const { blob } = await requestBlob(`/attachments/${attachmentId}/view`, { signal });
+      return blob;
+    },
     download: async (attachmentId: string, fallbackFilename = 'attachment') => {
       const { blob, filename } = await requestBlob(`/attachments/${attachmentId}/download`);
       triggerBrowserDownload(blob, filename ?? fallbackFilename);

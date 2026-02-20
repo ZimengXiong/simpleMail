@@ -21,6 +21,12 @@ import {
 
 import type { MessageRecord } from '../types/index';
 import { buildReplyReferencesHeader, normalizeMessageIdHeader, orderThreadMessages } from '../services/threading';
+import {
+  readPersistedInboxState,
+  reduceInboxState,
+  resolveInboxViewState,
+  toInboxPath,
+} from '../services/inboxStateMachine';
 type MessagesQueryResult = { messages: MessageRecord[]; totalCount: number };
 
 const isStarredFolderToken = (value: unknown) => String(value ?? '').trim().toUpperCase().includes('STARRED');
@@ -136,6 +142,10 @@ const buildSandboxedEmailDoc = (safeBodyHtml: string) => `<!DOCTYPE html>
 <html>
   <head>
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; img-src data: blob: cid:; media-src data: blob: cid:; style-src 'unsafe-inline'; font-src data:; connect-src 'none'; frame-src 'none'; object-src 'none'; form-action 'none'"
+    />
     <style>
       :root { color-scheme: only light; }
       body {
@@ -187,7 +197,41 @@ const ThreadView = () => {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const queryClient = useQueryClient();
+  const preferredInboxState = readPersistedInboxState();
   const connectorId = searchParams.get('connectorId') || undefined;
+  const inboxBackPath = useMemo(() => {
+    const seedParams = new URLSearchParams(searchParams);
+    if (threadId && !seedParams.has('threadId')) {
+      seedParams.set('threadId', threadId);
+    }
+
+    const incomingConnectorIds = new Set<string>();
+    const sendOnlyEmails = new Set<string>();
+    const connectorFromParams = String(seedParams.get('connectorId') ?? '').trim();
+    if (connectorFromParams) {
+      incomingConnectorIds.add(connectorFromParams);
+    }
+    const profileToken = String(seedParams.get('profile') ?? '').trim().toLowerCase();
+    const sendEmailFromParams = String(seedParams.get('sendEmail') ?? '').trim().toLowerCase();
+    if (profileToken === 'send-only' && sendEmailFromParams) {
+      sendOnlyEmails.add(sendEmailFromParams);
+    }
+    if (preferredInboxState?.profile.kind === 'incoming') {
+      incomingConnectorIds.add(preferredInboxState.profile.connectorId);
+    } else if (preferredInboxState?.profile.kind === 'send-only') {
+      sendOnlyEmails.add(preferredInboxState.profile.sendEmail);
+    }
+
+    const resolved = resolveInboxViewState(seedParams, {
+      incomingConnectorIds: Array.from(incomingConnectorIds),
+      sendOnlyEmails: Array.from(sendOnlyEmails),
+      preferredState: preferredInboxState,
+    });
+    if (!resolved.state) {
+      return '/inbox';
+    }
+    return toInboxPath(reduceInboxState(resolved.state, { type: 'close-thread' }));
+  }, [preferredInboxState, searchParams, threadId]);
 
   const [replyContext, setReplyContext] = useState<{
     open: boolean;
@@ -201,10 +245,20 @@ const ThreadView = () => {
     references?: string;
   } | null>(null);
   const [allowRichByMessageId, setAllowRichByMessageId] = useState<Record<string, boolean>>({});
+  const isScopedMessageQuery = (queryKey: readonly unknown[]) => {
+    if (!Array.isArray(queryKey) || queryKey[0] !== 'messages') {
+      return false;
+    }
+    const scope = queryKey[1];
+    if (connectorId) {
+      return scope === connectorId;
+    }
+    return !(typeof scope === 'string' && scope.startsWith('send-only:'));
+  };
 
   const { data: messages, isLoading } = useQuery({
     queryKey: ['thread', threadId, connectorId ?? 'all'],
-    queryFn: () => api.messages.getThread(threadId!),
+    queryFn: ({ signal }) => api.messages.getThread(threadId!, connectorId, signal),
     enabled: !!threadId,
     staleTime: 30_000,
   });
@@ -215,17 +269,21 @@ const ThreadView = () => {
     onMutate: async (vars) => {
       await Promise.all([
         queryClient.cancelQueries({ queryKey: ['thread', threadId, connectorId ?? 'all'] }),
-        queryClient.cancelQueries({ queryKey: ['messages'] }),
+        queryClient.cancelQueries({
+          predicate: (query) => isScopedMessageQuery(query.queryKey),
+        }),
       ]);
       const previousThread = queryClient.getQueryData<MessageRecord[]>(['thread', threadId, connectorId ?? 'all']);
-      const previousMessages = queryClient.getQueriesData<MessagesQueryResult>({ queryKey: ['messages'] });
+      const previousMessages = queryClient.getQueriesData<MessagesQueryResult>({
+        predicate: (query) => isScopedMessageQuery(query.queryKey),
+      });
       queryClient.setQueryData<MessageRecord[]>(
         ['thread', threadId, connectorId ?? 'all'],
         (current) => applyThreadPatch(current, vars.messageId, vars.data),
       );
       for (const [key, data] of previousMessages) {
         const queryKey = Array.isArray(key) ? key : [];
-        const removeFromStarredOnUnstar = isStarredFolderToken(queryKey[1]);
+        const removeFromStarredOnUnstar = isStarredFolderToken(queryKey[2]);
         queryClient.setQueryData<MessagesQueryResult>(
           key,
           applyMessageListPatch(data, vars.messageId, vars.data, { removeFromStarredOnUnstar }),
@@ -242,8 +300,11 @@ const ThreadView = () => {
       }
     },
     onSettled: () => {
-      queryClient.invalidateQueries({ queryKey: ['messages'] });
-      queryClient.invalidateQueries({ queryKey: ['thread', threadId, connectorId ?? 'all'] });
+      queryClient.invalidateQueries({
+        predicate: (query) => isScopedMessageQuery(query.queryKey),
+        refetchType: 'active',
+      });
+      queryClient.invalidateQueries({ queryKey: ['thread', threadId, connectorId ?? 'all'], refetchType: 'active' });
     },
   });
 
@@ -265,6 +326,28 @@ const ThreadView = () => {
   const newestMessageId = newestMessage?.id ?? null;
   const threadSubject = newestMessage?.subject || '(no subject)';
   const threadConversationId = threadId || '';
+  const sanitizedBodyByMessageId = useMemo(() => {
+    const map = new Map<string, {
+      sanitizedBody: SanitizedEmailHtmlResult | null;
+      safeBodyHtml: string | null;
+      blockedContentSummary: string | null;
+      allowRichFormatting: boolean;
+    }>();
+    for (const node of orderedThreadNodes) {
+      const msg = node.message;
+      const allowRichFormatting = allowRichByMessageId[msg.id] === true;
+      const sanitizedBody = msg.bodyHtml
+        ? sanitizeEmailHtmlWithReport(msg.bodyHtml, { allowStyles: allowRichFormatting })
+        : null;
+      map.set(msg.id, {
+        sanitizedBody,
+        safeBodyHtml: sanitizedBody?.html ?? null,
+        blockedContentSummary: buildBlockedContentSummary(sanitizedBody, allowRichFormatting),
+        allowRichFormatting,
+      });
+    }
+    return map;
+  }, [allowRichByMessageId, orderedThreadNodes]);
 
   const openReplyComposer = (mode: 'reply' | 'replyAll' | 'forward', message: MessageRecord | null) => {
     if (!message) return;
@@ -299,42 +382,45 @@ const ThreadView = () => {
   );
 
   return (
-    <div className="flex-1 flex flex-col h-full bg-white overflow-hidden">
-      <div className="h-14 border-b border-border flex items-center px-4 gap-4 shrink-0 bg-bg-card">
-        <button onClick={() => navigate(-1)} className="p-1.5 hover:bg-black/5 rounded-md text-text-secondary">
-          <ChevronLeft className="w-5 h-5" />
+    <div className="flex-1 flex flex-col h-full bg-white overflow-y-auto custom-scrollbar">
+      <div className="h-14 md:h-12 border-b border-border flex items-center bg-bg-card sticky top-0 z-40 px-4">
+        <button 
+          onClick={() => navigate(inboxBackPath)} 
+          className="-ml-1 p-1.5 hover:bg-black/5 rounded-md text-text-secondary transition-colors"
+        >
+          <ChevronLeft className="w-6 h-6 md:w-5 h-5" />
         </button>
-        <h2 className="text-lg font-bold text-text-primary truncate flex-1">
+        <h2 className="text-lg font-bold text-text-primary truncate flex-1 ml-1 md:ml-2">
           {threadSubject}
         </h2>
         <div className="flex items-center gap-1">
           <button
             onClick={() => newestMessage && updateMutation.mutate({ messageId: newestMessage.id, data: { isStarred: !newestMessage.isStarred } })}
-            className="p-1.5 hover:bg-black/5 rounded-md text-text-secondary"
+            className="p-2 hover:bg-black/5 rounded-md text-text-secondary"
           >
-            <Star className={`w-4 h-4 ${newestMessage?.isStarred ? 'fill-yellow-400 text-yellow-400' : ''}`} />
+            <Star className={`w-5 h-5 md:w-4 md:h-4 ${newestMessage?.isStarred ? 'fill-yellow-400 text-yellow-400' : ''}`} />
           </button>
           <button
             onClick={() => newestMessage && updateMutation.mutate({ messageId: newestMessage.id, data: { isRead: !newestMessage.isRead } })}
-            className="p-1.5 hover:bg-black/5 rounded-md text-text-secondary"
+            className="p-2 hover:bg-black/5 rounded-md text-text-secondary"
             title={newestMessage?.isRead ? 'Mark as Unread' : 'Mark as Read'}
           >
-            {newestMessage?.isRead ? <Mail className="w-4 h-4" /> : <MailOpen className="w-4 h-4" />}
+            {newestMessage?.isRead ? <Mail className="w-5 h-5 md:w-4 md:h-4" /> : <MailOpen className="w-5 h-5 md:w-4 md:h-4" />}
           </button>
           <button
             onClick={() => newestMessage && api.messages.downloadRaw(newestMessage.id)}
-            className="p-1.5 hover:bg-black/5 rounded-md text-text-secondary"
+            className="p-2 hover:bg-black/5 rounded-md text-text-secondary"
             title="Download raw message"
           >
-            <Download className="w-4 h-4" />
+            <Download className="w-5 h-5 md:w-4 md:h-4" />
           </button>
         </div>
       </div>
 
-      <div className="flex-1 overflow-y-auto bg-[#fbfbfa] p-8 pt-12">
+      <div className="flex-1 bg-[#fbfbfa] p-4 md:p-8 pt-6 md:pt-12">
         <div className="max-w-4xl mx-auto space-y-6">
-          <div className="pb-6 mb-8">
-            <h1 className="text-3xl md:text-4xl font-extrabold text-text-primary tracking-tight leading-tight">
+          <div className="pb-4 md:pb-6 mb-4 md:mb-8 border-b border-border/40">
+            <h1 className="text-2xl md:text-4xl font-extrabold text-text-primary tracking-tight leading-tight">
               {threadSubject}
             </h1>
           </div>
@@ -342,12 +428,11 @@ const ThreadView = () => {
           {orderedThreadNodes.map((node) => {
             const msg = node.message;
             const depthOffsetPx = Math.min(node.depth, 6) * 20;
-            const allowRichFormatting = allowRichByMessageId[msg.id] === true;
-            const sanitizedBody = msg.bodyHtml
-              ? sanitizeEmailHtmlWithReport(msg.bodyHtml, { allowStyles: allowRichFormatting })
-              : null;
-            const safeBodyHtml = sanitizedBody?.html ?? null;
-            const blockedContentSummary = buildBlockedContentSummary(sanitizedBody, allowRichFormatting);
+            const sanitizedPayload = sanitizedBodyByMessageId.get(msg.id);
+            const allowRichFormatting = sanitizedPayload?.allowRichFormatting ?? false;
+            const sanitizedBody = sanitizedPayload?.sanitizedBody ?? null;
+            const safeBodyHtml = sanitizedPayload?.safeBodyHtml ?? null;
+            const blockedContentSummary = sanitizedPayload?.blockedContentSummary ?? null;
             return (
             <div key={msg.id} className={`bg-white border border-border rounded-lg shadow-sm overflow-hidden ${msg.id === newestMessageId ? 'ring-1 ring-accent/15' : ''}`} style={depthOffsetPx > 0 ? { marginLeft: `${depthOffsetPx}px` } : undefined}>
               <div className="px-4 py-3 border-b border-border bg-sidebar/30 flex justify-between items-center">
@@ -424,7 +509,7 @@ const ThreadView = () => {
                   <iframe
                     title={`msg-${msg.id}`}
                     srcDoc={buildSandboxedEmailDoc(safeBodyHtml)}
-                    sandbox="allow-popups"
+                    sandbox="allow-popups allow-same-origin"
                     referrerPolicy="no-referrer"
                     loading="lazy"
                     className="w-full h-[420px] max-h-[70vh] border border-border/50 rounded-md bg-white"
@@ -437,7 +522,7 @@ const ThreadView = () => {
             );
           })}
 
-          <div className="pt-8 flex justify-center">
+          <div className="pt-8 hidden md:flex justify-center">
             <button
               onClick={() => openReplyComposer('reply', newestMessage)}
               className="flex items-center gap-2 px-6 py-2 border border-border rounded-full text-sm font-bold text-text-secondary hover:bg-sidebar hover:text-text-primary transition-all"

@@ -1,6 +1,6 @@
-import { useState, useMemo } from 'react';
+import { useState, useMemo, lazy, Suspense, useCallback, useEffect } from 'react';
 import { NavLink, useSearchParams } from 'react-router-dom';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../services/api';
 import { 
   Inbox, 
@@ -14,17 +14,25 @@ import {
   AlertOctagon,
   Clock
 } from 'lucide-react';
-import ComposeModal from './ComposeModal';
 import ProfileSwitcher from './ProfileSwitcher';
+import type { MailboxInfo } from '../types';
+import {
+  reduceInboxState,
+  resolveInboxViewState,
+  toInboxPath,
+  readPersistedInboxState,
+  type InboxStateEvent,
+} from '../services/inboxStateMachine';
+
+const loadComposeModal = () => import('./ComposeModal');
+const ComposeModal = lazy(loadComposeModal);
+const PAGE_SIZE = 50;
 
 const Sidebar = () => {
   const [searchParams] = useSearchParams();
   const [isComposeOpen, setIsComposeOpen] = useState(false);
-  
-  const activeConnectorId = searchParams.get('connectorId');
-  const activeProfileType = searchParams.get('profile');
-  const activeSendEmail = String(searchParams.get('sendEmail') ?? '').trim().toLowerCase();
-  const isSendOnlyProfile = activeProfileType === 'send-only' && !!activeSendEmail;
+  const queryClient = useQueryClient();
+  const preferredInboxState = readPersistedInboxState();
 
   const { data: connectors } = useQuery({
     queryKey: ['connectors', 'incoming'],
@@ -85,9 +93,30 @@ const Sidebar = () => {
     return profiles;
   }, [identities, incomingEmails, outgoingConnectors]);
 
-  const effectiveConnectorId = isSendOnlyProfile
-    ? null
-    : (activeConnectorId || connectors?.[0]?.id);
+  const resolvedRouteState = useMemo(
+    () => resolveInboxViewState(searchParams, {
+      incomingConnectorIds: (connectors ?? []).map((connector) => connector.id),
+      sendOnlyEmails: sendOnlyProfiles.map((profile) => String(profile.emailAddress ?? '').trim().toLowerCase()).filter(Boolean),
+      preferredState: preferredInboxState,
+    }),
+    [connectors, preferredInboxState, searchParams, sendOnlyProfiles],
+  );
+  const routeState = resolvedRouteState.state;
+  const isSendOnlyProfile = routeState?.profile.kind === 'send-only';
+  const activeSendEmail = routeState?.profile.kind === 'send-only'
+    ? routeState.profile.sendEmail
+    : '';
+  const effectiveConnectorId = routeState?.profile.kind === 'incoming'
+    ? routeState.profile.connectorId
+    : null;
+  const activeFolder = routeState?.folder ?? (isSendOnlyProfile ? 'OUTBOX' : 'INBOX');
+  const dispatchToInbox = useCallback((event: InboxStateEvent) => {
+    if (!routeState) {
+      return '/inbox';
+    }
+    const nextState = reduceInboxState(routeState, event);
+    return toInboxPath(nextState);
+  }, [routeState]);
 
   const { data: mailboxes, isLoading: loadingMailboxes } = useQuery({
     queryKey: ['mailboxes', effectiveConnectorId],
@@ -109,17 +138,14 @@ const Sidebar = () => {
   };
 
   const linkClass = (isActive: boolean) => `
-    flex items-center gap-2 px-2.5 py-1 rounded-md transition-colors text-sm group
+    flex items-center gap-2 px-3 py-1.5 rounded-md transition-all text-sm group
     ${isActive 
-      ? 'bg-black/5 dark:bg-white/5 text-text-primary font-semibold' 
-      : 'text-text-secondary hover:bg-black/5 dark:hover:bg-white/5 hover:text-text-primary font-medium'}
-  `;
-
-  // Sort and filter mailboxes to put Inbox first and avoid duplicates
-  const dynamicFolders = useMemo(() => {
+      ? 'bg-accent/10 text-accent font-bold shadow-xs' 
+      : 'text-text-secondary hover:bg-black/5 dark:hover:bg-white/5 hover:text-text-primary font-semibold'}
+  `;const dynamicFolders = useMemo(() => {
     if (!mailboxes) return [];
     return mailboxes
-      .filter((mb: any) => {
+      .filter((mb) => {
         const name = String(mb?.name ?? '').trim().toLowerCase();
         const path = String(mb?.path ?? '').trim();
         const pathLower = path.toLowerCase();
@@ -130,21 +156,114 @@ const Sidebar = () => {
         if (pathUpper === 'ALL' || pathUpper === 'ARCHIVE' || pathUpper === '[GMAIL]/ALL MAIL') return false;
         return true;
       })
-      .filter((mb: any, index: number, all: any[]) =>
-        all.findIndex((candidate: any) => String(candidate.path).toLowerCase() === String(mb.path).toLowerCase()) === index);
-  }, [mailboxes]);
+      .filter((mb, index, all) =>
+        all.findIndex((candidate) => String(candidate.path).toLowerCase() === String(mb.path).toLowerCase()) === index);
+  }, [mailboxes]) as MailboxInfo[];
+
+  const prefetchFolderMessages = useCallback((folderPath: string) => {
+    const normalizedFolder = String(folderPath || '').trim();
+    if (!normalizedFolder) {
+      return;
+    }
+
+    if (isSendOnlyProfile) {
+      if (!activeSendEmail) {
+        return;
+      }
+      void queryClient.prefetchQuery({
+        queryKey: ['messages', `send-only:${activeSendEmail}`, normalizedFolder, '', 1],
+        queryFn: () => api.messages.listSendOnly({
+          emailAddress: activeSendEmail,
+          folder: normalizedFolder,
+          limit: PAGE_SIZE,
+          offset: 0,
+        }),
+        staleTime: 20_000,
+      });
+      return;
+    }
+
+    if (!effectiveConnectorId) {
+      return;
+    }
+
+    void queryClient.prefetchQuery({
+      queryKey: ['messages', effectiveConnectorId, normalizedFolder, '', 1],
+      queryFn: () => api.messages.list({
+        folder: normalizedFolder,
+        connectorId: effectiveConnectorId,
+        limit: PAGE_SIZE,
+        offset: 0,
+      }),
+      staleTime: 20_000,
+    });
+  }, [activeSendEmail, effectiveConnectorId, isSendOnlyProfile, queryClient]);
+
+  useEffect(() => {
+    const browserWindow = window as Window & {
+      requestIdleCallback?: (callback: IdleRequestCallback, options?: IdleRequestOptions) => number;
+      cancelIdleCallback?: (handle: number) => void;
+    };
+
+    if (isSendOnlyProfile) {
+      const warmSendOnlyFolders = () => {
+        prefetchFolderMessages('OUTBOX');
+        prefetchFolderMessages('SENT');
+      };
+      if (typeof browserWindow.requestIdleCallback === 'function') {
+        const idleHandle = browserWindow.requestIdleCallback(() => {
+          warmSendOnlyFolders();
+        }, { timeout: 1_500 });
+        return () => {
+          if (typeof browserWindow.cancelIdleCallback === 'function') {
+            browserWindow.cancelIdleCallback(idleHandle);
+          }
+        };
+      }
+      const timeoutId = window.setTimeout(warmSendOnlyFolders, 400);
+      return () => window.clearTimeout(timeoutId);
+    }
+
+    if (!dynamicFolders.length) {
+      return;
+    }
+
+    const foldersToWarm = dynamicFolders
+      .slice(0, 4)
+      .map((mailbox) => String(mailbox.path || '').trim())
+      .filter(Boolean);
+    const warmFolders = () => {
+      foldersToWarm.forEach((folderPath) => prefetchFolderMessages(folderPath));
+    };
+
+    if (typeof browserWindow.requestIdleCallback === 'function') {
+      const idleHandle = browserWindow.requestIdleCallback(() => {
+        warmFolders();
+      }, { timeout: 1_500 });
+      return () => {
+        if (typeof browserWindow.cancelIdleCallback === 'function') {
+          browserWindow.cancelIdleCallback(idleHandle);
+        }
+      };
+    }
+
+    const timeoutId = window.setTimeout(warmFolders, 450);
+    return () => window.clearTimeout(timeoutId);
+  }, [dynamicFolders, isSendOnlyProfile, prefetchFolderMessages]);
 
   return (
     <div className="flex-1 flex flex-col min-h-0 bg-sidebar border-r border-border font-sans select-none">
       <ProfileSwitcher incomingConnectors={connectors || []} sendOnlyProfiles={sendOnlyProfiles} />
 
-      <div className="p-3 pt-0">
+      <div className="p-3 pt-0 hidden md:block">
         <button 
           onClick={() => setIsComposeOpen(true)}
+          onMouseEnter={() => { void loadComposeModal(); }}
+          onFocus={() => { void loadComposeModal(); }}
           disabled={!(identities?.length)}
-          className="w-full flex items-center justify-center gap-2 bg-bg-card border border-border py-1.5 rounded-md text-sm font-semibold text-text-primary hover:bg-black/5 dark:hover:bg-white/5 transition-all disabled:opacity-50 disabled:cursor-not-allowed active:scale-[0.98]"
+          className="w-full btn-secondary py-2 font-bold"
         >
-          <PenBox className="w-3.5 h-3.5 text-accent" />
+          <PenBox className="w-4 h-4 text-accent" />
           Compose
         </button>
       </div>
@@ -154,14 +273,17 @@ const Sidebar = () => {
           <div className="animate-in fade-in duration-300">
             {[{ name: 'Outbox', path: 'OUTBOX', icon: Clock }, { name: 'Sent', path: 'SENT', icon: Send }].map((mb) => {
               const Icon = mb.icon;
-              const currentFolder = String(searchParams.get('folder') ?? '').toUpperCase();
+              const currentFolder = String(activeFolder ?? '').toUpperCase();
               const isActive = currentFolder
                 ? currentFolder === mb.path
                 : mb.path === 'OUTBOX';
+              const to = dispatchToInbox({ type: 'select-folder', folder: mb.path });
               return (
                 <NavLink
                   key={mb.path}
-                  to={`/inbox?profile=send-only&sendEmail=${encodeURIComponent(activeSendEmail)}&folder=${mb.path}`}
+                  to={to}
+                  onMouseEnter={() => prefetchFolderMessages(mb.path)}
+                  onFocus={() => prefetchFolderMessages(mb.path)}
                   className={linkClass(isActive)}
                 >
                   <Icon className="w-4 h-4 opacity-60" />
@@ -179,14 +301,17 @@ const Sidebar = () => {
               </div>
             ) : dynamicFolders.length === 0 ? (
               <div className="px-6 py-2 text-xs text-text-secondary italic">No folders</div>
-            ) : dynamicFolders.map((mb: any) => {
+            ) : dynamicFolders.map((mb) => {
                 const Icon = getFolderIcon(mb.name);
-                const isActive = searchParams.get('folder') === mb.path
-                  || (!searchParams.get('folder') && String(mb.path).toUpperCase() === 'INBOX');
+                const isActive = activeFolder === mb.path
+                  || (!activeFolder && String(mb.path).toUpperCase() === 'INBOX');
+                const to = dispatchToInbox({ type: 'select-folder', folder: mb.path });
                 return (
                   <NavLink
                     key={mb.path}
-                    to={`/inbox?connectorId=${effectiveConnectorId}&folder=${encodeURIComponent(mb.path)}`}
+                    to={to}
+                    onMouseEnter={() => prefetchFolderMessages(mb.path)}
+                    onFocus={() => prefetchFolderMessages(mb.path)}
                     className={linkClass(isActive)}
                   >
                     <Icon className="w-4 h-4 opacity-60" />
@@ -199,7 +324,9 @@ const Sidebar = () => {
       </nav>
 
       {isComposeOpen && (
-        <ComposeModal onClose={() => setIsComposeOpen(false)} />
+        <Suspense fallback={null}>
+          <ComposeModal onClose={() => setIsComposeOpen(false)} />
+        </Suspense>
       )}
     </div>
   );

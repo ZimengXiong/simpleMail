@@ -11,22 +11,14 @@ const GOOGLE_SCOPES = [
   'https://www.googleapis.com/auth/userinfo.email',
 ];
 const INVALID_GRANT_REGEX = /invalid[_\s-]grant|unauthorized|disabled|permission.?denied|rejected/i;
+const MAX_OAUTH_STATE_CHARS = 200;
 
 export interface OAuthState {
   type: 'incoming' | 'outgoing';
-  connectorId: string;
+  connectorId?: string;
+  connectorPayload?: Record<string, any>;
   userId?: string;
 }
-
-const stateStore = new Map<string, { expiresAt: number; payload: OAuthState }>();
-
-const pruneExpiredStateStore = (nowMs = Date.now()) => {
-  for (const [key, value] of stateStore.entries()) {
-    if (value.expiresAt <= nowMs) {
-      stateStore.delete(key);
-    }
-  }
-};
 
 const getGoogleClient = (clientId?: string, clientSecret?: string): OAuth2Client => {
   return new OAuth2Client({
@@ -38,8 +30,9 @@ const getGoogleClient = (clientId?: string, clientSecret?: string): OAuth2Client
 
 export const createOAuthState = async (
   type: 'incoming' | 'outgoing',
-  connectorId: string,
+  connectorId?: string,
   userId?: string,
+  connectorPayload?: Record<string, any>,
 ) => {
   if (!userId) {
     throw new Error('userId is required for OAuth state');
@@ -47,55 +40,46 @@ export const createOAuthState = async (
 
   const state = randomUUID();
   const expiresAt = Date.now() + 10 * 60 * 1000;
-  pruneExpiredStateStore();
-  stateStore.set(state, {
-    expiresAt,
-    payload: { type, connectorId, userId },
-  });
   await query(
-    'INSERT INTO oauth_states (state, connector_id, connector_type, user_id, expires_at) VALUES ($1, $2, $3, $4, to_timestamp($5 / 1000.0))',
-    [state, connectorId, type, userId ?? null, expiresAt],
+    `INSERT INTO oauth_states (state, connector_id, connector_type, user_id, connector_payload, expires_at)
+     VALUES ($1, $2, $3, $4, $5::jsonb, to_timestamp($6 / 1000.0))`,
+    [state, connectorId ?? null, type, userId ?? null, JSON.stringify(connectorPayload ?? null), expiresAt],
   );
   return state;
 };
 
 export const consumeOAuthState = async (state: string): Promise<OAuthState | null> => {
-  pruneExpiredStateStore();
+  const normalizedState = String(state ?? '').trim();
+  if (!normalizedState || normalizedState.length > MAX_OAUTH_STATE_CHARS) {
+    return null;
+  }
 
   try {
     const consumed = await query<{
-      connector_id: string;
+      connector_id: string | null;
       connector_type: 'incoming' | 'outgoing';
       user_id: string | null;
+      connector_payload: Record<string, any> | null;
     }>(
       `DELETE FROM oauth_states
         WHERE state = $1
           AND expires_at > NOW()
-      RETURNING connector_id, connector_type, user_id`,
-      [state],
+      RETURNING connector_id, connector_type, user_id, connector_payload`,
+      [normalizedState],
     );
     if (consumed.rows.length > 0) {
-      stateStore.delete(state);
       const row = consumed.rows[0];
       return {
         type: row.connector_type,
-        connectorId: row.connector_id,
+        connectorId: row.connector_id ?? undefined,
+        connectorPayload: row.connector_payload ?? undefined,
         userId: row.user_id ?? undefined,
       };
     }
   } catch {
-    // If DB access fails, fall back to in-memory state to avoid blocking OAuth callbacks.
-  }
-
-  const cached = stateStore.get(state);
-  if (cached) {
-    if (cached.expiresAt < Date.now()) {
-      stateStore.delete(state);
-      return null;
-    }
-    stateStore.delete(state);
-    await query('DELETE FROM oauth_states WHERE state = $1', [state]).catch(() => undefined);
-    return cached.payload;
+    // Fail closed if state cannot be atomically consumed from persistent storage.
+    // This avoids replay if DB deletes temporarily fail.
+    return null;
   }
   return null;
 };
@@ -140,12 +124,13 @@ const isExpired = (value?: string | null): boolean => {
 
 export const getGoogleAuthorizeUrl = async (
   type: 'incoming' | 'outgoing',
-  connectorId: string,
+  connectorId?: string,
   clientId?: string,
   clientSecret?: string,
   userId?: string,
+  connectorPayload?: Record<string, any>,
 ) => {
-  const state = await createOAuthState(type, connectorId, userId);
+  const state = await createOAuthState(type, connectorId, userId, connectorPayload);
   const client = getGoogleClient(clientId, clientSecret);
   const authorizeUrl = client.generateAuthUrl({
     scope: GOOGLE_SCOPES,

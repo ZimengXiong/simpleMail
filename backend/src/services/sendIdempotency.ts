@@ -5,6 +5,7 @@ export type SendIdempotencyStatus = 'pending' | 'processing' | 'succeeded' | 'fa
 
 const STALE_PROCESSING_INTERVAL_SECONDS = 30;
 const SEND_IDEMPOTENCY_TTL_HOURS = 24;
+const MAX_IDEMPOTENCY_KEY_CHARS = 255;
 
 export interface SendIdempotencyPayload {
   userId: string;
@@ -51,8 +52,16 @@ export interface SendClaimResult extends SendIdempotencyRecord {
 
 const normalizeKey = (value?: string | null) => (value ? String(value).trim() : '');
 
-export const normalizeSendIdempotencyKey = (value?: string) =>
-  normalizeKey(value) || randomUUID();
+export const normalizeSendIdempotencyKey = (value?: string) => {
+  const normalized = normalizeKey(value);
+  if (!normalized) {
+    return randomUUID();
+  }
+  if (normalized.length > MAX_IDEMPOTENCY_KEY_CHARS) {
+    throw new Error(`idempotency key exceeds ${MAX_IDEMPOTENCY_KEY_CHARS} characters`);
+  }
+  return normalized;
+};
 
 const hashString = (value: string): string =>
   createHash('sha256').update(value).digest('hex');

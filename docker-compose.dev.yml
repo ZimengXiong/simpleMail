@@ -1,13 +1,11 @@
-version: "3.9"
-
 services:
   postgres:
     image: postgres:16
-    container_name: bettermail-postgres-dev
+    container_name: simplemail-postgres-dev
     environment:
-      POSTGRES_DB: bettermail
-      POSTGRES_USER: bettermail
-      POSTGRES_PASSWORD: bettermail
+      POSTGRES_DB: simplemail
+      POSTGRES_USER: simplemail
+      POSTGRES_PASSWORD: simplemail
     ports:
       - "5432:5432"
     volumes:
@@ -16,7 +14,7 @@ services:
 
   seaweed-master:
     image: chrislusf/seaweedfs
-    container_name: bettermail-seaweed-master-dev
+    container_name: simplemail-seaweed-master-dev
     command: master -ip=seaweed-master -port=9333 -mdir=/data
     volumes:
       - seaweed_master_data_dev:/data
@@ -24,7 +22,7 @@ services:
 
   seaweed-volume:
     image: chrislusf/seaweedfs
-    container_name: bettermail-seaweed-volume-dev
+    container_name: simplemail-seaweed-volume-dev
     command: volume -mserver=seaweed-master:9333 -port=8080 -dir=/data
     volumes:
       - seaweed_volume_data_dev:/data
@@ -34,7 +32,7 @@ services:
 
   seaweed-filer:
     image: chrislusf/seaweedfs
-    container_name: bettermail-seaweed-filer-dev
+    container_name: simplemail-seaweed-filer-dev
     command: filer -master=seaweed-master:9333 -s3 -s3.port=8333 -s3.config=/etc/seaweedfs/s3.json
     volumes:
       - ./deploy/seaweedfs:/etc/seaweedfs:ro
@@ -47,8 +45,26 @@ services:
       - "8888:8888"
     restart: unless-stopped
 
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.1
+    container_name: simplemail-keycloak-dev
+    command:
+      - start-dev
+      - --http-port=8080
+      - --import-realm
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./deploy/keycloak:/opt/keycloak/data/import:ro
+      - keycloak_data_dev:/opt/keycloak/data
+    restart: unless-stopped
+
 volumes:
   postgres_data_dev:
   seaweed_master_data_dev:
   seaweed_volume_data_dev:
   seaweed_filer_data_dev:
+  keycloak_data_dev:

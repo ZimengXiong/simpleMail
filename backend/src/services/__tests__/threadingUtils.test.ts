@@ -1,7 +1,3 @@
-/**
- * Unit tests for threading utility functions.
- * Run with: npx tsx src/services/__tests__/threadingUtils.test.ts
- */
 import assert from 'node:assert/strict';
 import {
   normalizeSubject,
@@ -28,7 +24,6 @@ const test = (name: string, fn: () => void) => {
   }
 };
 
-// ── normalizeSubject ──────────────────────────────────────────────────
 
 test('strips single Re: prefix', () => {
   assert.equal(normalizeSubject('Re: Meeting'), 'meeting');
@@ -67,7 +62,6 @@ test('handles Re: with spaces before colon', () => {
   assert.equal(normalizeSubject('Re : Re : test'), 'test');
 });
 
-// ── subjectGenericKey ─────────────────────────────────────────────────
 
 test('strips punctuation and normalizes', () => {
   assert.equal(subjectGenericKey('Hello!'), 'hello');
@@ -77,7 +71,6 @@ test('collapses whitespace in generic key', () => {
   assert.equal(subjectGenericKey('  hi  there  '), 'hi there');
 });
 
-// ── extractEmails ─────────────────────────────────────────────────────
 
 test('extracts single email', () => {
   assert.deepEqual(extractEmails('alice@example.com'), ['alice@example.com']);
@@ -102,7 +95,6 @@ test('handles null/undefined', () => {
   assert.deepEqual(extractEmails(''), []);
 });
 
-// ── intersects ────────────────────────────────────────────────────────
 
 test('detects intersection', () => {
   assert.equal(intersects(['a', 'b'], ['b', 'c']), true);
@@ -117,7 +109,6 @@ test('empty arrays', () => {
   assert.equal(intersects(['a'], []), false);
 });
 
-// ── normalizeMessageId ────────────────────────────────────────────────
 
 test('strips angle brackets and lowercases', () => {
   assert.equal(normalizeMessageId('<ABC@example.com>'), 'abc@example.com');
@@ -137,7 +128,6 @@ test('returns null for empty/null', () => {
   assert.equal(normalizeMessageId('   '), null);
 });
 
-// ── messageIdVariants ─────────────────────────────────────────────────
 
 test('returns both bare and angle-bracketed forms', () => {
   assert.deepEqual(messageIdVariants('<ABC@example.com>'), [
@@ -151,7 +141,6 @@ test('returns empty for null', () => {
   assert.deepEqual(messageIdVariants(''), []);
 });
 
-// ── isSubjectTooGeneric ───────────────────────────────────────────────
 
 test('detects generic subjects', () => {
   assert.equal(isSubjectTooGeneric('hi', false, false), true);
@@ -180,7 +169,6 @@ test('empty subject is generic', () => {
   assert.equal(isSubjectTooGeneric('', false, false), true);
 });
 
-// ── GENERIC_SUBJECTS contains expected entries ────────────────────────
 
 test('contains common generic subjects', () => {
   assert.equal(GENERIC_SUBJECTS.has('hi'), true);
@@ -194,7 +182,6 @@ test('does not contain non-generic subjects', () => {
   assert.equal(GENERIC_SUBJECTS.has('quarterly review'), false);
 });
 
-// ── Report ────────────────────────────────────────────────────────────
 
 console.log(`\n${passed + failed} tests: ${passed} passed, ${failed} failed`);
 if (failed > 0) {

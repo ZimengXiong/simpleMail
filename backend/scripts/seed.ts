@@ -37,7 +37,7 @@ async function main() {
     'Primary',
     'user@gmail.com',
     outgoing.id,
-    'Sent from BetterMail',
+    'Sent from simpleMail',
     incoming.id,
     'reply@example.com',
   );

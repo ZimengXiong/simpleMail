@@ -1,16 +1,28 @@
 import Fastify from 'fastify';
+import { timingSafeEqual } from 'node:crypto';
 import { env } from './src/config/env.js';
 import { registerRoutes } from './src/routes/index.js';
 import type { FastifyError, FastifyReply, FastifyRequest } from 'fastify';
 import type { ResolvedUser } from './src/services/user.js';
-import { createUser, getUserByToken } from './src/services/user.js';
+import { upsertUserFromOidc } from './src/services/user.js';
 import { resumeConfiguredIdleWatches } from './src/services/imap.js';
+import { verifyOidcAccessToken } from './src/services/oidc.js';
 
 type AuthenticatedRequest = FastifyRequest & { user: ResolvedUser | null };
 
 const server = Fastify({
   logger: env.nodeEnv === 'development',
+  disableRequestLogging: true,
 });
+
+const secureTokenEquals = (left: string, right: string) => {
+  const leftBuffer = Buffer.from(left);
+  const rightBuffer = Buffer.from(right);
+  if (leftBuffer.length !== rightBuffer.length) {
+    return false;
+  }
+  return timingSafeEqual(leftBuffer, rightBuffer);
+};
 
 const normalizeRoutePath = (value: string) => {
   const trimmed = String(value || '').trim();
@@ -47,13 +59,42 @@ const isSecureExternalUrl = (value: string) => {
   }
 };
 
+const isSafeAbsolutePath = (value: string) => {
+  const trimmed = String(value || '').trim();
+  if (!trimmed || !trimmed.startsWith('/') || trimmed.startsWith('//')) {
+    return false;
+  }
+  if (trimmed.includes('://') || trimmed.includes('\\')) {
+    return false;
+  }
+  try {
+    const parsed = new URL(trimmed, 'http://localhost');
+    return parsed.pathname === trimmed && !parsed.search && !parsed.hash;
+  } catch {
+    return false;
+  }
+};
+
 if (env.nodeEnv === 'production' && !env.apiAdminToken) {
   throw new Error('API_ADMIN_TOKEN is required in production');
 }
 
+if (env.apiAdminToken && env.apiAdminToken.length < 24) {
+  throw new Error('API_ADMIN_TOKEN must be at least 24 characters');
+}
+
+if (env.nodeEnv === 'production' && env.allowAdminUserBootstrap) {
+  throw new Error('ALLOW_ADMIN_USER_BOOTSTRAP must be false in production');
+}
+
 const rawWebhookPath = String(env.gmailPush.webhookPath || '').trim();
-if (!rawWebhookPath.startsWith('/') || rawWebhookPath.includes('://')) {
+if (!isSafeAbsolutePath(rawWebhookPath)) {
   throw new Error('GMAIL_PUSH_WEBHOOK_PATH must be an absolute path');
+}
+
+const rawOauthCallbackPath = String(env.oauthCallbackPath || '').trim();
+if (!isSafeAbsolutePath(rawOauthCallbackPath)) {
+  throw new Error('OAUTH_CALLBACK_PATH must be an absolute path');
 }
 
 if (env.nodeEnv === 'production') {
@@ -66,6 +107,16 @@ if (env.nodeEnv === 'production') {
   if (!isSecureExternalUrl(env.googleRedirectUri)) {
     throw new Error('GOOGLE_REDIRECT_URI must use HTTPS in production');
   }
+  if (!isSecureExternalUrl(env.oidc.issuerUrl)) {
+    throw new Error('OIDC_ISSUER_URL must use HTTPS in production');
+  }
+  if (env.oidc.jwksUri && !isSecureExternalUrl(env.oidc.jwksUri)) {
+    throw new Error('OIDC_JWKS_URI must use HTTPS in production');
+  }
+}
+
+if (!env.oidc.requiredEmail) {
+  throw new Error('OIDC_REQUIRED_EMAIL must be set for single-user authentication');
 }
 
 if (env.gmailPush.enabled && !env.gmailPush.pushServiceAccountEmail) {
@@ -83,7 +134,8 @@ const isPublicRoute = (path: string) => {
 };
 
 const isAdminRoute = (path: string) =>
-  path === '/api/admin/users' || path.startsWith('/api/admin/users/');
+  env.allowAdminUserBootstrap
+  && (path === '/api/admin/users' || path.startsWith('/api/admin/users/'));
 
 type RouteRateLimitRule = {
   id: string;
@@ -93,6 +145,24 @@ type RouteRateLimitRule = {
 };
 
 const routeRateLimitRules: RouteRateLimitRule[] = [
+  {
+    id: 'health',
+    windowMs: 60_000,
+    max: 120,
+    match: (path) => path === '/api/health',
+  },
+  {
+    id: 'oauth-callback',
+    windowMs: 60_000,
+    max: 120,
+    match: (path) => path === '/api/oauth/google/callback',
+  },
+  {
+    id: 'gmail-push-webhook',
+    windowMs: 60_000,
+    max: 600,
+    match: (path) => path === gmailWebhookPath,
+  },
   {
     id: 'admin',
     windowMs: 60_000,
@@ -106,14 +176,88 @@ const routeRateLimitRules: RouteRateLimitRule[] = [
     match: (path) => /^\/api\/connectors\/outgoing\/[^/]+\/test$/.test(path),
   },
   {
+    id: 'connector-mailboxes',
+    windowMs: 60_000,
+    max: 40,
+    match: (path) => /^\/api\/connectors\/[^/]+\/mailboxes$/.test(path),
+  },
+  {
     id: 'oauth-authorize',
     windowMs: 60_000,
     max: 60,
     match: (path) => path === '/api/oauth/google/authorize',
   },
+  {
+    id: 'messages-send',
+    windowMs: 60_000,
+    max: 45,
+    match: (path) => path === '/api/messages/send',
+  },
+  {
+    id: 'attachments',
+    windowMs: 60_000,
+    max: 180,
+    match: (path) =>
+      /^\/api\/attachments\/[^/]+\/(?:download|view)$/.test(path)
+      || /^\/api\/messages\/[^/]+\/raw$/.test(path),
+  },
+  {
+    id: 'attachments-scan',
+    windowMs: 60_000,
+    max: 60,
+    match: (path) => path === '/api/attachments/scan',
+  },
+  {
+    id: 'sync-watch',
+    windowMs: 60_000,
+    max: 90,
+    match: (path) => /^\/api\/sync\/[^/]+\/watch(?:\/stop)?$/.test(path),
+  },
+  {
+    id: 'events-stream',
+    windowMs: 60_000,
+    max: 30,
+    match: (path) => path === '/api/events/stream',
+  },
 ];
 
 const routeRateLimitCounters = new Map<string, { resetAtMs: number; count: number }>();
+const ROUTE_RATE_LIMIT_SWEEP_INTERVAL_MS = 60_000;
+const ROUTE_RATE_LIMIT_MAX_COUNTERS = 20_000;
+let lastRateLimitSweepAtMs = 0;
+
+const sweepRouteRateLimitCounters = (nowMs: number) => {
+  if (
+    routeRateLimitCounters.size === 0
+    || (
+      routeRateLimitCounters.size < ROUTE_RATE_LIMIT_MAX_COUNTERS
+      && nowMs - lastRateLimitSweepAtMs < ROUTE_RATE_LIMIT_SWEEP_INTERVAL_MS
+    )
+  ) {
+    return;
+  }
+
+  lastRateLimitSweepAtMs = nowMs;
+  for (const [key, entry] of routeRateLimitCounters.entries()) {
+    if (entry.resetAtMs <= nowMs) {
+      routeRateLimitCounters.delete(key);
+    }
+  }
+
+  if (routeRateLimitCounters.size <= ROUTE_RATE_LIMIT_MAX_COUNTERS) {
+    return;
+  }
+
+  const overflow = routeRateLimitCounters.size - ROUTE_RATE_LIMIT_MAX_COUNTERS;
+  let removed = 0;
+  for (const key of routeRateLimitCounters.keys()) {
+    routeRateLimitCounters.delete(key);
+    removed += 1;
+    if (removed >= overflow) {
+      break;
+    }
+  }
+};
 
 const checkRateLimit = (ip: string, path: string) => {
   const matchedRule = routeRateLimitRules.find((rule) => rule.match(path));
@@ -121,10 +265,18 @@ const checkRateLimit = (ip: string, path: string) => {
     return null;
   }
 
-  const key = `${matchedRule.id}:${ip}`;
   const nowMs = Date.now();
+  sweepRouteRateLimitCounters(nowMs);
+
+  const key = `${matchedRule.id}:${ip}`;
   const existing = routeRateLimitCounters.get(key);
   if (!existing || existing.resetAtMs <= nowMs) {
+    if (!existing && routeRateLimitCounters.size >= ROUTE_RATE_LIMIT_MAX_COUNTERS) {
+      const oldestKey = routeRateLimitCounters.keys().next().value;
+      if (oldestKey) {
+        routeRateLimitCounters.delete(oldestKey);
+      }
+    }
     routeRateLimitCounters.set(key, {
       resetAtMs: nowMs + matchedRule.windowMs,
       count: 1,
@@ -139,83 +291,54 @@ const checkRateLimit = (ip: string, path: string) => {
   return null;
 };
 
-const extractUserToken = (request: FastifyRequest) => {
+const MAX_ACCESS_TOKEN_CHARS = 16_384;
+
+const normalizeTokenCandidate = (value: unknown): string | undefined => {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+  const normalized = value.trim();
+  if (!normalized || normalized.length > MAX_ACCESS_TOKEN_CHARS) {
+    return undefined;
+  }
+  return normalized;
+};
+
+const extractAccessToken = (request: FastifyRequest) => {
   const authHeader = request.headers.authorization;
   if (typeof authHeader === 'string' && authHeader.toLowerCase().startsWith('bearer ')) {
-    return authHeader.slice(7).trim();
-  }
-
-  const userToken = request.headers['x-user-token'];
-  const headerToken = Array.isArray(userToken) ? userToken[0] : userToken;
-  if (headerToken) {
-    return headerToken;
+    const token = normalizeTokenCandidate(authHeader.slice(7));
+    if (token) {
+      return token;
+    }
   }
 
   return undefined;
 };
 
-const bootstrapDevUser = async () => {
-  if (env.nodeEnv !== 'development' || !env.bootstrapDevUser) {
-    return;
-  }
-
-  if (!env.devUserToken) {
-    return;
-  }
-
-  const user = await createUser({
-    email: env.devUserEmail,
-    name: env.devUserName,
-    token: env.devUserToken,
-  });
-
-  if (user?.token) {
-    console.log(`Bootstrapped dev user ${user.email} with prefix ${user.tokenPrefix}`);
-  }
-};
-
-const ensureBootstrapDevUser = async (userToken: string) => {
-  if (env.nodeEnv !== 'development' || !env.bootstrapDevUser || !env.devUserToken) {
-    return null;
-  }
-
-  if (userToken !== env.devUserToken) {
-    return null;
-  }
-
-  const user = await createUser({
-    email: env.devUserEmail,
-    name: env.devUserName,
-    token: env.devUserToken,
-  });
-
-  if (user?.token) {
-    console.log(`Recreated missing dev user ${user.email} with prefix ${user.tokenPrefix}`);
-  }
-
-  return {
-    id: user.id,
-    email: user.email,
-    name: user.name,
-    tokenPrefix: user.tokenPrefix,
-  };
-};
-
 server.addHook('onRequest', async (request, reply) => {
   const requestPath = getRequestPathname(request.url);
-  if (isPublicRoute(requestPath)) {
-    return;
-  }
-
   const retryAfter = checkRateLimit(request.ip, requestPath);
   if (retryAfter !== null) {
     reply.header('Retry-After', String(retryAfter));
     return reply.code(429).send({ error: 'too many requests' });
   }
 
+  if (isPublicRoute(requestPath)) {
+    return;
+  }
+
+  if (!env.allowAdminUserBootstrap && requestPath.startsWith('/api/admin/')) {
+    return reply.code(404).send({ error: 'not found' });
+  }
+
   const headerValue = request.headers['x-api-key'];
-  const headerToken = Array.isArray(headerValue) ? headerValue[0] : headerValue;
-  const hasAdminToken = Boolean(env.apiAdminToken && headerToken === env.apiAdminToken);
+  const headerToken = normalizeTokenCandidate(Array.isArray(headerValue) ? headerValue[0] : headerValue);
+  const hasAdminToken = Boolean(
+    env.apiAdminToken
+    && headerToken
+    && secureTokenEquals(headerToken, env.apiAdminToken),
+  );
   const isAdminRequest = isAdminRoute(requestPath);
 
   if (isAdminRequest) {
@@ -229,20 +352,43 @@ server.addHook('onRequest', async (request, reply) => {
     return reply.code(401).send({ error: 'admin token missing' });
   }
 
-  const userToken = extractUserToken(request);
-  if (!userToken) {
-    return reply.code(401).send({ error: 'missing user token' });
+  const accessToken = extractAccessToken(request);
+  if (!accessToken) {
+    return reply.code(401).send({ error: 'missing access token' });
   }
 
-  const user = (await getUserByToken(userToken)) ?? (await ensureBootstrapDevUser(userToken));
-  if (!user) {
-    return reply.code(401).send({ error: 'invalid user token' });
+  let identity: Awaited<ReturnType<typeof verifyOidcAccessToken>>;
+  try {
+    identity = await verifyOidcAccessToken(accessToken);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : 'unknown verification error';
+    request.log.warn({ path: requestPath, reason }, 'OIDC token verification failed');
+    const message = env.nodeEnv === 'development'
+      ? `invalid access token: ${reason}`
+      : 'invalid access token';
+    return reply.code(401).send({ error: message });
   }
 
+  if (identity.email !== env.oidc.requiredEmail) {
+    return reply.code(403).send({ error: 'authenticated user is not allowed' });
+  }
+
+  if (env.oidc.requiredSubject && identity.subject !== env.oidc.requiredSubject) {
+    return reply.code(403).send({ error: 'authenticated subject is not allowed' });
+  }
+
+  const user = await upsertUserFromOidc({
+    email: identity.email,
+    name: identity.name,
+    subject: identity.subject,
+  });
   (request as AuthenticatedRequest).user = user;
 });
 
 server.addHook('onSend', async (_request, reply, payload) => {
+  if (!reply.hasHeader('Cache-Control')) {
+    reply.header('Cache-Control', 'no-store');
+  }
   reply.header('Referrer-Policy', 'no-referrer');
   reply.header('X-Content-Type-Options', 'nosniff');
   reply.header('X-Frame-Options', 'DENY');
@@ -275,7 +421,6 @@ server.setErrorHandler((error, request: FastifyRequest, reply: FastifyReply) => 
 });
 
 await registerRoutes(server);
-await bootstrapDevUser();
 void resumeConfiguredIdleWatches().catch((error) => {
   server.log.warn({ error }, 'failed to resume idle watchers');
 });
@@ -288,4 +433,4 @@ process.on('SIGINT', stop);
 process.on('SIGTERM', stop);
 
 await server.listen({ port: env.port, host: '0.0.0.0' });
-console.log(`BetterMail API listening on ${env.port}`);
+console.log(`simpleMail API listening on ${env.port}`);

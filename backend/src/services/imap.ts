@@ -35,6 +35,52 @@ const isGmailImapConnector = (connector: any): boolean => {
   );
 };
 
+const MAX_MAILBOX_PATH_CHARS = 512;
+const MAX_WATCH_MAILBOXES = 32;
+const MAX_WATCH_MAILBOX_SANITIZE_SCAN_ITEMS = MAX_WATCH_MAILBOXES * 8;
+const MAILBOX_CONTROL_CHAR_PATTERN = /[\u0000-\u001F\u007F]/;
+
+const normalizeWatchMailboxInput = (value: unknown): string => {
+  const normalized = String(value ?? '').trim();
+  if (!normalized) {
+    throw new Error('mailbox is required');
+  }
+  if (normalized.length > MAX_MAILBOX_PATH_CHARS) {
+    throw new Error(`mailbox exceeds ${MAX_MAILBOX_PATH_CHARS} characters`);
+  }
+  if (MAILBOX_CONTROL_CHAR_PATTERN.test(normalized)) {
+    throw new Error('mailbox contains invalid control characters');
+  }
+  return normalized;
+};
+
+const sanitizeConfiguredWatchMailboxes = (
+  value: unknown,
+  isGmailLike: boolean,
+): string[] => {
+  const entries = Array.isArray(value) ? value : [];
+  const normalized: string[] = [];
+  const dedupe = new Set<string>();
+  const scanLimit = Math.min(entries.length, MAX_WATCH_MAILBOX_SANITIZE_SCAN_ITEMS);
+  for (let index = 0; index < scanLimit && normalized.length < MAX_WATCH_MAILBOXES; index += 1) {
+    let mailbox: string;
+    try {
+      mailbox = normalizeWatchMailboxInput(entries[index]);
+    } catch {
+      continue;
+    }
+    const canonicalMailbox = isGmailLike
+      ? normalizeGmailMailboxPath(mailbox)
+      : mailbox;
+    if (dedupe.has(canonicalMailbox)) {
+      continue;
+    }
+    dedupe.add(canonicalMailbox);
+    normalized.push(canonicalMailbox);
+  }
+  return normalized;
+};
+
 type SyncMailboxStatus = 'idle' | 'queued' | 'syncing' | 'cancel_requested' | 'cancelled' | 'completed' | 'error';
 
 type SyncProgressSnapshot = {
@@ -247,6 +293,9 @@ const getIncomingConnectorByIdForUser = async (userId: string, connectorId: stri
   return connectorResult.rows[0];
 };
 
+const isIncomingConnectorActive = (connector: any) =>
+  String(connector?.status ?? '').trim().toLowerCase() === 'active';
+
 const getConnectorByMessageId = async (userId: string, messageId: string) => {
   const result = await query<{ incoming_connector_id: string }>(
     `SELECT m.incoming_connector_id
@@ -290,7 +339,11 @@ const setFlagInList = (flags: string[], flag: string, enabled: boolean) => {
   return Array.from(next).sort();
 };
 
-const getThreadMessageRowsForUser = async (userId: string, threadId: string) => {
+const getThreadMessageRowsForUser = async (
+  userId: string,
+  threadId: string,
+  connectorId: string,
+) => {
   const result = await query<{
     id: string;
     incoming_connector_id: string;
@@ -302,20 +355,25 @@ const getThreadMessageRowsForUser = async (userId: string, threadId: string) => 
       INNER JOIN incoming_connectors ic ON ic.id = m.incoming_connector_id
      WHERE m.thread_id = $1
        AND ic.user_id = $2
+       AND m.incoming_connector_id = $3
      ORDER BY m.received_at DESC
-  `, [threadId, userId]);
+  `, [threadId, userId, connectorId]);
   return result.rows;
 };
 
-const getThreadIdForMessage = async (userId: string, messageId: string) => {
-  const result = await query<{ thread_id: string }>(
-    `SELECT m.thread_id
+const getThreadContextForMessage = async (userId: string, messageId: string) => {
+  const result = await query<{
+    thread_id: string | null;
+    incoming_connector_id: string;
+  }>(
+    `SELECT m.thread_id,
+            m.incoming_connector_id
        FROM messages m
        INNER JOIN incoming_connectors ic ON ic.id = m.incoming_connector_id
       WHERE m.id = $1 AND ic.user_id = $2`,
     [messageId, userId],
   );
-  return result.rows[0]?.thread_id ?? null;
+  return result.rows[0] ?? null;
 };
 
 type IdleWatch = {
@@ -334,6 +392,8 @@ type IdleWatch = {
 };
 
 const activeIdleWatchers = new Map<string, IdleWatch>();
+const scheduledMailboxSyncRetries = new Map<string, NodeJS.Timeout>();
+const MAILBOX_SYNC_RETRY_DELAY_MS = 5_000;
 const IMAP_TIMEOUT_SENTINEL = 'IMAP_OPERATION_TIMEOUT';
 const SYNC_CANCELLED_SENTINEL = 'SYNC_CANCELLED';
 const SYNC_ALREADY_RUNNING_SENTINEL = 'SYNC_ALREADY_RUNNING';
@@ -2401,7 +2461,7 @@ export const hydrateGmailMailboxContentBatch = async (
   batchSize = env.sync.gmailBackgroundHydrateBatchSize,
 ) => {
   const connector = await getIncomingConnectorByIdForUser(userId, connectorId);
-  if (!connector || connector.provider !== 'gmail') {
+  if (!connector || connector.provider !== 'gmail' || !isIncomingConnectorActive(connector)) {
     return { processed: 0, failed: 0, remaining: 0 };
   }
 
@@ -3108,6 +3168,7 @@ const syncMailbox = async (connector: any, mailbox: string, options: GetImapClie
       syncError: String(error),
       syncProgress: null,
     });
+    scheduleMailboxSyncRetry(String(connector.user_id ?? ''), String(connector.id), mailbox, error);
     throw error;
   }
 };
@@ -3121,6 +3182,9 @@ export const syncIncomingConnector = async (
   const connector = await getIncomingConnectorByIdForUser(userId, connectorId);
   if (!connector) {
     throw new Error(`Incoming connector ${connectorId} not found`);
+  }
+  if (!isIncomingConnectorActive(connector)) {
+    throw new Error(`Incoming connector ${connectorId} is not active`);
   }
   if (connector.provider === 'gmail' && connector.sync_settings?.gmailApiBootstrapped !== true) {
     // Only wipe existing data if the account is genuinely empty.
@@ -3225,6 +3289,41 @@ export const requestSyncCancellation = async (
 
 const createWatcherKey = (connectorId: string, mailbox: string) => `${connectorId}:${mailbox}`;
 
+const shouldScheduleMailboxRetry = (error: unknown) => {
+  const message = String(error ?? '').toLowerCase();
+  if (!message) {
+    return false;
+  }
+  if (message.includes(SYNC_CANCELLED_SENTINEL.toLowerCase())) {
+    return false;
+  }
+  if (message.includes(SYNC_ALREADY_RUNNING_SENTINEL.toLowerCase())) {
+    return false;
+  }
+  if (message.includes('incoming connector') && (message.includes('not found') || message.includes('not active'))) {
+    return false;
+  }
+  return true;
+};
+
+const scheduleMailboxSyncRetry = (userId: string, connectorId: string, mailbox: string, error: unknown) => {
+  const normalizedUserId = String(userId ?? '').trim();
+  if (!normalizedUserId || !shouldScheduleMailboxRetry(error)) {
+    return;
+  }
+
+  const key = createWatcherKey(connectorId, mailbox);
+  if (scheduledMailboxSyncRetries.has(key)) {
+    return;
+  }
+
+  const timer = setTimeout(() => {
+    scheduledMailboxSyncRetries.delete(key);
+    void syncIncomingConnector(normalizedUserId, connectorId, mailbox).catch(() => undefined);
+  }, MAILBOX_SYNC_RETRY_DELAY_MS);
+  scheduledMailboxSyncRetries.set(key, timer);
+};
+
 const getConnectorAuthToken = (connectorAuth: any) => connectorAuth?.accessToken ?? connectorAuth?.password;
 
 export const startIncomingConnectorIdleWatch = async (userId: string, connectorId: string, mailbox = env.sync.defaultMailbox) => {
@@ -3232,9 +3331,13 @@ export const startIncomingConnectorIdleWatch = async (userId: string, connectorI
   if (!connector) {
     throw new Error(`Incoming connector ${connectorId} not found`);
   }
+  if (!isIncomingConnectorActive(connector)) {
+    throw new Error(`Incoming connector ${connectorId} is not active`);
+  }
+  const mailboxInput = normalizeWatchMailboxInput(mailbox);
   const normalizedMailbox = isGmailImapConnector(connector)
-    ? normalizeGmailMailboxPath(mailbox)
-    : mailbox;
+    ? normalizeGmailMailboxPath(mailboxInput)
+    : mailboxInput;
   const key = createWatcherKey(connectorId, normalizedMailbox);
   if (activeIdleWatchers.has(key)) {
     return;
@@ -3508,9 +3611,10 @@ export const stopIncomingConnectorIdleWatch = async (userId: string, connectorId
   if (!connector) {
     throw new Error(`Incoming connector ${connectorId} not found`);
   }
+  const mailboxInput = normalizeWatchMailboxInput(mailbox);
   const normalizedMailbox = isGmailImapConnector(connector)
-    ? normalizeGmailMailboxPath(mailbox)
-    : mailbox;
+    ? normalizeGmailMailboxPath(mailboxInput)
+    : mailboxInput;
 
   const key = createWatcherKey(connectorId, normalizedMailbox);
   const existing = activeIdleWatchers.get(key);
@@ -3593,10 +3697,10 @@ export const resumeConfiguredIdleWatches = async () => {
 
   let resumed = 0;
   for (const connector of connectors.rows) {
-    const configured = connector.sync_settings?.watchMailboxes;
-    const watchMailboxes = Array.isArray(configured)
-      ? configured.map((value) => String(value)).filter(Boolean)
-      : [];
+    const watchMailboxes = sanitizeConfiguredWatchMailboxes(
+      connector.sync_settings?.watchMailboxes,
+      isGmailImapConnector(connector),
+    );
     for (const mailbox of watchMailboxes) {
       try {
         await startIncomingConnectorIdleWatch(connector.user_id, connector.id, mailbox);
@@ -3968,12 +4072,16 @@ export const applyThreadMessageActions = async (
     removeLabelKeys?: string[];
   },
 ) => {
-  const threadId = await getThreadIdForMessage(userId, messageId);
-  if (!threadId) {
+  const threadContext = await getThreadContextForMessage(userId, messageId);
+  if (!threadContext?.thread_id) {
     throw new Error('Message not found');
   }
 
-  const threadMessages = await getThreadMessageRowsForUser(userId, threadId);
+  const threadMessages = await getThreadMessageRowsForUser(
+    userId,
+    threadContext.thread_id,
+    threadContext.incoming_connector_id,
+  );
   if (threadMessages.length === 0) {
     throw new Error('Thread not found');
   }

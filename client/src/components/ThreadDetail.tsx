@@ -9,13 +9,13 @@ import {
   Download,
   RefreshCw,
   Reply,
+  ReplyAll,
   Forward,
   Star,
   ChevronDown,
   Trash2,
   MailOpen,
   Mail as MailIcon,
-  CornerUpLeft,
   AlertCircle,
   AlertTriangle,
   ExternalLink,
@@ -25,6 +25,7 @@ import type { AttachmentRecord, MessageRecord } from '../types/index';
 import Avatar from './Avatar';
 import { sanitizeEmailHtmlWithReport } from '../services/htmlSanitizer';
 import { buildReplyReferencesHeader, normalizeMessageIdHeader, orderThreadMessages } from '../services/threading';
+import { useMediaQuery } from '../services/layout';
 
 interface ThreadDetailProps {
   threadId: string;
@@ -68,6 +69,29 @@ const sortableTimestamp = (value: string | null | undefined) => {
   return Number.isFinite(parsed) ? parsed : Number.NEGATIVE_INFINITY;
 };
 
+const normalizeContentId = (value: unknown) =>
+  String(value ?? '').replace(/[<>]/g, '').trim().toLowerCase();
+
+const extractInlineCidReferences = (html: string | null | undefined) => {
+  const references = new Set<string>();
+  if (!html) {
+    return references;
+  }
+
+  const cidRegex = /cid:\s*<?([^>"'\s)]+)>?/gi;
+  let match: RegExpExecArray | null;
+  while ((match = cidRegex.exec(html)) !== null) {
+    const normalized = normalizeContentId(match[1]);
+    if (normalized) {
+      references.add(normalized);
+    }
+  }
+  return references;
+};
+
+const isAbortDomException = (error: unknown): boolean =>
+  error instanceof DOMException && error.name === 'AbortError';
+
 const makeReplySubject = (subject: string | null, mode: ComposeMode) => {
   const base = subject || '(no subject)';
   if (mode === 'forward') return /^fwd?:/i.test(base) ? base : `Fwd: ${base}`;
@@ -101,8 +125,15 @@ const buildSandboxedEmailDoc = (safeBodyHtml: string) => `<!DOCTYPE html>
 <html>
   <head>
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; img-src data: blob: cid:; media-src data: blob: cid:; style-src 'unsafe-inline'; font-src data:; connect-src 'none'; frame-src 'none'; object-src 'none'; form-action 'none'"
+    />
     <style>
       :root { color-scheme: only light; }
+      html, body {
+        overflow: hidden;
+      }
       body {
         margin: 0;
         padding: 12px;
@@ -112,6 +143,12 @@ const buildSandboxedEmailDoc = (safeBodyHtml: string) => `<!DOCTYPE html>
         line-height: 1.55;
         background: #fff;
         overflow-wrap: anywhere;
+        word-break: break-word;
+        overflow-x: hidden;
+        box-sizing: border-box;
+      }
+      * {
+        box-sizing: border-box;
       }
       img, video, audio, iframe, table {
         max-width: 100%;
@@ -193,11 +230,23 @@ const ThreadDetail = ({ threadId, connectorId, onActionComplete }: ThreadDetailP
   const newestMessageRef = useRef<HTMLDivElement>(null);
   const [replyContext, setReplyContext] = useState<ReplyContext | null>(null);
   const threadQueryKey = ['thread', threadId, connectorId ?? 'all'];
+  const isMobile = useMediaQuery('(max-width: 768px)');
+  const isScopedMessageQuery = (queryKey: readonly unknown[]) => {
+    if (!Array.isArray(queryKey) || queryKey[0] !== 'messages') {
+      return false;
+    }
+    const scope = queryKey[1];
+    if (connectorId) {
+      return scope === connectorId;
+    }
+    return !(typeof scope === 'string' && scope.startsWith('send-only:'));
+  };
 
   const { data: messages, isLoading, isError } = useQuery({
     queryKey: threadQueryKey,
-    queryFn: () => api.messages.getThread(threadId),
+    queryFn: ({ signal }) => api.messages.getThread(threadId, connectorId, signal),
     enabled: !!threadId,
+    staleTime: 30_000,
   });
 
   const orderedThreadNodes = useMemo(
@@ -238,17 +287,21 @@ const ThreadDetail = ({ threadId, connectorId, onActionComplete }: ThreadDetailP
     onMutate: async (payload) => {
       await Promise.all([
         queryClient.cancelQueries({ queryKey: threadQueryKey }),
-        queryClient.cancelQueries({ queryKey: ['messages'] }),
+        queryClient.cancelQueries({
+          predicate: (query) => isScopedMessageQuery(query.queryKey),
+        }),
       ]);
       const previousThread = queryClient.getQueryData<MessageRecord[]>(threadQueryKey);
-      const previousMessages = queryClient.getQueriesData<MessagesQueryResult>({ queryKey: ['messages'] });
+      const previousMessages = queryClient.getQueriesData<MessagesQueryResult>({
+        predicate: (query) => isScopedMessageQuery(query.queryKey),
+      });
       queryClient.setQueryData<MessageRecord[]>(
         threadQueryKey,
         (current) => applyThreadPatch(current, payload.messageId, payload.data),
       );
       for (const [key, data] of previousMessages) {
         const queryKey = Array.isArray(key) ? key : [];
-        const removeFromStarredOnUnstar = isStarredFolderToken(queryKey[1]);
+        const removeFromStarredOnUnstar = isStarredFolderToken(queryKey[2]);
         queryClient.setQueryData<MessagesQueryResult>(
           key,
           applyMessageListPatch(data, payload.messageId, payload.data, { removeFromStarredOnUnstar }),
@@ -265,8 +318,11 @@ const ThreadDetail = ({ threadId, connectorId, onActionComplete }: ThreadDetailP
       }
     },
     onSettled: () => {
-      queryClient.invalidateQueries({ queryKey: ['messages'] });
-      queryClient.invalidateQueries({ queryKey: threadQueryKey });
+      queryClient.invalidateQueries({
+        predicate: (query) => isScopedMessageQuery(query.queryKey),
+        refetchType: 'active',
+      });
+      queryClient.invalidateQueries({ queryKey: threadQueryKey, refetchType: 'active' });
       onActionComplete?.();
     }
   });
@@ -274,6 +330,7 @@ const ThreadDetail = ({ threadId, connectorId, onActionComplete }: ThreadDetailP
   const { data: identities } = useQuery({
     queryKey: ['identities'],
     queryFn: () => api.identities.list(),
+    staleTime: 60_000,
   });
 
   const openComposer = (mode: ComposeMode, message: MessageRecord) => {
@@ -283,7 +340,6 @@ const ThreadDetail = ({ threadId, connectorId, onActionComplete }: ThreadDetailP
     const inReplyTo = normalizeMessageIdHeader(message.messageId) ?? undefined;
     const references = buildReplyReferencesHeader(message.referencesHeader, message.messageId);
 
-    // Try to find the best identity to reply FROM
     const allRecipients = new Set([...toRecipients, ...ccRecipients].map(e => e.toLowerCase()));
     let bestIdentity = identities?.find(id => allRecipients.has(id.emailAddress.toLowerCase()));
     if (!bestIdentity && message.incomingConnectorId) {
@@ -338,32 +394,44 @@ const ThreadDetail = ({ threadId, connectorId, onActionComplete }: ThreadDetailP
   if (isError || !messages || orderedThreadNodes.length === 0 || !newestMessage) return <div className="flex-1 flex flex-col items-center justify-center text-text-secondary p-8 text-center bg-bg-card"><AlertCircle className="w-12 h-12 mb-4 text-red-400 opacity-50" /><h3 className="text-base font-bold text-text-primary mb-1">Thread not found</h3></div>;
 
   return (
-    <div className="flex flex-col h-full bg-bg-card overflow-hidden font-sans">
-      <div className="h-11 border-b border-border/60 flex items-center px-4 gap-2 shrink-0 bg-bg-card">
-        <div className="flex items-center gap-1 border-r border-border/40 pr-2 mr-1">
-          <button onClick={() => updateMutation.mutate({ messageId: newestMessage.id, data: { delete: true } })} className="p-1.5 hover:bg-red-50 dark:hover:bg-red-900/20 hover:text-red-500 rounded-md text-text-secondary transition-colors" title="Delete"><Trash2 className="w-4 h-4" /></button>
+    <div className="flex flex-col min-h-full bg-bg-card font-sans">
+      <div className="h-11 border-b border-border/60 flex items-center px-4 gap-2 shrink-0 bg-bg-card sticky top-0 z-30">
+        <div className="flex items-center gap-1 border-r border-border/40 pr-2 -ml-2">
+          <button
+            onClick={() => updateMutation.mutate({ messageId: newestMessage.id, data: { delete: true } })}
+            className="p-2 hover:bg-red-50 dark:hover:bg-red-900/20 text-text-secondary hover:text-red-500 rounded-md transition-colors"
+            title="Delete"
+          >
+            <Trash2 className="w-4 h-4" />
+          </button>
         </div>
         <div className="flex items-center gap-1">
-          <button onClick={() => updateMutation.mutate({ messageId: newestMessage.id, data: { isRead: !newestMessage.isRead } })} className="p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-md text-text-secondary transition-colors" title={newestMessage.isRead ? "Mark as Unread" : "Mark as Read"}>{newestMessage.isRead ? <MailIcon className="w-4 h-4" /> : <MailOpen className="w-4 h-4" />}</button>
+          <button
+            onClick={() => updateMutation.mutate({ messageId: newestMessage.id, data: { isRead: !newestMessage.isRead } })}
+            className="p-2 hover:bg-black/5 dark:hover:bg-white/5 rounded-md text-text-secondary transition-colors"
+            title={newestMessage.isRead ? "Mark as Unread" : "Mark as Read"}
+          >
+            {newestMessage.isRead ? <MailIcon className="w-4 h-4" /> : <MailOpen className="w-4 h-4" />}
+          </button>
         </div>
         <div className="flex-1 min-w-0" />
-        <div className="flex items-center gap-1 text-text-secondary">
-          <button className="p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-md" onClick={() => { void api.messages.viewRaw(newestMessage.id); }}><ExternalLink className="w-4 h-4" /></button>
+        <div className="flex items-center gap-1 text-text-secondary -mr-2">
+          <button className="p-2 hover:bg-black/5 dark:hover:bg-white/5 rounded-md transition-colors" onClick={() => { void api.messages.viewRaw(newestMessage.id); }}><ExternalLink className="w-4 h-4" /></button>
         </div>
       </div>
 
-      <div ref={scrollContainerRef} className="flex-1 overflow-y-auto bg-sidebar/30 p-4 pt-6 custom-scrollbar">
-        <div className="w-full max-w-4xl mx-auto space-y-4 pb-32">
-          <div className="px-1 mb-4 pb-3 border-b border-border/40">
-            <h1 className="text-2xl md:text-3xl font-extrabold text-text-primary tracking-tight leading-tight">
+      <div className="flex-1 bg-sidebar/30 p-2 md:p-4 pt-4 md:pt-6">
+        <div className="w-full max-w-4xl mx-auto space-y-3 md:space-y-4 pb-32">
+          <div className="px-2 mb-2 md:mb-4 pb-3 border-b border-border/40">
+            <h1 className="text-xl md:text-3xl font-extrabold text-text-primary tracking-tight leading-tight">
               {newestMessage.subject || '(no subject)'}
             </h1>
           </div>
-          <div className="space-y-4">
+          <div className="space-y-3 md:space-y-4">
             {orderedThreadNodes.map((node) => {
               const msg = node.message;
               const isNewest = msg.id === newestMessageId;
-              const depthOffsetPx = Math.min(node.depth, 6) * 20;
+              const depthOffsetPx = isMobile ? Math.min(node.depth, 2) * 8 : Math.min(node.depth, 6) * 20;
               return (
                 <div key={msg.id} ref={isNewest ? newestMessageRef : null} style={depthOffsetPx > 0 ? { marginLeft: `${depthOffsetPx}px` } : undefined}>
                   <MessageItem
@@ -372,14 +440,25 @@ const ThreadDetail = ({ threadId, connectorId, onActionComplete }: ThreadDetailP
                     defaultExpanded={isNewest}
                     onReply={() => openComposer('reply', msg)}
                     onToggleStar={() => updateMutation.mutate({ messageId: msg.id, data: { isStarred: !msg.isStarred } })}
+                    isMobile={isMobile}
                   />
                 </div>
               );
             })}
           </div>
-          <div className="pt-8 flex justify-center gap-3">
-            <button onClick={() => openComposer('replyAll', newestMessage)} className="flex items-center gap-2 px-5 py-1.5 bg-bg-card border border-border rounded-md text-size-sm font-semibold text-text-secondary hover:text-text-primary hover:border-accent/40 transition-all active:scale-[0.98] shadow-xs"><CornerUpLeft className="w-3.5 h-3.5 text-accent" />Reply all</button>
-            <button onClick={() => openComposer('forward', newestMessage)} className="flex items-center gap-2 px-5 py-1.5 bg-bg-card border border-border rounded-md text-size-sm font-semibold text-text-secondary hover:text-text-primary hover:border-accent/40 transition-all active:scale-[0.98] shadow-xs"><Forward className="w-3.5 h-3.5 text-text-secondary" />Forward</button>
+          <div className="pt-8 flex flex-col sm:flex-row justify-start gap-3 px-2 md:px-0">
+            <button onClick={() => openComposer('reply', newestMessage)} className="btn-secondary px-6 py-2 font-bold">
+              <Reply className="w-4 h-4 text-accent" />
+              Reply
+            </button>
+            <button onClick={() => openComposer('replyAll', newestMessage)} className="btn-secondary px-6 py-2 font-bold">
+              <ReplyAll className="w-4 h-4 text-accent" />
+              Reply all
+            </button>
+            <button onClick={() => openComposer('forward', newestMessage)} className="btn-secondary px-6 py-2 font-bold">
+              <Forward className="w-4 h-4 text-text-secondary" />
+              Forward
+            </button>
           </div>
         </div>
       </div>
@@ -402,14 +481,122 @@ const ThreadDetail = ({ threadId, connectorId, onActionComplete }: ThreadDetailP
   );
 };
 
-const MessageItem = ({ msg, depth, defaultExpanded, onReply, onToggleStar }: { msg: MessageRecord; depth: number, defaultExpanded: boolean, onReply: () => void, onToggleStar: () => void }) => {
+const MessageItem = ({ msg, depth, defaultExpanded, onReply, onToggleStar, isMobile }: { msg: MessageRecord; depth: number, defaultExpanded: boolean, onReply: () => void, onToggleStar: () => void, isMobile: boolean }) => {
   const [isExpanded, setIsExpanded] = useState(defaultExpanded);
   const [showDetails, setShowDetails] = useState(false);
   const [allowRichFormatting, setAllowRichFormatting] = useState(false);
-  const sanitizedBody = useMemo(
-    () => (msg.bodyHtml ? sanitizeEmailHtmlWithReport(msg.bodyHtml, { allowStyles: allowRichFormatting }) : null),
-    [msg.bodyHtml, allowRichFormatting],
+  const [inlineCidUrls, setInlineCidUrls] = useState<Map<string, string>>(new Map());
+  const iframeObserverRef = useRef<ResizeObserver | null>(null);
+  const iframeTimerIdsRef = useRef<number[]>([]);
+  const referencedInlineCids = useMemo(
+    () => extractInlineCidReferences(msg.bodyHtml),
+    [msg.bodyHtml],
   );
+
+  useEffect(() => {
+    return () => {
+      iframeObserverRef.current?.disconnect();
+      iframeObserverRef.current = null;
+      for (const timerId of iframeTimerIdsRef.current) {
+        window.clearTimeout(timerId);
+      }
+      iframeTimerIdsRef.current = [];
+    };
+  }, []);
+
+  const { data: attachments } = useQuery({
+    queryKey: ['attachments', msg.id],
+    queryFn: () => api.messages.getAttachments(msg.id),
+    staleTime: 30_000,
+    enabled: isExpanded && referencedInlineCids.size > 0,
+  });
+
+  useEffect(() => {
+    let cancelled = false;
+    let abortController: AbortController | null = null;
+    const createdObjectUrls: string[] = [];
+
+    const loadInlineCidUrls = async () => {
+      if (!isExpanded || referencedInlineCids.size === 0 || !attachments?.length) {
+        if (!cancelled) {
+          setInlineCidUrls(new Map());
+        }
+        return;
+      }
+
+      const cidAttachmentMap = new Map<string, AttachmentRecord>();
+      for (const attachment of attachments) {
+        const normalizedCid = normalizeContentId(attachment.contentId);
+        if (
+          !normalizedCid
+          || attachment.scanStatus === 'infected'
+          || !referencedInlineCids.has(normalizedCid)
+          || cidAttachmentMap.has(normalizedCid)
+        ) {
+          continue;
+        }
+        cidAttachmentMap.set(normalizedCid, attachment);
+      }
+
+      if (cidAttachmentMap.size === 0) {
+        if (!cancelled) {
+          setInlineCidUrls(new Map());
+        }
+        return;
+      }
+
+      abortController = new AbortController();
+      const entries = await Promise.all(
+        Array.from(cidAttachmentMap.entries()).map(async ([cid, attachment]) => {
+          try {
+            const blob = await api.attachments.getPreviewBlob(attachment.id, abortController?.signal);
+            if (cancelled) {
+              return null;
+            }
+            const objectUrl = URL.createObjectURL(blob);
+            createdObjectUrls.push(objectUrl);
+            return [cid, objectUrl] as const;
+          } catch (error) {
+            if (isAbortDomException(error)) {
+              return null;
+            }return null;
+          }
+        }),
+      );
+
+      if (!cancelled) {
+        const resolvedEntries = entries.filter((entry): entry is readonly [string, string] => Boolean(entry));
+        setInlineCidUrls(new Map(resolvedEntries));
+      }
+    };
+
+    void loadInlineCidUrls();
+    return () => {
+      cancelled = true;
+      abortController?.abort();
+      for (const url of createdObjectUrls) {
+        URL.revokeObjectURL(url);
+      }
+    };
+  }, [attachments, isExpanded, referencedInlineCids]);
+
+  const sanitizedBody = useMemo(() => {
+    if (!msg.bodyHtml) return null;
+    const result = sanitizeEmailHtmlWithReport(msg.bodyHtml, { allowStyles: allowRichFormatting });
+
+    if (inlineCidUrls.size > 0) {
+      let html = result.html;
+      for (const [cid, url] of inlineCidUrls.entries()) {
+        const escapedCid = cid.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const regex = new RegExp(`cid:<?${escapedCid}>?`, 'gi');
+        html = html.replace(regex, url);
+      }
+      return { ...result, html };
+    }
+
+    return result;
+  }, [msg.bodyHtml, allowRichFormatting, inlineCidUrls]);
+
   const safeBodyHtml = sanitizedBody?.html ?? null;
   const blockedContentSummary = useMemo(() => {
     if (!sanitizedBody?.hasBlockedContent || allowRichFormatting) {
@@ -429,52 +616,52 @@ const MessageItem = ({ msg, depth, defaultExpanded, onReply, onToggleStar }: { m
   const bcc = msg.bccHeader || null;
 
   return (
-    <div className={`bg-bg-card border border-border rounded-md shadow-xs overflow-hidden transition-all ${depth > 0 ? 'border-l-4 border-l-accent/20' : ''} ${!isExpanded ? 'hover:border-accent/30 cursor-pointer' : ''}`}>
-      <div className={`px-4 py-3 flex items-center justify-between transition-colors relative ${isExpanded ? 'border-b border-border/40 bg-black/[0.01] dark:bg-white/[0.01]' : 'hover:bg-black/[0.02] dark:hover:bg-white/[0.02]'}`}>
+    <div className={`bg-bg-card border border-border rounded-md shadow-xs overflow-hidden transition-all ${depth > 0 && !isMobile ? 'border-l-4 border-l-accent/20' : ''} ${depth > 0 && isMobile ? 'border-l-2 border-l-accent/20' : ''} ${!isExpanded ? 'hover:border-accent/30 cursor-pointer' : ''}`}>
+      <div className={`px-2 md:px-4 py-2.5 md:py-3 flex items-center justify-between transition-colors relative ${isExpanded ? 'border-b border-border/40 bg-black/[0.01] dark:bg-white/[0.01]' : 'hover:bg-black/[0.02] dark:hover:bg-white/[0.02]'}`}>
         <div className="absolute inset-0 cursor-pointer z-0" onClick={() => setIsExpanded(!isExpanded)} />
-        <div className="flex items-center gap-3 flex-1 min-w-0 z-10 pointer-events-none">
-          <Avatar text={from.name} fallbackIcon={UserCircle} size="md" className="pointer-events-auto" />
+        <div className="flex items-center gap-2 md:gap-3 flex-1 min-w-0 z-10 pointer-events-none">
+          <Avatar text={from.name} fallbackIcon={UserCircle} size={isMobile ? 'sm' : 'md'} className="pointer-events-auto" />
             <div className="min-w-0 flex-1 pointer-events-auto">
             <div className="flex items-baseline gap-2 overflow-hidden flex-1">
-              <span className="text-sm font-semibold text-text-primary shrink-0 max-w-[300px] truncate cursor-text">{from.name}</span>
-              {isExpanded && from.email && <span className="text-[11px] text-text-secondary opacity-60 truncate font-normal cursor-text">{from.email}</span>}
-              {!isExpanded && <span className="text-[11px] text-text-secondary truncate font-normal opacity-50 ml-2 italic flex-1 min-w-0 cursor-text">— {msg.snippet}</span>}
+              <span className="text-sm font-semibold text-text-primary shrink-0 max-w-[150px] md:max-w-[300px] truncate cursor-text">{from.name}</span>
+              {isExpanded && from.email && !isMobile && <span className="text-[11px] text-text-secondary opacity-60 truncate font-normal cursor-text">{from.email}</span>}
+              {!isExpanded && <span className="text-[11px] text-text-secondary truncate font-normal opacity-50 ml-1 md:ml-2 italic flex-1 min-w-0 cursor-text">— {msg.snippet}</span>}
             </div>
             {isExpanded && (
               <div className="flex flex-col min-w-0">
-                <div className="text-[11px] text-text-secondary mt-0.5 flex items-center gap-1 opacity-80 cursor-pointer hover:underline w-fit max-w-full" onClick={(e) => { e.stopPropagation(); setShowDetails(!showDetails); }}>
+                <div className="text-[10px] md:text-[11px] text-text-secondary mt-0.5 flex items-center gap-1 opacity-80 cursor-pointer hover:underline w-fit max-w-full" onClick={(e) => { e.stopPropagation(); setShowDetails(!showDetails); }}>
                   <span className="shrink-0">to</span>
                   <span className="truncate">{msg.toHeader}</span>
-                  <ChevronDown className={`w-3 h-3 shrink-0 transition-transform ${showDetails ? 'rotate-180' : ''}`} />
+                  <ChevronDown className={`w-2.5 h-2.5 md:w-3 md:h-3 shrink-0 transition-transform ${showDetails ? 'rotate-180' : ''}`} />
                 </div>
               </div>
             )}
           </div>
         </div>
-        <div className="flex items-center gap-3 shrink-0 ml-4 z-10">
-          <div className="text-[10px] text-text-secondary font-medium whitespace-nowrap opacity-60 uppercase tracking-tight cursor-text">
+        <div className="flex items-center gap-1 md:gap-3 shrink-0 ml-2 md:ml-4 z-10">
+          <div className="text-[9px] md:text-[10px] text-text-secondary font-medium whitespace-nowrap opacity-60 uppercase tracking-tight cursor-text">
             {msg.receivedAt && (() => {
               const d = new Date(msg.receivedAt);
               if (isToday(d)) return format(d, 'h:mm a');
-              if (isYesterday(d)) return 'Yesterday, ' + format(d, 'h:mm a');
-              return format(d, 'MMM d, p');
+              if (isYesterday(d)) return isMobile ? 'Yest' : 'Yesterday, ' + format(d, 'h:mm a');
+              return format(d, isMobile ? 'MMM d' : 'MMM d, p');
             })()}
           </div>
           <div className="flex items-center gap-0.5 text-text-secondary">
-            <button className="p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-md" onClick={(e) => { e.stopPropagation(); onToggleStar(); }}><Star className={`w-3.5 h-3.5 ${msg.isStarred ? 'fill-yellow-400 text-yellow-400' : ''}`} /></button>
-            <button className="p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-md" onClick={(e) => { e.stopPropagation(); onReply(); }} title="Reply"><Reply className="w-3.5 h-3.5" /></button>
+            <button className="p-2 hover:bg-black/5 dark:hover:bg-white/5 rounded-md transition-colors" onClick={(e) => { e.stopPropagation(); onToggleStar(); }}><Star className={`w-4 h-4 ${msg.isStarred ? 'fill-yellow-400 text-yellow-400' : ''}`} /></button>
+            <button className="p-2 hover:bg-black/5 dark:hover:bg-white/5 rounded-md transition-colors" onClick={(e) => { e.stopPropagation(); onReply(); }} title="Reply"><Reply className="w-4 h-4" /></button>
           </div>
         </div>
       </div>
 
       {isExpanded && showDetails && (
-        <div className="px-4 py-3 bg-black/[0.02] dark:bg-white/[0.02] border-b border-border/40 animate-in slide-in-from-top-1 duration-200">
-          <div className="grid grid-cols-[max-content_1fr] gap-x-3 gap-y-1 text-[11px] ml-11">
+        <div className="px-3 md:px-4 py-2.5 md:py-3 bg-black/[0.02] dark:bg-white/[0.02] border-b border-border/40 animate-in slide-in-from-top-1 duration-200">
+          <div className="grid grid-cols-[max-content_1fr] gap-x-2 md:gap-x-3 gap-y-1 text-[10px] md:text-[11px] ml-8 md:ml-11">
             <span className="text-text-secondary font-semibold text-right opacity-60">from:</span>
-            <span className="text-text-primary font-medium flex items-center gap-2"><span className="font-bold">{from.name}</span><span className="opacity-60">{from.email}</span></span>
-            <span className="text-text-secondary font-semibold text-right opacity-60">to:</span><span className="text-text-primary font-medium">{msg.toHeader}</span>
-            {cc && <><span className="text-text-secondary font-semibold text-right opacity-60">cc:</span><span className="text-text-primary font-medium">{cc}</span></>}
-            {bcc && <><span className="text-text-secondary font-semibold text-right opacity-60">bcc:</span><span className="text-text-primary font-medium">{bcc}</span></>}
+            <span className="text-text-primary font-medium flex flex-wrap items-center gap-1 md:gap-2"><span className="font-bold">{from.name}</span><span className="opacity-60 break-all">{from.email}</span></span>
+            <span className="text-text-secondary font-semibold text-right opacity-60">to:</span><span className="text-text-primary font-medium break-all">{msg.toHeader}</span>
+            {cc && <><span className="text-text-secondary font-semibold text-right opacity-60">cc:</span><span className="text-text-primary font-medium break-all">{cc}</span></>}
+            {bcc && <><span className="text-text-secondary font-semibold text-right opacity-60">bcc:</span><span className="text-text-primary font-medium break-all">{bcc}</span></>}
             <span className="text-text-secondary font-semibold text-right opacity-60">date:</span><span className="text-text-primary font-medium">{msg.receivedAt && format(new Date(msg.receivedAt), 'MMMM d, yyyy, h:mm a')}</span>
             <span className="text-text-secondary font-semibold text-right opacity-60">subject:</span><span className="text-text-primary font-medium">{msg.subject || '(no subject)'}</span>
           </div>
@@ -483,7 +670,7 @@ const MessageItem = ({ msg, depth, defaultExpanded, onReply, onToggleStar }: { m
 
       {isExpanded && (
         <>
-          <div className="bg-white p-6 text-base leading-relaxed selection:bg-accent/10 text-[#222]">
+          <div className="bg-white p-4 md:p-6 text-sm md:text-base leading-relaxed selection:bg-accent/10 text-[#222] break-words overflow-wrap-anywhere">
             {sanitizedBody?.hasBlockedContent && !allowRichFormatting && (
               <div className="mb-3 rounded-md border border-amber-300/80 bg-amber-50 px-3 py-2 text-[12px] text-amber-900 flex items-start gap-2">
                 <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
@@ -513,32 +700,68 @@ const MessageItem = ({ msg, depth, defaultExpanded, onReply, onToggleStar }: { m
               </div>
             )}
             {safeBodyHtml ? (
-              <div className="w-full min-w-0 overflow-hidden">
+              <div className="w-full min-w-0">
                 <iframe
                   title={`msg-${msg.id}`}
                   srcDoc={buildSandboxedEmailDoc(safeBodyHtml)}
-                  className="w-full h-[420px] max-h-[70vh] border border-border/50 rounded-md bg-white"
-                  sandbox="allow-popups"
+                  className="w-full border-none bg-white transition-all duration-200"
+                  style={{ height: '200px' }}                   scrolling="no"
+                  sandbox="allow-popups allow-same-origin"
+                  onLoad={(e) => {
+                    const iframe = e.currentTarget;
+                    const doc = iframe.contentWindow?.document;
+                    if (doc?.body) {
+                      iframeObserverRef.current?.disconnect();
+                      iframeObserverRef.current = null;
+                      for (const timerId of iframeTimerIdsRef.current) {
+                        window.clearTimeout(timerId);
+                      }
+                      iframeTimerIdsRef.current = [];
+
+                      const updateHeight = () => {
+                        const height = doc.body.scrollHeight;
+                        if (height > 0) {
+                          iframe.style.height = `${height}px`;
+                        }
+                      };
+                      updateHeight();
+                      const observer = new ResizeObserver(updateHeight);
+                      observer.observe(doc.body);
+                      iframeObserverRef.current = observer;
+                      iframeTimerIdsRef.current.push(window.setTimeout(updateHeight, 500));
+                      iframeTimerIdsRef.current.push(window.setTimeout(updateHeight, 2000));
+                    }
+                  }}
                   referrerPolicy="no-referrer"
                   loading="lazy"
                 />
               </div>
-            ) : <div className="whitespace-pre-wrap">{msg.bodyText}</div>}
+            ) : <div className="whitespace-pre-wrap break-words overflow-wrap-anywhere">{msg.bodyText}</div>}
           </div>
-          <AttachmentList messageId={msg.id} />
+          <AttachmentList messageId={msg.id} isMobile={isMobile} />
         </>
       )}
     </div>
   );
 };
 
-const AttachmentList = ({ messageId }: { messageId: string }) => {
+const AttachmentList = ({ messageId, isMobile }: { messageId: string; isMobile: boolean }) => {
   const { data: attachments, isLoading } = useQuery({ queryKey: ['attachments', messageId], queryFn: () => api.messages.getAttachments(messageId), staleTime: 30_000 });
   if (isLoading || !attachments?.length) return null;
-  return <div className="px-5 pb-5 pt-2 border-t border-border/40 bg-white"><div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">{attachments.map(att => <AttachmentItem key={att.id} messageId={messageId} attachment={att} />)}</div></div>;
+  return (
+    <div className="px-4 pb-4 pt-2 border-t border-border/40 bg-bg-card">
+      <div className="flex items-center gap-2 mb-2 text-text-secondary opacity-60 ml-1">
+        <Paperclip className="w-3 h-3" />
+        <span className="text-[10px] font-bold uppercase tracking-wider">{attachments.length} {attachments.length === 1 ? 'Attachment' : 'Attachments'}</span>
+      </div>
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+        {attachments.map(att => <AttachmentItem key={att.id} messageId={messageId} attachment={att} isMobile={isMobile} />)}
+      </div>
+    </div>
+  );
 };
 
-const AttachmentItem = ({ messageId, attachment }: { messageId: string; attachment: AttachmentRecord }) => {
+const AttachmentItem = ({ messageId, attachment, isMobile }: { messageId: string; attachment: AttachmentRecord; isMobile: boolean }) => {
   const queryClient = useQueryClient();
   const scanMutation = useMutation({ mutationFn: () => api.messages.triggerScan(messageId, attachment.id), onSuccess: () => queryClient.invalidateQueries({ queryKey: ['attachments', messageId] }) });
   const downloadMutation = useMutation({ mutationFn: () => api.attachments.download(attachment.id, attachment.filename || 'attachment') });
@@ -577,10 +800,38 @@ const AttachmentItem = ({ messageId, attachment }: { messageId: string; attachme
     }
   };
   return (
-    <div className="flex items-center gap-2 p-1.5 bg-[#f8f9fa] border border-[#dadce0] rounded-lg group hover:border-accent/40 transition-all shadow-xs">
-      <div className="w-7 h-7 rounded bg-white flex items-center justify-center shrink-0 border border-[#dadce0]"><Paperclip className="w-3.5 h-3.5 text-[#5f6368]" /></div>
-      <div className="min-w-0 flex-1"><div className="text-[11px] font-bold text-[#1f1f1f] truncate" title={attachment.filename}>{attachment.filename}</div><div className="text-[9px] text-[#5f6368] flex items-center gap-1 uppercase tracking-tighter"><span>{(attachment.size / 1024).toFixed(0)}K</span></div></div>
-      <div className="flex items-center gap-0.5">{['error', 'missing'].includes(attachment.scanStatus) && <button onClick={() => scanMutation.mutate()} className="p-1 hover:bg-black/5 rounded" title="Retry scan"><RefreshCw className="w-3 h-3" /></button>}{canPreviewInline && <button onClick={handleOpenInNewTab} disabled={attachment.scanStatus === 'infected'} className="p-1 hover:bg-black/5 rounded text-text-secondary disabled:opacity-30" title="Open in new tab"><ExternalLink className="w-3 h-3" /></button>}<button onClick={handleDownload} disabled={attachment.scanStatus === 'infected' || downloadMutation.isPending} className="p-1 hover:bg-accent/10 rounded text-accent disabled:opacity-30" title="Download">{downloadMutation.isPending ? <Loader2 className="w-3 h-3 animate-spin" /> : <Download className="w-3 h-3" />}</button></div>
+    <div className="flex items-center gap-2.5 p-1.5 bg-accent/[0.02] dark:bg-white/[0.02] border border-border/60 rounded-lg group hover:bg-accent/[0.05] hover:border-accent/30 transition-all duration-200 shadow-xs hover:shadow-sm">
+      <div className="w-8 h-8 rounded-md bg-bg-card flex items-center justify-center shrink-0 border border-border/40 shadow-xs group-hover:scale-105 transition-transform">
+        <Paperclip className="w-3.5 h-3.5 text-text-secondary opacity-70" />
+      </div>
+      <div className="min-w-0 flex-1">
+        <div className="text-[11px] font-bold text-text-primary truncate" title={attachment.filename}>
+          {attachment.filename}
+        </div>
+        <div className="text-[9px] text-text-secondary opacity-60 font-medium lowercase">
+          {(attachment.size / 1024).toFixed(0)}kb
+        </div>
+      </div>
+      <div className={`flex items-center gap-0.5 transition-opacity ${isMobile ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`}>
+        {['error', 'missing'].includes(attachment.scanStatus) && (
+          <button onClick={() => scanMutation.mutate()} className="p-1 hover:bg-black/5 dark:hover:bg-white/5 rounded-md" title="Retry scan">
+            <RefreshCw className="w-3.5 h-3.5 text-text-secondary" />
+          </button>
+        )}
+        {canPreviewInline && (
+          <button onClick={handleOpenInNewTab} disabled={attachment.scanStatus === 'infected'} className="p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-md text-text-secondary disabled:opacity-30" title="Open in new tab">
+            <ExternalLink className="w-4 h-4 md:w-3.5 md:h-3.5" />
+          </button>
+        )}
+        <button
+          onClick={handleDownload}
+          disabled={attachment.scanStatus === 'infected' || downloadMutation.isPending}
+          className="p-1.5 hover:bg-accent/10 rounded-md text-accent disabled:opacity-30 transition-colors"
+          title="Download"
+        >
+          {downloadMutation.isPending ? <Loader2 className="w-4 h-4 md:w-3.5 md:h-3.5 animate-spin" /> : <Download className="w-4 h-4 md:w-3.5 md:h-3.5" />}
+        </button>
+      </div>
     </div>
   );
 };

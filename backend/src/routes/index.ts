@@ -25,7 +25,12 @@ import {
   exchangeCodeForTokens,
   ensureValidGoogleAccessToken,
 } from '../services/googleOAuth.js';
-import { enqueueSend, enqueueSyncWithOptions, enqueueAttachmentScan } from '../services/queue.js';
+import {
+  enqueueSend,
+  enqueueSyncWithOptions,
+  enqueueAttachmentScan,
+  purgeIncomingConnectorSyncJobs,
+} from '../services/queue.js';
 import { query } from '../db/pool.js';
 import {
   listConnectorMailboxes,
@@ -108,6 +113,8 @@ const isGmailAuthConnector = (connector: any): boolean => {
   );
 };
 
+const isActiveConnectorStatus = (value: unknown) => String(value ?? '').trim().toLowerCase() === 'active';
+
 const isGmailLikeConnector = (connector: any): boolean => {
   if (!connector) {
     return false;
@@ -153,6 +160,244 @@ const parseBooleanParam = (value: unknown): boolean | null => {
   return null;
 };
 
+const parsePositiveIntWithCap = (value: unknown, fallback: number, max: number) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return fallback;
+  }
+  return Math.min(Math.floor(parsed), max);
+};
+
+const parseNonNegativeIntWithCap = (value: unknown, fallback: number, max: number) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return fallback;
+  }
+  return Math.min(Math.floor(parsed), max);
+};
+
+const parseTrimmedStringArrayWithCap = (
+  value: unknown,
+  fieldName: string,
+  maxItems: number,
+): string[] => {
+  if (value === undefined || value === null) {
+    return [];
+  }
+  if (!Array.isArray(value)) {
+    throw new Error(`${fieldName} must be an array`);
+  }
+  if (value.length > maxItems) {
+    throw new Error(`${fieldName} exceeds ${maxItems} items`);
+  }
+  const normalized: string[] = [];
+  const dedupe = new Set<string>();
+  for (const entry of value) {
+    const token = String(entry ?? '').trim();
+    if (!token) {
+      throw new Error(`${fieldName} must not contain empty values`);
+    }
+    if (dedupe.has(token)) {
+      continue;
+    }
+    dedupe.add(token);
+    normalized.push(token);
+  }
+  return normalized;
+};
+
+const assertUuidList = (values: string[], fieldName: string) => {
+  for (const value of values) {
+    if (!UUID_PATTERN.test(value)) {
+      throw new Error(`${fieldName} must contain valid UUID values`);
+    }
+  }
+};
+
+type ConnectorOwnershipCacheEntry = {
+  expiresAtMs: number;
+  isGmailLike: boolean;
+};
+
+type TimedCacheEntry<T> = {
+  expiresAtMs: number;
+  value: T;
+};
+
+type QuickFiltersResponse = {
+  labels: Array<{ key: string; name: string; count: number }>;
+  starred: number;
+  withAttachments: number;
+  topFrom: Array<{ fromHeader: string; count: number }>;
+};
+
+type SearchSuggestionsResponse = {
+  labels: Array<{ key: string; name: string }>;
+  from: Array<{ fromHeader: string; count: number }>;
+  subjects: Array<{ subject: string; count: number }>;
+};
+
+const ACTIVE_MAILBOX_CONNECTOR_CACHE_TTL_MS = 60_000;
+const ACTIVE_MAILBOX_CONNECTOR_CACHE_MAX = 2_000;
+const activeMailboxConnectorCache = new Map<string, ConnectorOwnershipCacheEntry>();
+const SEARCH_QUICK_FILTERS_CACHE_TTL_MS = 8_000;
+const SEARCH_QUICK_FILTERS_CACHE_MAX = 2_000;
+const SEARCH_SUGGESTIONS_CACHE_TTL_MS = 15_000;
+const SEARCH_SUGGESTIONS_CACHE_MAX = 8_000;
+const quickFiltersCache = new Map<string, TimedCacheEntry<QuickFiltersResponse>>();
+const searchSuggestionsCache = new Map<string, TimedCacheEntry<SearchSuggestionsResponse>>();
+const activeEventStreamsByUser = new Map<string, number>();
+
+const activeMailboxConnectorCacheKey = (userId: string, connectorId: string) =>
+  `${userId}:${connectorId}`;
+
+const getActiveMailboxConnectorCache = (userId: string, connectorId: string): ConnectorOwnershipCacheEntry | null => {
+  const key = activeMailboxConnectorCacheKey(userId, connectorId);
+  const cached = activeMailboxConnectorCache.get(key);
+  if (!cached) {
+    return null;
+  }
+  if (cached.expiresAtMs <= Date.now()) {
+    activeMailboxConnectorCache.delete(key);
+    return null;
+  }
+  return cached;
+};
+
+const setActiveMailboxConnectorCache = (
+  userId: string,
+  connectorId: string,
+  isGmailLike: boolean,
+) => {
+  const key = activeMailboxConnectorCacheKey(userId, connectorId);
+  activeMailboxConnectorCache.delete(key);
+  activeMailboxConnectorCache.set(key, {
+    expiresAtMs: Date.now() + ACTIVE_MAILBOX_CONNECTOR_CACHE_TTL_MS,
+    isGmailLike,
+  });
+  if (activeMailboxConnectorCache.size > ACTIVE_MAILBOX_CONNECTOR_CACHE_MAX) {
+    const oldest = activeMailboxConnectorCache.keys().next().value as string | undefined;
+    if (oldest) {
+      activeMailboxConnectorCache.delete(oldest);
+    }
+  }
+};
+
+const clearActiveMailboxConnectorCache = (userId: string, connectorId: string) => {
+  activeMailboxConnectorCache.delete(activeMailboxConnectorCacheKey(userId, connectorId));
+};
+
+const getIncomingConnectorGmailLikeCached = async (userId: string, connectorId: string): Promise<boolean | null> => {
+  const cached = getActiveMailboxConnectorCache(userId, connectorId);
+  if (cached) {
+    return cached.isGmailLike;
+  }
+
+  const connector = await getIncomingConnector(userId, connectorId);
+  if (!connector) {
+    return null;
+  }
+
+  const isGmailLike = isGmailLikeConnector(connector);
+  setActiveMailboxConnectorCache(userId, connectorId, isGmailLike);
+  return isGmailLike;
+};
+
+const getTimedCacheValue = <T>(
+  cache: Map<string, TimedCacheEntry<T>>,
+  key: string,
+): T | null => {
+  const entry = cache.get(key);
+  if (!entry) {
+    return null;
+  }
+  if (entry.expiresAtMs <= Date.now()) {
+    cache.delete(key);
+    return null;
+  }
+  cache.delete(key);
+  cache.set(key, entry);
+  return entry.value;
+};
+
+const setTimedCacheValue = <T>(
+  cache: Map<string, TimedCacheEntry<T>>,
+  key: string,
+  value: T,
+  ttlMs: number,
+  maxEntries: number,
+) => {
+  cache.delete(key);
+  cache.set(key, {
+    expiresAtMs: Date.now() + ttlMs,
+    value,
+  });
+  if (cache.size > maxEntries) {
+    const oldest = cache.keys().next().value as string | undefined;
+    if (oldest) {
+      cache.delete(oldest);
+    }
+  }
+};
+
+const clearSearchCachesForUser = (userId: string) => {
+  quickFiltersCache.delete(userId);
+  const prefix = `${userId}:`;
+  for (const key of searchSuggestionsCache.keys()) {
+    if (key.startsWith(prefix)) {
+      searchSuggestionsCache.delete(key);
+    }
+  }
+};
+
+const ensureIncomingConnectorStatesBulk = async (
+  connectorId: string,
+  mailboxes: string[],
+) => {
+  const normalized = Array.from(new Set(
+    (mailboxes ?? [])
+      .map((mailbox) => String(mailbox ?? '').trim())
+      .filter(Boolean),
+  ));
+  if (normalized.length === 0) {
+    return;
+  }
+
+  try {
+    await query(
+      `INSERT INTO sync_states (incoming_connector_id, mailbox)
+       SELECT $1, mailbox
+         FROM UNNEST($2::text[]) AS mailboxes(mailbox)
+       ON CONFLICT (incoming_connector_id, mailbox)
+       DO NOTHING`,
+      [connectorId, normalized],
+    );
+  } catch {
+    // Fall back to per-mailbox inserts if bulk path fails.
+    for (const mailbox of normalized) {
+      await ensureIncomingConnectorState(connectorId, mailbox);
+    }
+  }
+};
+
+const tryAcquireEventStreamSlot = (userId: string) => {
+  const current = activeEventStreamsByUser.get(userId) ?? 0;
+  if (current >= MAX_ACTIVE_EVENT_STREAMS_PER_USER) {
+    return false;
+  }
+  activeEventStreamsByUser.set(userId, current + 1);
+  return true;
+};
+
+const releaseEventStreamSlot = (userId: string) => {
+  const current = activeEventStreamsByUser.get(userId) ?? 0;
+  if (current <= 1) {
+    activeEventStreamsByUser.delete(userId);
+    return;
+  }
+  activeEventStreamsByUser.set(userId, current - 1);
+};
+
 const mailboxReadPreferenceRankSql = `CASE UPPER(m.folder_path)
   WHEN 'INBOX' THEN 0
   WHEN 'SENT' THEN 1
@@ -165,16 +410,14 @@ const mailboxReadPreferenceRankSql = `CASE UPPER(m.folder_path)
   ELSE 20
 END`;
 
-const normalizeConnectorFolderFilter = async (
-  userId: string,
+const logicalMessageKeySql = (alias: string) =>
+  `COALESCE(NULLIF(${alias}.gmail_message_id, ''), LOWER(NULLIF(${alias}.message_id, '')), ${alias}.id::text)`;
+
+const normalizeConnectorFolderFilterWithConnector = (
   folder: string | undefined,
-  connectorId: string | undefined,
+  connector: any | null,
 ) => {
-  if (!folder || !connectorId) {
-    return folder;
-  }
-  const connector = await getIncomingConnector(userId, connectorId);
-  if (!connector) {
+  if (!folder || !connector) {
     return folder;
   }
   if (!isGmailLikeConnector(connector)) {
@@ -183,22 +426,13 @@ const normalizeConnectorFolderFilter = async (
   return normalizeGmailMailboxPath(folder);
 };
 
-const buildGmailFolderPredicates = async (
-  userId: string,
+const buildGmailFolderPredicatesWithConnector = (
   folder: string | undefined,
-  connectorId: string | undefined,
+  connector: any | null,
 ) => {
-  if (!folder || !connectorId) {
+  if (!folder || !connector) {
     return {
       candidates: null as string[] | null,
-      dedupeLogicalMessages: false,
-    };
-  }
-
-  const connector = await getIncomingConnector(userId, connectorId);
-  if (!connector) {
-    return {
-      candidates: null,
       dedupeLogicalMessages: false,
     };
   }
@@ -269,6 +503,35 @@ const MAX_SEND_BODY_HTML_CHARS = 500_000;
 const MAX_SEND_ATTACHMENT_BYTES = 10 * 1024 * 1024;
 const MAX_SEND_TOTAL_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 const MAX_SEND_HEADER_CHARS = 2_000;
+const MAX_IDENTITY_DISPLAY_NAME_CHARS = 180;
+const MAX_IDENTITY_SIGNATURE_CHARS = 20_000;
+const MAX_IDENTITY_REPLY_TO_CHARS = 998;
+const MAX_OAUTH_CODE_CHARS = 8_192;
+const MAX_OAUTH_STATE_CHARS = 200;
+const MAX_OAUTH_CLIENT_ID_CHARS = 512;
+const MAX_OAUTH_CLIENT_SECRET_CHARS = 2_048;
+const MAX_PUSH_ENDPOINT_CHARS = 2_048;
+const MAX_PUSH_KEY_CHARS = 512;
+const MAX_PUSH_USER_AGENT_CHARS = 1_024;
+const MAX_MAILBOX_PATH_CHARS = 512;
+const MAX_WATCH_MAILBOXES = 32;
+const MAX_MESSAGES_PAGE_LIMIT = 200;
+const MAX_MESSAGES_OFFSET = 10_000;
+const MAX_MESSAGES_SEARCH_QUERY_CHARS = 2_000;
+const MAX_SEND_ONLY_SEARCH_CHARS = 512;
+const MAX_SEARCH_SUGGESTION_QUERY_CHARS = 120;
+const MAX_SAVED_SEARCH_NAME_CHARS = 120;
+const MAX_SAVED_SEARCH_QUERY_CHARS = 2_000;
+const MAX_LABEL_MUTATION_ITEMS = 100;
+const MAX_EVENTS_LIMIT = 500;
+const MAX_SYNC_EVENT_ID = Number.MAX_SAFE_INTEGER;
+const MAX_ACTIVE_EVENT_STREAMS_PER_USER = 3;
+const EVENT_STREAM_ERROR_BACKOFF_MS = 500;
+const MAX_WATCH_MAILBOX_SANITIZE_SCAN_ITEMS = MAX_WATCH_MAILBOXES * 8;
+const EMAIL_ADDRESS_PATTERN = /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,63}$/i;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const MAILBOX_CONTROL_CHAR_PATTERN = /[\u0000-\u001F\u007F]/;
+const SAFE_ATTACHMENT_SCAN_STATUSES = new Set(['clean', 'disabled', 'size_skipped']);
 
 const insecureMailTransportAllowed =
   env.allowInsecureMailTransport || env.nodeEnv === 'development' || env.nodeEnv === 'test';
@@ -319,8 +582,344 @@ const estimateBase64PayloadBytes = (value: string): number | null => {
   return ((normalized.length / 4) * 3) - padding;
 };
 
+const normalizeIdentityDisplayName = (value: unknown): string => {
+  const normalized = String(value ?? '').trim().replace(/\s+/g, ' ');
+  if (!normalized) {
+    throw new Error('displayName is required');
+  }
+  if (!HEADER_VALUE_PATTERN.test(normalized) || normalized.length > MAX_IDENTITY_DISPLAY_NAME_CHARS) {
+    throw new Error(`displayName is invalid (max ${MAX_IDENTITY_DISPLAY_NAME_CHARS} chars, no line breaks)`);
+  }
+  return normalized;
+};
+
+const normalizeSingleEmailAddress = (value: unknown, fieldName: string): string => {
+  const normalized = String(value ?? '').trim().toLowerCase();
+  if (!normalized) {
+    throw new Error(`${fieldName} is required`);
+  }
+  if (!EMAIL_ADDRESS_PATTERN.test(normalized)) {
+    throw new Error(`${fieldName} must be a valid email address`);
+  }
+  return normalized;
+};
+
+const normalizeOptionalReplyTo = (value: unknown): string | null => {
+  if (value === undefined || value === null || String(value).trim() === '') {
+    return null;
+  }
+  const normalized = String(value).trim();
+  if (!HEADER_VALUE_PATTERN.test(normalized) || normalized.length > MAX_IDENTITY_REPLY_TO_CHARS) {
+    throw new Error('replyTo is invalid');
+  }
+  const parsed = parseAddressList(normalized);
+  if (!parsed || parsed.length === 0) {
+    throw new Error('replyTo must include at least one valid email address');
+  }
+  return parsed.join(', ');
+};
+
+const normalizeOptionalSignature = (value: unknown): string | null => {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  const normalized = String(value);
+  if (normalized.length > MAX_IDENTITY_SIGNATURE_CHARS) {
+    throw new Error(`signature exceeds ${MAX_IDENTITY_SIGNATURE_CHARS} characters`);
+  }
+  return normalized;
+};
+
+const normalizeMailboxInput = (value: unknown, fieldName = 'mailbox'): string => {
+  const normalized = String(value ?? '').trim();
+  if (!normalized) {
+    throw new Error(`${fieldName} is required`);
+  }
+  if (normalized.length > MAX_MAILBOX_PATH_CHARS) {
+    throw new Error(`${fieldName} exceeds ${MAX_MAILBOX_PATH_CHARS} characters`);
+  }
+  if (MAILBOX_CONTROL_CHAR_PATTERN.test(normalized)) {
+    throw new Error(`${fieldName} contains invalid control characters`);
+  }
+  return normalized;
+};
+
+const normalizePersistedWatchMailboxes = (
+  value: unknown,
+  options: {
+    isGmailLike: boolean;
+    fallbackMailbox: string;
+    includeFallbackWhenEmpty?: boolean;
+  },
+): string[] => {
+  const entries = Array.isArray(value) ? value : [];
+  const normalized: string[] = [];
+  const dedupe = new Set<string>();
+  const scanLimit = Math.min(entries.length, MAX_WATCH_MAILBOX_SANITIZE_SCAN_ITEMS);
+  for (let index = 0; index < scanLimit && normalized.length < MAX_WATCH_MAILBOXES; index += 1) {
+    const entry = String(entries[index] ?? '').trim();
+    if (!entry) {
+      continue;
+    }
+    let mailbox: string;
+    try {
+      mailbox = normalizeMailboxInput(entry, 'syncSettings.watchMailboxes[]');
+    } catch {
+      continue;
+    }
+    const canonicalMailbox = options.isGmailLike
+      ? normalizeGmailMailboxPath(mailbox)
+      : mailbox;
+    if (dedupe.has(canonicalMailbox)) {
+      continue;
+    }
+    dedupe.add(canonicalMailbox);
+    normalized.push(canonicalMailbox);
+  }
+
+  if (normalized.length > 0) {
+    return normalized;
+  }
+  if (options.includeFallbackWhenEmpty === false) {
+    return [];
+  }
+  return [options.fallbackMailbox];
+};
+
+const getAttachmentScanBlock = (
+  scanStatus: unknown,
+): { statusCode: number; error: string } | null => {
+  const normalizedStatus = String(scanStatus ?? '').trim().toLowerCase();
+  if (SAFE_ATTACHMENT_SCAN_STATUSES.has(normalizedStatus)) {
+    return null;
+  }
+  if (normalizedStatus === 'infected') {
+    return { statusCode: 403, error: 'attachment blocked: malware detected' };
+  }
+  if (normalizedStatus === 'pending' || normalizedStatus === 'processing') {
+    return { statusCode: 409, error: 'attachment blocked: malware scan in progress' };
+  }
+  if (normalizedStatus === 'failed' || normalizedStatus === 'missing' || normalizedStatus === 'error') {
+    return { statusCode: 409, error: 'attachment blocked: malware scan failed' };
+  }
+  return { statusCode: 409, error: 'attachment blocked: unknown scan status' };
+};
+
 const isPlainObject = (value: unknown): value is Record<string, any> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
+
+type IncomingOAuthConnectorDraft = {
+  name: string;
+  provider: string;
+  emailAddress: string;
+  host?: string;
+  port?: number;
+  tls?: boolean;
+  authType: 'oauth2';
+  authConfig: Record<string, any>;
+  syncSettings?: Record<string, any>;
+};
+
+type OutgoingOAuthConnectorDraft = {
+  name: string;
+  provider: 'gmail';
+  fromAddress: string;
+  host?: string;
+  port?: number;
+  tlsMode: 'ssl' | 'starttls' | 'none';
+  authType: 'oauth2';
+  authConfig: Record<string, any>;
+  fromEnvelopeDefaults?: Record<string, any>;
+  sentCopyBehavior?: Record<string, any>;
+};
+
+const buildIncomingOAuthConnectorDraft = async (
+  userId: string,
+  rawDraft: unknown,
+  oauthClientId?: string,
+  oauthClientSecret?: string,
+): Promise<{ existingConnectorId?: string; draft?: IncomingOAuthConnectorDraft }> => {
+  if (!isPlainObject(rawDraft)) {
+    throw new Error('connector draft is required');
+  }
+  if (!rawDraft.name || !rawDraft.provider || !rawDraft.emailAddress) {
+    throw new Error('name, provider, emailAddress required');
+  }
+
+  const provider = String(rawDraft.provider ?? '').trim().toLowerCase();
+  const authType = String(rawDraft.authType ?? 'oauth2').trim().toLowerCase();
+  if (authType !== 'oauth2') {
+    throw new Error('oauth2 authType is required for Gmail OAuth flow');
+  }
+  const emailAddress = normalizeSingleEmailAddress(rawDraft.emailAddress, 'emailAddress');
+
+  if (rawDraft.syncSettings !== undefined && !isPlainObject(rawDraft.syncSettings)) {
+    throw new Error('syncSettings must be an object');
+  }
+  if (rawDraft.authConfig !== undefined && !isPlainObject(rawDraft.authConfig)) {
+    throw new Error('authConfig must be an object');
+  }
+
+  const parsedPort = parseOptionalPort(rawDraft.port, 'incoming connector port');
+  const normalizedImapTlsMode = normalizeTlsMode(
+    rawDraft?.syncSettings?.imapTlsMode ?? rawDraft?.syncSettings?.tlsMode,
+    'syncSettings.imapTlsMode',
+  );
+  if ((rawDraft.tls === false || normalizedImapTlsMode === 'none') && !insecureMailTransportAllowed) {
+    throw new Error('unencrypted IMAP is disabled on this server');
+  }
+  if (rawDraft.host !== undefined && rawDraft.host !== null && String(rawDraft.host).trim()) {
+    await assertSafeOutboundHost(String(rawDraft.host), { context: 'incoming connector host' });
+  }
+
+  const requestedSyncSettings = {
+    ...(rawDraft?.syncSettings ?? {}),
+    ...(normalizedImapTlsMode ? { imapTlsMode: normalizedImapTlsMode } : {}),
+  };
+  const defaultWatchMailbox = isGmailLikeConnector({
+    provider,
+    sync_settings: requestedSyncSettings,
+    syncSettings: requestedSyncSettings,
+  })
+    ? normalizeGmailMailboxPath(normalizeMailboxInput(env.sync.defaultMailbox, 'DEFAULT_MAILBOX'))
+    : normalizeMailboxInput(env.sync.defaultMailbox, 'DEFAULT_MAILBOX');
+  let watchMailboxes = parseTrimmedStringArrayWithCap(
+    requestedSyncSettings?.watchMailboxes,
+    'syncSettings.watchMailboxes',
+    MAX_WATCH_MAILBOXES,
+  );
+  if (watchMailboxes.length === 0) {
+    watchMailboxes = [defaultWatchMailbox];
+  } else {
+    watchMailboxes = watchMailboxes.map((mailbox) => normalizeMailboxInput(mailbox, 'syncSettings.watchMailboxes[]'));
+  }
+
+  const syncSettings = {
+    ...requestedSyncSettings,
+    watchMailboxes: Array.from(new Set(
+      watchMailboxes.map((mailbox: string) => isGmailLikeConnector({
+        provider,
+        sync_settings: requestedSyncSettings,
+        syncSettings: requestedSyncSettings,
+      })
+        ? normalizeGmailMailboxPath(mailbox)
+        : mailbox),
+    )),
+  };
+  const supportsOauthIncoming = isGmailAuthConnector({
+    provider,
+    sync_settings: syncSettings,
+    syncSettings: syncSettings,
+  });
+  if (!supportsOauthIncoming) {
+    throw new Error('oauth2 incoming auth is only supported for Gmail connectors');
+  }
+
+  const expectedGmailMode = String(Boolean(syncSettings?.gmailImap));
+  const existing = await query<{ id: string }>(
+    `SELECT id
+       FROM incoming_connectors
+      WHERE user_id = $1
+       AND provider = $2
+        AND email_address = $3
+        AND COALESCE(auth_config->>'authType', 'password') = 'oauth2'
+        AND COALESCE(sync_settings->>'gmailImap', 'false') = $4
+      ORDER BY created_at DESC
+      LIMIT 1`,
+    [userId, provider, emailAddress, expectedGmailMode],
+  );
+  if (existing.rows.length > 0) {
+    return { existingConnectorId: existing.rows[0].id };
+  }
+
+  return {
+    draft: {
+      name: String(rawDraft.name),
+      provider,
+      emailAddress,
+      host: rawDraft.host !== undefined ? String(rawDraft.host) : undefined,
+      port: parsedPort,
+      tls: rawDraft.tls ?? true,
+      authType: 'oauth2',
+      authConfig: {
+        authType: 'oauth2',
+        ...(oauthClientId ? { oauthClientId } : {}),
+        ...(oauthClientSecret ? { oauthClientSecret } : {}),
+      },
+      syncSettings,
+    },
+  };
+};
+
+const buildOutgoingOAuthConnectorDraft = async (
+  userId: string,
+  rawDraft: unknown,
+  oauthClientId?: string,
+  oauthClientSecret?: string,
+): Promise<{ existingConnectorId?: string; draft?: OutgoingOAuthConnectorDraft }> => {
+  if (!isPlainObject(rawDraft)) {
+    throw new Error('connector draft is required');
+  }
+  if (!rawDraft.name || !rawDraft.provider || !rawDraft.fromAddress) {
+    throw new Error('name, provider, fromAddress required');
+  }
+
+  const provider = String(rawDraft.provider ?? '').trim().toLowerCase();
+  if (provider !== 'gmail') {
+    throw new Error('oauth2 outgoing auth is only supported for provider=gmail');
+  }
+  const authType = String(rawDraft.authType ?? 'oauth2').trim().toLowerCase();
+  if (authType !== 'oauth2') {
+    throw new Error('oauth2 authType is required for Gmail OAuth flow');
+  }
+  const fromAddress = normalizeSingleEmailAddress(rawDraft.fromAddress, 'fromAddress');
+  if (rawDraft.authConfig !== undefined && !isPlainObject(rawDraft.authConfig)) {
+    throw new Error('authConfig must be an object');
+  }
+
+  const parsedPort = parseOptionalPort(rawDraft.port, 'outgoing connector port');
+  const tlsMode = normalizeTlsMode(rawDraft.tlsMode, 'tlsMode') ?? 'starttls';
+  if (tlsMode === 'none' && !insecureMailTransportAllowed) {
+    throw new Error('unencrypted SMTP is disabled on this server');
+  }
+  if (rawDraft.host !== undefined && rawDraft.host !== null && String(rawDraft.host).trim()) {
+    await assertSafeOutboundHost(String(rawDraft.host), { context: 'outgoing connector host' });
+  }
+
+  const existing = await query<{ id: string }>(
+    `SELECT id
+       FROM outgoing_connectors
+      WHERE user_id = $1
+        AND provider = 'gmail'
+        AND from_address = $2
+        AND COALESCE(auth_config->>'authType', 'password') = 'oauth2'
+      ORDER BY created_at DESC
+      LIMIT 1`,
+    [userId, fromAddress],
+  );
+  if (existing.rows.length > 0) {
+    return { existingConnectorId: existing.rows[0].id };
+  }
+
+  return {
+    draft: {
+      name: String(rawDraft.name),
+      provider: 'gmail',
+      fromAddress,
+      host: rawDraft.host !== undefined ? String(rawDraft.host) : undefined,
+      port: parsedPort,
+      tlsMode,
+      authType: 'oauth2',
+      authConfig: {
+        authType: 'oauth2',
+        ...(oauthClientId ? { oauthClientId } : {}),
+        ...(oauthClientSecret ? { oauthClientSecret } : {}),
+      },
+      fromEnvelopeDefaults: isPlainObject(rawDraft.fromEnvelopeDefaults) ? rawDraft.fromEnvelopeDefaults : {},
+      sentCopyBehavior: isPlainObject(rawDraft.sentCopyBehavior) ? rawDraft.sentCopyBehavior : {},
+    },
+  };
+};
 
 const toPublicAuthConfig = (authConfig: unknown) => {
   const source = (authConfig && typeof authConfig === 'object')
@@ -418,7 +1017,7 @@ const verifyPubSubPushToken = async (
   if (!payload.iss || !GOOGLE_IDENTITY_ISSUERS.has(payload.iss)) {
     throw new Error('invalid pubsub oidc issuer');
   }
-  if (payload.email_verified === false) {
+  if (payload.email_verified !== true) {
     throw new Error('pubsub oidc email is not verified');
   }
   if (payload.aud && !audience.includes(String(payload.aud))) {
@@ -452,8 +1051,8 @@ const decodePubSubPushBody = (body: any): { emailAddress: string; historyId?: st
   }
 
   const payload = JSON.parse(decoded) as { emailAddress?: string; historyId?: string | number };
-  const emailAddress = String(payload.emailAddress ?? '').trim();
-  if (!emailAddress) {
+  const emailAddress = String(payload.emailAddress ?? '').trim().toLowerCase();
+  if (!emailAddress || !EMAIL_ADDRESS_PATTERN.test(emailAddress)) {
     return null;
   }
 
@@ -474,6 +1073,37 @@ const buildGmailWatchLabelIds = (watchMailboxes: string[]) => {
   return ids.length > 0 ? ids : ['INBOX'];
 };
 
+const GMAIL_DEFAULT_SYNC_TARGETS = ['INBOX', 'SENT', 'DRAFT', 'STARRED', 'TRASH', 'SPAM'] as const;
+
+const buildInitialSyncTargets = (
+  connector: { provider?: unknown; sync_settings?: Record<string, any> | null; syncSettings?: Record<string, any> | null } | null,
+  discoveredMailboxes: string[],
+  fallbackMailbox: string,
+) => {
+  const normalizedDiscovered = Array.from(new Set(
+    (discoveredMailboxes ?? [])
+      .map((mailbox) => String(mailbox ?? '').trim())
+      .filter(Boolean),
+  ));
+
+  if (!isGmailLikeConnector(connector ?? {})) {
+    return normalizedDiscovered.length > 0 ? normalizedDiscovered : [fallbackMailbox];
+  }
+
+  const merged = new Set<string>();
+  for (const mailbox of normalizedDiscovered) {
+    merged.add(normalizeGmailMailboxPath(mailbox));
+  }
+  for (const mailbox of GMAIL_DEFAULT_SYNC_TARGETS) {
+    merged.add(normalizeGmailMailboxPath(mailbox));
+  }
+  if (merged.size === 0) {
+    merged.add(normalizeGmailMailboxPath(fallbackMailbox));
+  }
+
+  return Array.from(merged);
+};
+
 export const registerRoutes = async (app: FastifyInstance) => {
   const getUserId = (request: any) => {
     if (!request.user?.id) {
@@ -484,9 +1114,24 @@ export const registerRoutes = async (app: FastifyInstance) => {
     return request.user.id;
   };
 
-  app.get('/api/health', async () => ({ status: 'ok', seaweed: { bucket: env.seaweed.bucket } }));
+  app.get('/api/health', async () => ({ status: 'ok' }));
+
+  app.get('/api/session', async (req, reply) => {
+    const user = (req as any).user;
+    if (!user?.id) {
+      return reply.code(401).send({ error: 'missing user context' });
+    }
+    return {
+      id: String(user.id),
+      email: String(user.email ?? ''),
+      name: String(user.name ?? ''),
+    };
+  });
 
   app.post('/api/admin/users', async (req, reply) => {
+    if (!env.allowAdminUserBootstrap) {
+      return reply.code(404).send({ error: 'not found' });
+    }
     const body = req.body as any;
     if (!body?.email || !body?.name) {
       return reply.code(400).send({ error: 'email and name required' });
@@ -551,6 +1196,12 @@ export const registerRoutes = async (app: FastifyInstance) => {
 
     const normalizedAuthType = String(body?.authType ?? 'password').toLowerCase();
     const provider = String(body.provider ?? '').trim().toLowerCase();
+    let normalizedEmailAddress: string;
+    try {
+      normalizedEmailAddress = normalizeSingleEmailAddress(body.emailAddress, 'emailAddress');
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : 'invalid emailAddress' });
+    }
     if (body.syncSettings !== undefined && !isPlainObject(body.syncSettings)) {
       return reply.code(400).send({ error: 'syncSettings must be an object' });
     }
@@ -583,13 +1234,23 @@ export const registerRoutes = async (app: FastifyInstance) => {
       sync_settings: requestedSyncSettings,
       syncSettings: requestedSyncSettings,
     })
-      ? normalizeGmailMailboxPath(env.sync.defaultMailbox)
-      : env.sync.defaultMailbox;
-    const watchMailboxes = Array.isArray(requestedSyncSettings?.watchMailboxes)
-      ? requestedSyncSettings.watchMailboxes
-        .map((value: unknown) => String(value).trim())
-        .filter(Boolean)
-      : [defaultWatchMailbox];
+      ? normalizeGmailMailboxPath(normalizeMailboxInput(env.sync.defaultMailbox, 'DEFAULT_MAILBOX'))
+      : normalizeMailboxInput(env.sync.defaultMailbox, 'DEFAULT_MAILBOX');
+    let watchMailboxes: string[];
+    try {
+      watchMailboxes = parseTrimmedStringArrayWithCap(
+        requestedSyncSettings?.watchMailboxes,
+        'syncSettings.watchMailboxes',
+        MAX_WATCH_MAILBOXES,
+      );
+      if (watchMailboxes.length === 0) {
+        watchMailboxes = [defaultWatchMailbox];
+      } else {
+        watchMailboxes = watchMailboxes.map((mailbox) => normalizeMailboxInput(mailbox, 'syncSettings.watchMailboxes[]'));
+      }
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : 'invalid syncSettings.watchMailboxes' });
+    }
     const syncSettings = {
       ...requestedSyncSettings,
       watchMailboxes: Array.from(new Set(
@@ -619,11 +1280,11 @@ export const registerRoutes = async (app: FastifyInstance) => {
         `SELECT id
            FROM incoming_connectors
           WHERE user_id = $1
-            AND provider = $2
+           AND provider = $2
             AND email_address = $3
             AND COALESCE(auth_config->>'authType', 'password') = $4
             AND COALESCE(sync_settings->>'gmailImap', 'false') = $5`,
-        [userId, provider, String(body.emailAddress), normalizedAuthType, expectedGmailMode],
+        [userId, provider, normalizedEmailAddress, normalizedAuthType, expectedGmailMode],
       );
 
       if (existing.rows.length > 0) {
@@ -634,7 +1295,7 @@ export const registerRoutes = async (app: FastifyInstance) => {
     const result = await createIncomingConnector(userId, {
       name: String(body.name),
       provider,
-      emailAddress: String(body.emailAddress),
+      emailAddress: normalizedEmailAddress,
       host: body.host,
       port: parsedPort,
       tls: body.tls ?? true,
@@ -642,6 +1303,11 @@ export const registerRoutes = async (app: FastifyInstance) => {
       authConfig: body.authConfig ?? {},
       syncSettings,
     });
+    setActiveMailboxConnectorCache(
+      userId,
+      result.id,
+      isGmailLikeConnector({ provider, sync_settings: syncSettings, syncSettings }),
+    );
 
     if (normalizedAuthType !== 'oauth2') {
       const firstMailbox = syncSettings.watchMailboxes?.[0] ?? defaultWatchMailbox;
@@ -664,6 +1330,12 @@ export const registerRoutes = async (app: FastifyInstance) => {
 
     const normalizedProvider = String(body.provider ?? '').trim().toLowerCase();
     const authType = String(body.authType ?? (normalizedProvider === 'gmail' ? 'oauth2' : 'password')).toLowerCase();
+    let normalizedFromAddress: string;
+    try {
+      normalizedFromAddress = normalizeSingleEmailAddress(body.fromAddress, 'fromAddress');
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : 'invalid fromAddress' });
+    }
     if (body.authConfig !== undefined && !isPlainObject(body.authConfig)) {
       return reply.code(400).send({ error: 'authConfig must be an object' });
     }
@@ -692,7 +1364,7 @@ export const registerRoutes = async (app: FastifyInstance) => {
             AND provider = $2
             AND from_address = $3
             AND COALESCE(auth_config->>'authType', 'password') = $4`,
-        [userId, normalizedProvider, String(body.fromAddress), authType],
+        [userId, normalizedProvider, normalizedFromAddress, authType],
       );
 
       if (existing.rows.length > 0) {
@@ -704,7 +1376,7 @@ export const registerRoutes = async (app: FastifyInstance) => {
       try {
         await verifyOutgoingConnectorCredentials({
           provider: normalizedProvider,
-          fromAddress: String(body.fromAddress),
+          fromAddress: normalizedFromAddress,
           host: body.host ?? null,
           port: parsedPort ?? null,
           tlsMode: normalizedTlsMode,
@@ -720,7 +1392,7 @@ export const registerRoutes = async (app: FastifyInstance) => {
     const result = await createOutgoingConnector(userId, {
       name: String(body.name),
       provider: normalizedProvider,
-      fromAddress: String(body.fromAddress),
+      fromAddress: normalizedFromAddress,
       host: body.host,
       port: parsedPort,
       tlsMode: normalizedTlsMode,
@@ -745,6 +1417,27 @@ export const registerRoutes = async (app: FastifyInstance) => {
     }
     if (body.authConfig !== undefined && body.authConfig !== null && !isPlainObject(body.authConfig)) {
       return reply.code(400).send({ error: 'authConfig must be an object' });
+    }
+    let normalizedEmailAddress: string | undefined;
+    let normalizedWatchMailboxes: string[] | undefined;
+    try {
+      if (body.emailAddress !== undefined) {
+        normalizedEmailAddress = normalizeSingleEmailAddress(body.emailAddress, 'emailAddress');
+      }
+      if (
+        body.syncSettings !== undefined
+        && body.syncSettings !== null
+        && Object.prototype.hasOwnProperty.call(body.syncSettings, 'watchMailboxes')
+      ) {
+        const parsedWatchMailboxes = parseTrimmedStringArrayWithCap(
+          body.syncSettings.watchMailboxes,
+          'syncSettings.watchMailboxes',
+          MAX_WATCH_MAILBOXES,
+        );
+        normalizedWatchMailboxes = parsedWatchMailboxes.map((mailbox) => normalizeMailboxInput(mailbox, 'syncSettings.watchMailboxes[]'));
+      }
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : 'invalid incoming connector payload' });
     }
 
     const existing = await getIncomingConnector(userId, connectorId);
@@ -773,14 +1466,30 @@ export const registerRoutes = async (app: FastifyInstance) => {
     if (mergedHost !== undefined && mergedHost !== null && String(mergedHost).trim()) {
       await assertSafeOutboundHost(String(mergedHost), { context: 'incoming connector host' });
     }
-    const mergedSyncSettings = {
+    const provider = String(existing.provider ?? '').trim().toLowerCase();
+    const mergedSyncSettingsBase = {
       ...(body.syncSettings ?? existing.sync_settings ?? existing.syncSettings ?? {}),
       ...(normalizedImapTlsMode ? { imapTlsMode: normalizedImapTlsMode } : {}),
+    };
+    const canonicalWatchMailboxes = normalizedWatchMailboxes
+      ? Array.from(new Set(
+          normalizedWatchMailboxes.map((mailbox) => isGmailLikeConnector({
+            provider,
+            sync_settings: mergedSyncSettingsBase,
+            syncSettings: mergedSyncSettingsBase,
+          })
+            ? normalizeGmailMailboxPath(mailbox)
+            : mailbox),
+        ))
+      : undefined;
+    const mergedSyncSettings = {
+      ...mergedSyncSettingsBase,
+      ...(canonicalWatchMailboxes ? { watchMailboxes: canonicalWatchMailboxes } : {}),
     };
     const mergedAuthConfig = body.authConfig ?? existing.auth_config ?? existing.authConfig ?? {};
     const mergedAuthType = String(mergedAuthConfig?.authType ?? 'password').toLowerCase();
     const supportsOauthIncoming = isGmailAuthConnector({
-      provider: String(existing.provider ?? '').trim().toLowerCase(),
+      provider,
       sync_settings: mergedSyncSettings,
       syncSettings: mergedSyncSettings,
     });
@@ -792,7 +1501,7 @@ export const registerRoutes = async (app: FastifyInstance) => {
 
     await updateIncomingConnector(userId, connectorId, {
       name: body.name,
-      emailAddress: body.emailAddress,
+      emailAddress: normalizedEmailAddress ?? body.emailAddress,
       host: body.host,
       port: parsedPort,
       tls: body.tls,
@@ -802,13 +1511,16 @@ export const registerRoutes = async (app: FastifyInstance) => {
         : {
             ...(body.syncSettings ?? {}),
             ...(normalizedImapTlsMode ? { imapTlsMode: normalizedImapTlsMode } : {}),
+            ...(canonicalWatchMailboxes ? { watchMailboxes: canonicalWatchMailboxes } : {}),
           },
       status: body.status,
     });
     const updated = await getIncomingConnector(userId, connectorId);
     if (!updated) {
+      clearActiveMailboxConnectorCache(userId, connectorId);
       return reply.code(404).send({ error: 'connector not found' });
     }
+    setActiveMailboxConnectorCache(userId, connectorId, isGmailLikeConnector(updated));
     return sanitizeConnectorForResponse(updated);
   });
 
@@ -822,6 +1534,14 @@ export const registerRoutes = async (app: FastifyInstance) => {
     }
     if (body.authConfig !== undefined && body.authConfig !== null && !isPlainObject(body.authConfig)) {
       return reply.code(400).send({ error: 'authConfig must be an object' });
+    }
+    let normalizedFromAddress: string | undefined;
+    try {
+      if (body.fromAddress !== undefined) {
+        normalizedFromAddress = normalizeSingleEmailAddress(body.fromAddress, 'fromAddress');
+      }
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : 'invalid fromAddress' });
     }
 
     const existing = await getOutgoingConnector(userId, connectorId);
@@ -865,7 +1585,7 @@ export const registerRoutes = async (app: FastifyInstance) => {
       try {
         await verifyOutgoingConnectorCredentials({
           provider: String(existing.provider ?? ''),
-          fromAddress: String(body.fromAddress ?? existing.fromAddress ?? existing.from_address ?? ''),
+          fromAddress: normalizedFromAddress ?? String(existing.fromAddress ?? existing.from_address ?? ''),
           host: body.host !== undefined ? body.host : (existing.host ?? null),
           port: parsedPort !== undefined ? parsedPort : (existing.port ?? null),
           tlsMode: normalizedTlsMode ?? existing.tlsMode ?? existing.tls_mode ?? 'starttls',
@@ -880,7 +1600,7 @@ export const registerRoutes = async (app: FastifyInstance) => {
 
     await updateOutgoingConnector(userId, connectorId, {
       name: body.name,
-      fromAddress: body.fromAddress,
+      fromAddress: normalizedFromAddress ?? body.fromAddress,
       host: body.host,
       port: parsedPort,
       tlsMode: normalizedTlsMode,
@@ -948,20 +1668,40 @@ export const registerRoutes = async (app: FastifyInstance) => {
     const connectorId = String((req.params as any).connectorId);
     const connector = await getIncomingConnector(userId, connectorId);
     if (connector) {
-      const configuredWatchMailboxes = Array.isArray(connector.sync_settings?.watchMailboxes)
-        ? connector.sync_settings.watchMailboxes.map((value: unknown) => String(value || '').trim()).filter(Boolean)
-        : [];
-      const fallbackMailbox = isGmailLikeConnector(connector)
-        ? normalizeGmailMailboxPath(env.sync.defaultMailbox)
-        : env.sync.defaultMailbox;
-      const watchMailboxes = configuredWatchMailboxes.length > 0
-        ? configuredWatchMailboxes
-        : [fallbackMailbox];
-      for (const mailbox of watchMailboxes) {
-        await stopIncomingConnectorIdleWatch(userId, connectorId, mailbox).catch(() => undefined);
-      }
+      await updateIncomingConnector(userId, connectorId, { status: 'deleting' });
+      const connectorIsGmailLike = isGmailLikeConnector(connector);
+      const fallbackMailbox = connectorIsGmailLike
+        ? normalizeGmailMailboxPath(normalizeMailboxInput(env.sync.defaultMailbox, 'DEFAULT_MAILBOX'))
+        : normalizeMailboxInput(env.sync.defaultMailbox, 'DEFAULT_MAILBOX');
+      const watchMailboxes = normalizePersistedWatchMailboxes(
+        connector.sync_settings?.watchMailboxes,
+        {
+          isGmailLike: connectorIsGmailLike,
+          fallbackMailbox,
+        },
+      );
+      const syncStateMailboxes = await query<{ mailbox: string }>(
+        `SELECT mailbox
+           FROM sync_states
+          WHERE incoming_connector_id = $1`,
+        [connectorId],
+      ).then((result) => result.rows.map((row) => String(row.mailbox || '').trim()).filter(Boolean))
+        .catch(() => []);
+      const cancellationTargets = Array.from(new Set([...watchMailboxes, ...syncStateMailboxes]));
+      await Promise.allSettled(
+        cancellationTargets.map((mailbox: string) =>
+          requestSyncCancellation(userId, connectorId, mailbox),
+        ),
+      );
+      await Promise.allSettled(
+        watchMailboxes.map((mailbox: string) =>
+          stopIncomingConnectorIdleWatch(userId, connectorId, mailbox),
+        ),
+      );
+      await purgeIncomingConnectorSyncJobs(connectorId).catch(() => ({ removed: 0 }));
     }
     await deleteIncomingConnector(userId, connectorId);
+    clearActiveMailboxConnectorCache(userId, connectorId);
     return { status: 'deleted', id: connectorId };
   });
 
@@ -979,14 +1719,27 @@ export const registerRoutes = async (app: FastifyInstance) => {
       return reply.code(400).send({ error: 'displayName, emailAddress, outgoingConnectorId required' });
     }
 
+    let displayName: string;
+    let emailAddress: string;
+    let signature: string | null;
+    let replyTo: string | null;
+    try {
+      displayName = normalizeIdentityDisplayName(body.displayName);
+      emailAddress = normalizeSingleEmailAddress(body.emailAddress, 'emailAddress');
+      signature = normalizeOptionalSignature(body.signature);
+      replyTo = normalizeOptionalReplyTo(body.replyTo);
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : 'invalid identity payload' });
+    }
+
     const created = await createIdentity(
       userId,
-      String(body.displayName),
-      String(body.emailAddress),
+      displayName,
+      emailAddress,
       String(body.outgoingConnectorId),
-      body.signature ?? null,
+      signature,
       body.sentToIncomingConnectorId ?? null,
-      body.replyTo ?? null,
+      replyTo,
     );
     return created;
   });
@@ -1014,13 +1767,34 @@ export const registerRoutes = async (app: FastifyInstance) => {
       return reply.code(400).send({ error: 'request body required' });
     }
 
+    let displayName: string | undefined;
+    let emailAddress: string | undefined;
+    let signature: string | null | undefined;
+    let replyTo: string | null | undefined;
+    try {
+      if (body.displayName !== undefined) {
+        displayName = normalizeIdentityDisplayName(body.displayName);
+      }
+      if (body.emailAddress !== undefined) {
+        emailAddress = normalizeSingleEmailAddress(body.emailAddress, 'emailAddress');
+      }
+      if (body.signature !== undefined) {
+        signature = normalizeOptionalSignature(body.signature);
+      }
+      if (body.replyTo !== undefined) {
+        replyTo = normalizeOptionalReplyTo(body.replyTo);
+      }
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : 'invalid identity payload' });
+    }
+
     await updateIdentity(userId, identityId, {
-      displayName: body.displayName,
-      emailAddress: body.emailAddress,
-      signature: body.signature,
+      displayName,
+      emailAddress,
+      signature,
       outgoingConnectorId: body.outgoingConnectorId ?? undefined,
       sentToIncomingConnectorId: body.sentToIncomingConnectorId ?? undefined,
-      replyTo: body.replyTo,
+      replyTo,
     });
     const refreshed = await getIdentity(userId, identityId);
     if (!refreshed) {
@@ -1047,11 +1821,13 @@ export const registerRoutes = async (app: FastifyInstance) => {
     if (!body?.name) {
       return reply.code(400).send({ error: 'name required' });
     }
-    return createUserLabel({
+    const created = await createUserLabel({
       userId,
       name: String(body.name),
       key: body.key,
     });
+    clearSearchCachesForUser(userId);
+    return created;
   });
 
   app.get('/api/labels/:labelId', async (req, reply) => {
@@ -1076,6 +1852,7 @@ export const registerRoutes = async (app: FastifyInstance) => {
     if (!updated) {
       return reply.code(404).send({ error: 'label not found' });
     }
+    clearSearchCachesForUser(userId);
     return updated;
   });
 
@@ -1083,6 +1860,7 @@ export const registerRoutes = async (app: FastifyInstance) => {
     const userId = getUserId(req);
     const labelId = String((req.params as any).labelId);
     await archiveLabel(userId, labelId);
+    clearSearchCachesForUser(userId);
     return { status: 'deleted', id: labelId };
   });
 
@@ -1108,10 +1886,20 @@ export const registerRoutes = async (app: FastifyInstance) => {
       return reply.code(400).send({ error: 'request body required' });
     }
 
-    const addLabelIds = Array.isArray(body.addLabelIds) ? body.addLabelIds : [];
-    const removeLabelIds = Array.isArray(body.removeLabelIds) ? body.removeLabelIds : [];
-    const addLabelKeys = Array.isArray(body.addLabelKeys) ? body.addLabelKeys : [];
-    const removeLabelKeys = Array.isArray(body.removeLabelKeys) ? body.removeLabelKeys : [];
+    let addLabelIds: string[];
+    let removeLabelIds: string[];
+    let addLabelKeys: string[];
+    let removeLabelKeys: string[];
+    try {
+      addLabelIds = parseTrimmedStringArrayWithCap(body.addLabelIds, 'addLabelIds', MAX_LABEL_MUTATION_ITEMS);
+      removeLabelIds = parseTrimmedStringArrayWithCap(body.removeLabelIds, 'removeLabelIds', MAX_LABEL_MUTATION_ITEMS);
+      addLabelKeys = parseTrimmedStringArrayWithCap(body.addLabelKeys, 'addLabelKeys', MAX_LABEL_MUTATION_ITEMS);
+      removeLabelKeys = parseTrimmedStringArrayWithCap(body.removeLabelKeys, 'removeLabelKeys', MAX_LABEL_MUTATION_ITEMS);
+      assertUuidList(addLabelIds, 'addLabelIds');
+      assertUuidList(removeLabelIds, 'removeLabelIds');
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : 'invalid label mutation payload' });
+    }
 
     if (addLabelIds.length === 0 && removeLabelIds.length === 0 && addLabelKeys.length === 0 && removeLabelKeys.length === 0) {
       return reply.code(400).send({ error: 'labels required' });
@@ -1129,6 +1917,7 @@ export const registerRoutes = async (app: FastifyInstance) => {
     if (removeLabelKeys.length > 0) {
       await removeLabelsFromMessageByKey(userId, messageId, removeLabelKeys);
     }
+    clearSearchCachesForUser(userId);
     return listMessageLabels(userId, messageId);
   });
 
@@ -1141,6 +1930,7 @@ export const registerRoutes = async (app: FastifyInstance) => {
       return reply.code(404).send({ error: 'message not found' });
     }
     await removeLabelsFromMessage(userId, messageId, [labelId]);
+    clearSearchCachesForUser(userId);
     return { status: 'deleted', messageId, labelId };
   });
 
@@ -1149,14 +1939,94 @@ export const registerRoutes = async (app: FastifyInstance) => {
     const body = req.body as any;
     const type = body?.type;
     const connectorId = body?.connectorId;
+    const connectorDraft = body?.connector;
     const clientId = body?.oauthClientId;
     const clientSecret = body?.oauthClientSecret;
 
-    if (!type || !connectorId) {
-      return reply.code(400).send({ error: 'type (incoming|outgoing) and connectorId required' });
+    if (!type) {
+      return reply.code(400).send({ error: 'type (incoming|outgoing) required' });
+    }
+    if (type !== 'incoming' && type !== 'outgoing') {
+      return reply.code(400).send({ error: 'type must be incoming or outgoing' });
+    }
+    const normalizedClientId = clientId === undefined || clientId === null
+      ? undefined
+      : String(clientId).trim();
+    const normalizedClientSecret = clientSecret === undefined || clientSecret === null
+      ? undefined
+      : String(clientSecret).trim();
+    if (normalizedClientId && normalizedClientId.length > MAX_OAUTH_CLIENT_ID_CHARS) {
+      return reply.code(400).send({ error: `oauthClientId exceeds ${MAX_OAUTH_CLIENT_ID_CHARS} characters` });
+    }
+    if (normalizedClientSecret && normalizedClientSecret.length > MAX_OAUTH_CLIENT_SECRET_CHARS) {
+      return reply.code(400).send({ error: `oauthClientSecret exceeds ${MAX_OAUTH_CLIENT_SECRET_CHARS} characters` });
     }
 
-    const connectorType = type === 'incoming' ? 'incoming' : 'outgoing';
+    if (!connectorId && !connectorDraft) {
+      return reply.code(400).send({ error: 'connectorId or connector draft is required' });
+    }
+
+    if (!connectorId && connectorDraft) {
+      try {
+        if (type === 'incoming') {
+          const built = await buildIncomingOAuthConnectorDraft(
+            userId,
+            connectorDraft,
+            normalizedClientId,
+            normalizedClientSecret,
+          );
+          if (built.existingConnectorId) {
+            const url = await getGoogleAuthorizeUrl(
+              type,
+              built.existingConnectorId,
+              normalizedClientId,
+              normalizedClientSecret,
+              userId,
+            );
+            return { authorizeUrl: url };
+          }
+          const url = await getGoogleAuthorizeUrl(
+            type,
+            undefined,
+            normalizedClientId,
+            normalizedClientSecret,
+            userId,
+            built.draft,
+          );
+          return { authorizeUrl: url };
+        }
+
+        const built = await buildOutgoingOAuthConnectorDraft(
+          userId,
+          connectorDraft,
+          normalizedClientId,
+          normalizedClientSecret,
+        );
+        if (built.existingConnectorId) {
+          const url = await getGoogleAuthorizeUrl(
+            type,
+            built.existingConnectorId,
+            normalizedClientId,
+            normalizedClientSecret,
+            userId,
+          );
+          return { authorizeUrl: url };
+        }
+        const url = await getGoogleAuthorizeUrl(
+          type,
+          undefined,
+          normalizedClientId,
+          normalizedClientSecret,
+          userId,
+          built.draft,
+        );
+        return { authorizeUrl: url };
+      } catch (error) {
+        return reply.code(400).send({ error: error instanceof Error ? error.message : 'invalid connector draft' });
+      }
+    }
+
+    const connectorType = type;
     const connector = connectorType === 'incoming'
       ? await getIncomingConnector(userId, connectorId)
       : await getOutgoingConnector(userId, connectorId);
@@ -1169,12 +2039,12 @@ export const registerRoutes = async (app: FastifyInstance) => {
       return reply.code(400).send({ error: 'OAuth flow is only valid for Gmail connectors' });
     }
 
-    if (clientId || clientSecret) {
+    if (normalizedClientId || normalizedClientSecret) {
       const existingAuth = connector.authConfig ?? {};
       const nextAuth = {
         ...existingAuth,
-        ...(clientId ? { oauthClientId: clientId } : {}),
-        ...(clientSecret ? { oauthClientSecret: clientSecret } : {}),
+        ...(normalizedClientId ? { oauthClientId: normalizedClientId } : {}),
+        ...(normalizedClientSecret ? { oauthClientSecret: normalizedClientSecret } : {}),
       };
 
       if (connectorType === 'incoming') {
@@ -1189,8 +2059,8 @@ export const registerRoutes = async (app: FastifyInstance) => {
     const url = await getGoogleAuthorizeUrl(
       connectorType,
       connectorId,
-      connector.authConfig?.oauthClientId ?? clientId,
-      connector.authConfig?.oauthClientSecret ?? clientSecret,
+      connector.authConfig?.oauthClientId ?? normalizedClientId,
+      connector.authConfig?.oauthClientSecret ?? normalizedClientSecret,
       userId,
     );
     return { authorizeUrl: url };
@@ -1216,8 +2086,20 @@ export const registerRoutes = async (app: FastifyInstance) => {
     if (!code || !state) {
       return redirectToFrontend('error', { error: 'missing code or state' });
     }
+    const normalizedCode = String(code).trim();
+    const normalizedState = String(state).trim();
+    if (
+      !normalizedCode
+      || !normalizedState
+      || normalizedCode.length > MAX_OAUTH_CODE_CHARS
+      || normalizedState.length > MAX_OAUTH_STATE_CHARS
+      || !HEADER_VALUE_PATTERN.test(normalizedCode)
+      || !HEADER_VALUE_PATTERN.test(normalizedState)
+    ) {
+      return redirectToFrontend('error', { error: 'invalid code or state' });
+    }
 
-    const payload = await consumeOAuthState(state);
+    const payload = await consumeOAuthState(normalizedState);
     if (!payload) {
       return redirectToFrontend('error', { error: 'invalid or expired oauth state' });
     }
@@ -1227,22 +2109,47 @@ export const registerRoutes = async (app: FastifyInstance) => {
       return redirectToFrontend('error', { error: 'oauth state missing user context' });
     }
 
-    const { type, connectorId } = payload;
+    const { type } = payload;
+    let connectorId = payload.connectorId;
+    if (type !== 'incoming' && type !== 'outgoing') {
+      return redirectToFrontend('error', { error: 'invalid oauth state payload' });
+    }
+    const connectorDraft = payload.connectorPayload;
+    let connectorRow: any = null;
 
-    const connectorTable = type === 'incoming' ? 'incoming_connectors' : 'outgoing_connectors';
-    const connectorSelectColumns = type === 'incoming'
-      ? 'auth_config, user_id, provider, sync_settings'
-      : 'auth_config, user_id, provider, NULL::jsonb AS sync_settings';
-    const whereClause = 'WHERE id = $1 AND user_id = $2';
-    const params = [connectorId, targetUserId];
-
-    const row = await query<any>(`SELECT ${connectorSelectColumns} FROM ${connectorTable} ${whereClause}`, params);
-    if (row.rows.length === 0) {
-      return redirectToFrontend('error', { error: `${type} connector not found` });
+    if (connectorId) {
+      const row = type === 'incoming'
+        ? await query<any>(
+          `SELECT auth_config, user_id, provider, sync_settings, email_address, name
+             FROM incoming_connectors
+            WHERE id = $1 AND user_id = $2`,
+          [connectorId, targetUserId],
+        )
+        : await query<any>(
+          `SELECT auth_config, user_id, provider, NULL::jsonb AS sync_settings
+             FROM outgoing_connectors
+            WHERE id = $1 AND user_id = $2`,
+          [connectorId, targetUserId],
+        );
+      if (row.rows.length === 0) {
+        return redirectToFrontend('error', { error: `${type} connector not found` });
+      }
+      connectorRow = row.rows[0];
+    } else {
+      if (!isPlainObject(connectorDraft)) {
+        return redirectToFrontend('error', { error: 'oauth state missing connector draft' });
+      }
+      connectorRow = {
+        auth_config: isPlainObject(connectorDraft.authConfig) ? connectorDraft.authConfig : {},
+        provider: connectorDraft.provider,
+        sync_settings: isPlainObject(connectorDraft.syncSettings) ? connectorDraft.syncSettings : {},
+        email_address: connectorDraft.emailAddress,
+        name: connectorDraft.name,
+      };
     }
 
-    const existingAuth = row.rows[0]?.auth_config || {};
-    const tokens = await exchangeCodeForTokens(code, existingAuth.oauthClientId, existingAuth.oauthClientSecret);
+    const existingAuth = connectorRow?.auth_config || {};
+    const tokens = await exchangeCodeForTokens(normalizedCode, existingAuth.oauthClientId, existingAuth.oauthClientSecret);
     const nextAuth = {
       ...(existingAuth || {}),
       authType: 'oauth2',
@@ -1252,37 +2159,112 @@ export const registerRoutes = async (app: FastifyInstance) => {
       scope: tokens.scope,
     };
 
+    if (!connectorId) {
+      if (!isPlainObject(connectorDraft)) {
+        return redirectToFrontend('error', { error: 'oauth state missing connector draft' });
+      }
+      if (type === 'incoming') {
+        const created = await createIncomingConnector(targetUserId, {
+          name: String(connectorDraft.name ?? ''),
+          provider: String(connectorDraft.provider ?? '').trim().toLowerCase(),
+          emailAddress: normalizeSingleEmailAddress(connectorDraft.emailAddress, 'emailAddress'),
+          host: connectorDraft.host !== undefined ? String(connectorDraft.host) : undefined,
+          port: parseOptionalPort(connectorDraft.port, 'incoming connector port'),
+          tls: connectorDraft.tls ?? true,
+          authType: 'oauth2',
+          authConfig: nextAuth,
+          syncSettings: isPlainObject(connectorDraft.syncSettings) ? connectorDraft.syncSettings : {},
+        });
+        connectorId = created.id;
+        connectorRow = {
+          ...connectorRow,
+          auth_config: nextAuth,
+          sync_settings: isPlainObject(connectorDraft.syncSettings) ? connectorDraft.syncSettings : {},
+        };
+      } else {
+        const created = await createOutgoingConnector(targetUserId, {
+          name: String(connectorDraft.name ?? ''),
+          provider: 'gmail',
+          fromAddress: normalizeSingleEmailAddress(connectorDraft.fromAddress, 'fromAddress'),
+          host: connectorDraft.host !== undefined ? String(connectorDraft.host) : undefined,
+          port: parseOptionalPort(connectorDraft.port, 'outgoing connector port'),
+          tlsMode: normalizeTlsMode(connectorDraft.tlsMode, 'tlsMode') ?? 'starttls',
+          authType: 'oauth2',
+          authConfig: nextAuth,
+          fromEnvelopeDefaults: isPlainObject(connectorDraft.fromEnvelopeDefaults) ? connectorDraft.fromEnvelopeDefaults : {},
+          sentCopyBehavior: isPlainObject(connectorDraft.sentCopyBehavior) ? connectorDraft.sentCopyBehavior : {},
+        });
+        connectorId = created.id;
+        connectorRow = {
+          ...connectorRow,
+          auth_config: nextAuth,
+        };
+      }
+    }
+
+    if (!connectorId) {
+      return redirectToFrontend('error', { error: 'failed to resolve connector for oauth callback' });
+    }
+
     if (type === 'incoming') {
       await updateIncomingConnectorAuth(connectorId, nextAuth, targetUserId);
       try {
-        const provider = row.rows[0]?.provider;
-        let connectorSyncSettings = row.rows[0]?.sync_settings ?? {};
-        const fallbackMailbox = isGmailLikeConnector({ provider, sync_settings: connectorSyncSettings, syncSettings: connectorSyncSettings })
-          ? normalizeGmailMailboxPath(env.sync.defaultMailbox)
-          : env.sync.defaultMailbox;
-        const existingWatchMailboxes: string[] = Array.isArray(connectorSyncSettings?.watchMailboxes)
-          ? connectorSyncSettings.watchMailboxes.map((value: unknown) => String(value))
-          : [];
-        if (!existingWatchMailboxes.includes(fallbackMailbox)) {
-          connectorSyncSettings = {
-            ...connectorSyncSettings,
-            watchMailboxes: [...existingWatchMailboxes, fallbackMailbox],
-          };
-          await updateIncomingConnector(targetUserId, connectorId, {
-            syncSettings: connectorSyncSettings,
-          });
+        const provider = connectorRow?.provider;
+        let connectorSyncSettings = connectorRow?.sync_settings ?? {};
+        const connectorIsGmailLike = isGmailLikeConnector({ provider, sync_settings: connectorSyncSettings, syncSettings: connectorSyncSettings });
+        const fallbackMailbox = connectorIsGmailLike
+          ? normalizeGmailMailboxPath(normalizeMailboxInput(env.sync.defaultMailbox, 'DEFAULT_MAILBOX'))
+          : normalizeMailboxInput(env.sync.defaultMailbox, 'DEFAULT_MAILBOX');
+        connectorSyncSettings = {
+          ...connectorSyncSettings,
+          watchMailboxes: normalizePersistedWatchMailboxes(
+            connectorSyncSettings?.watchMailboxes,
+            {
+              isGmailLike: connectorIsGmailLike,
+              fallbackMailbox,
+            },
+          ),
+        };
+        await updateIncomingConnector(targetUserId, connectorId, {
+          syncSettings: connectorSyncSettings,
+        });
+
+        const shouldCreateOutgoingGmail = connectorSyncSettings?.createOutgoingGmail === true;
+        if (shouldCreateOutgoingGmail) {
+          const incomingEmailAddress = (() => {
+            try {
+              return normalizeSingleEmailAddress(connectorRow?.email_address, 'emailAddress');
+            } catch {
+              return String(connectorRow?.email_address ?? '').trim().toLowerCase();
+            }
+          })();
+          if (incomingEmailAddress) {
+            const existingOutgoing = await query<{ id: string }>(
+              `SELECT id
+                 FROM outgoing_connectors
+                WHERE user_id = $1
+                  AND provider = 'gmail'
+                  AND LOWER(from_address) = LOWER($2)
+                ORDER BY created_at DESC
+                LIMIT 1`,
+              [targetUserId, incomingEmailAddress],
+            );
+            const outgoingConnectorId = existingOutgoing.rows[0]?.id
+              ?? (await createOutgoingConnector(targetUserId, {
+                name: `${String(connectorRow?.name ?? '').trim() || incomingEmailAddress} (Outgoing)`,
+                provider: 'gmail',
+                fromAddress: incomingEmailAddress,
+                authType: 'oauth2',
+                authConfig: nextAuth,
+              })).id;
+            await updateOutgoingConnectorAuth(outgoingConnectorId, nextAuth, targetUserId);
+          }
         }
 
         const connectorPushEnabled = connectorSyncSettings?.gmailPush?.enabled !== false;
         if (provider === 'gmail' && env.gmailPush.enabled && env.gmailPush.topicName && connectorPushEnabled) {
           try {
-            const watchLabelIds = buildGmailWatchLabelIds(
-              Array.isArray(connectorSyncSettings.watchMailboxes)
-                ? connectorSyncSettings.watchMailboxes
-                  .map((value: unknown) => String(value))
-                  .filter(Boolean)
-                : [fallbackMailbox],
-            );
+            const watchLabelIds = buildGmailWatchLabelIds(connectorSyncSettings.watchMailboxes ?? [fallbackMailbox]);
             const watchResponse = await gmailApiRequest<{ historyId?: string | number; expiration?: string | number }>(
               'incoming',
               { id: connectorId, auth_config: nextAuth },
@@ -1333,22 +2315,46 @@ export const registerRoutes = async (app: FastifyInstance) => {
             ? normalizeGmailMailboxPath(mailbox.path)
             : mailbox.path)
           .filter((mailbox) => Boolean(mailbox && String(mailbox).trim()));
-        const uniqueTargets = Array.from(new Set(queueTargets));
-        const targets = uniqueTargets.length > 0 ? uniqueTargets : [fallbackMailbox];
-        for (const mailbox of targets) {
-          await ensureIncomingConnectorState(connectorId, mailbox);
-          const enqueued = await enqueueSyncWithOptions(targetUserId, connectorId, mailbox, {
-            priority: resolveSyncQueuePriority(targetUserId, connectorId, mailbox),
-          });
-          if (enqueued) {
-            await setSyncState(connectorId, mailbox, {
-              status: 'queued',
-              syncCompletedAt: null,
-              syncError: null,
-              syncProgress: { inserted: 0, updated: 0, reconciledRemoved: 0, metadataRefreshed: 0 },
+        const targets = buildInitialSyncTargets(
+          { provider, sync_settings: connectorSyncSettings, syncSettings: connectorSyncSettings },
+          queueTargets,
+          fallbackMailbox,
+        );
+        await ensureIncomingConnectorStatesBulk(connectorId, targets);
+        await Promise.all(
+          targets.map(async (mailbox) => {
+            const enqueued = await enqueueSyncWithOptions(targetUserId, connectorId, mailbox, {
+              priority: resolveSyncQueuePriority(targetUserId, connectorId, mailbox),
             });
-          }
-        }
+            if (!enqueued) {
+              try {
+                await setSyncState(connectorId, mailbox, {
+                  status: 'syncing',
+                  syncStartedAt: new Date(),
+                  syncCompletedAt: null,
+                  syncError: null,
+                  syncProgress: { inserted: 0, updated: 0, reconciledRemoved: 0, metadataRefreshed: 0 },
+                });
+              } catch {
+                // Ignore sync-state persistence failures so fallback sync still starts.
+              }
+              void syncIncomingConnector(targetUserId, connectorId, mailbox).catch((error) => {
+                app.log.warn({ error, connectorId, mailbox }, 'oauth callback fallback sync failed');
+              });
+              return;
+            }
+            try {
+              await setSyncState(connectorId, mailbox, {
+                status: 'queued',
+                syncCompletedAt: null,
+                syncError: null,
+                syncProgress: { inserted: 0, updated: 0, reconciledRemoved: 0, metadataRefreshed: 0 },
+              });
+            } catch {
+              // Keep queueing responsive even when sync-state persistence is unavailable.
+            }
+          }),
+        );
       } catch {
         // no-op: callback should still succeed even if background queue is temporarily unavailable
       }
@@ -1358,7 +2364,9 @@ export const registerRoutes = async (app: FastifyInstance) => {
 
     return redirectToFrontend('ok', {
       connectorType: type,
+      type,
       connectorId,
+      id: connectorId,
     });
   });
 
@@ -1370,7 +2378,15 @@ export const registerRoutes = async (app: FastifyInstance) => {
     if (!connector) {
       return reply.code(404).send({ error: 'connector not found' });
     }
-    const mailboxInput = body.mailbox || 'INBOX';
+    if (!isActiveConnectorStatus(connector.status)) {
+      return reply.code(409).send({ error: 'connector is not active' });
+    }
+    let mailboxInput: string;
+    try {
+      mailboxInput = normalizeMailboxInput(body.mailbox ?? 'INBOX');
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : 'invalid mailbox' });
+    }
     const mailbox = isGmailLikeConnector(connector)
       ? normalizeGmailMailboxPath(mailboxInput)
       : mailboxInput;
@@ -1389,31 +2405,40 @@ export const registerRoutes = async (app: FastifyInstance) => {
           ? normalizeGmailMailboxPath(entry.path)
           : entry.path)
         .filter((entry) => Boolean(entry && String(entry).trim()));
-      const uniqueTargets = Array.from(new Set(queueTargets));
       const fallbackMailbox = isGmailLikeConnector(connector)
-        ? normalizeGmailMailboxPath(env.sync.defaultMailbox)
-        : env.sync.defaultMailbox;
-      const targets = uniqueTargets.length > 0 ? uniqueTargets : [fallbackMailbox];
+        ? normalizeGmailMailboxPath(normalizeMailboxInput(env.sync.defaultMailbox, 'DEFAULT_MAILBOX'))
+        : normalizeMailboxInput(env.sync.defaultMailbox, 'DEFAULT_MAILBOX');
+      const targets = buildInitialSyncTargets(connector, queueTargets, fallbackMailbox);
+      await ensureIncomingConnectorStatesBulk(connectorId, targets);
 
-      let queued = 0;
-      for (const targetMailbox of targets) {
-        await ensureIncomingConnectorState(connectorId, targetMailbox);
-        const enqueued = await enqueueSyncWithOptions(userId, connectorId, targetMailbox, {
-          priority: resolvePriorityForMailbox(targetMailbox),
-        });
-        if (enqueued) {
-          queued += 1;
-          try {
-            await setSyncState(connectorId, targetMailbox, {
-              status: 'queued',
-              syncCompletedAt: null,
-              syncError: null,
-              syncProgress: { inserted: 0, updated: 0, reconciledRemoved: 0, metadataRefreshed: 0 },
-            });
-          } catch {
-            // Ignore sync state persistence failures to keep sync trigger responsive.
+      const queuedResults = await Promise.all(
+        targets.map(async (targetMailbox) => {
+          const enqueued = await enqueueSyncWithOptions(userId, connectorId, targetMailbox, {
+            priority: resolvePriorityForMailbox(targetMailbox),
+          });
+          if (enqueued) {
+            try {
+              await setSyncState(connectorId, targetMailbox, {
+                status: 'queued',
+                syncCompletedAt: null,
+                syncError: null,
+                syncProgress: { inserted: 0, updated: 0, reconciledRemoved: 0, metadataRefreshed: 0 },
+              });
+            } catch {
+              // Ignore sync state persistence failures to keep sync trigger responsive.
+            }
           }
+          return enqueued;
+        }),
+      );
+      const queued = queuedResults.filter(Boolean).length;
+      if (queued === 0) {
+        for (const targetMailbox of targets) {
+          void syncIncomingConnector(userId, connectorId, targetMailbox).catch((error) => {
+            req.log.warn({ error, connectorId, mailbox: targetMailbox }, 'fallback full-sync start failed');
+          });
         }
+        return { status: 'started', queued: 0, total: targets.length, mailboxes: targets };
       }
       return { status: 'queued', queued, total: targets.length, mailboxes: targets };
     }
@@ -1458,17 +2483,30 @@ export const registerRoutes = async (app: FastifyInstance) => {
     const userId = getUserId(req);
     const body = (req.body as any) || {};
     const connectorId = String(body.connectorId || '').trim();
-    const mailboxInput = String(body.mailbox || '').trim();
-    if (!connectorId || !mailboxInput) {
+    if (!connectorId) {
       return reply.code(400).send({ error: 'connectorId and mailbox are required' });
     }
-
-    const connector = await getIncomingConnector(userId, connectorId);
-    if (!connector) {
-      return reply.code(404).send({ error: 'connector not found' });
+    let mailboxInput: string;
+    try {
+      mailboxInput = normalizeMailboxInput(body.mailbox);
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : 'invalid mailbox' });
     }
 
-    const mailbox = isGmailLikeConnector(connector)
+    let cached = getActiveMailboxConnectorCache(userId, connectorId);
+    if (!cached) {
+      const connector = await getIncomingConnector(userId, connectorId);
+      if (!connector) {
+        return reply.code(404).send({ error: 'connector not found' });
+      }
+      cached = {
+        expiresAtMs: Date.now() + ACTIVE_MAILBOX_CONNECTOR_CACHE_TTL_MS,
+        isGmailLike: isGmailLikeConnector(connector),
+      };
+      setActiveMailboxConnectorCache(userId, connectorId, cached.isGmailLike);
+    }
+
+    const mailbox = cached.isGmailLike
       ? normalizeGmailMailboxPath(mailboxInput)
       : mailboxInput;
     markActiveMailbox(userId, connectorId, mailbox);
@@ -1483,9 +2521,15 @@ export const registerRoutes = async (app: FastifyInstance) => {
     if (!connector) {
       return reply.code(404).send({ error: 'connector not found' });
     }
+    let mailboxInput: string;
+    try {
+      mailboxInput = normalizeMailboxInput(body.mailbox ?? env.sync.defaultMailbox);
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : 'invalid mailbox' });
+    }
     const mailbox = isGmailLikeConnector(connector)
-      ? normalizeGmailMailboxPath(body.mailbox || env.sync.defaultMailbox)
-      : (body.mailbox || env.sync.defaultMailbox);
+      ? normalizeGmailMailboxPath(mailboxInput)
+      : mailboxInput;
     return requestSyncCancellation(userId, connectorId, mailbox);
   });
 
@@ -1493,7 +2537,12 @@ export const registerRoutes = async (app: FastifyInstance) => {
     const userId = getUserId(req);
     const connectorId = String((req.params as any).connectorId);
     const queryParams = req.query as any;
-    const mailboxInput = String(queryParams?.mailbox || env.sync.defaultMailbox);
+    let mailboxInput: string;
+    try {
+      mailboxInput = normalizeMailboxInput(queryParams?.mailbox ?? env.sync.defaultMailbox);
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : 'invalid mailbox' });
+    }
 
     const connector = await getIncomingConnector(userId, connectorId);
     if (!connector) {
@@ -1532,29 +2581,23 @@ export const registerRoutes = async (app: FastifyInstance) => {
 
     // Keep sync-state polling fully DB-backed. Listing remote mailboxes here
     // opens extra IMAP/Gmail API sessions and can starve active sync watchers.
-    const configuredWatchMailboxes = Array.isArray(connector.sync_settings?.watchMailboxes)
-      ? connector.sync_settings.watchMailboxes
-        .map((value: unknown) => String(value || '').trim())
-        .filter(Boolean)
-      : [];
-    const fallbackMailbox = isGmailLikeConnector(connector)
-      ? normalizeGmailMailboxPath(env.sync.defaultMailbox)
-      : env.sync.defaultMailbox;
-    const seedMailboxes = configuredWatchMailboxes.length > 0
-      ? configuredWatchMailboxes
-      : [fallbackMailbox];
+    const connectorIsGmailLike = isGmailLikeConnector(connector);
+    const fallbackMailbox = connectorIsGmailLike
+      ? normalizeGmailMailboxPath(normalizeMailboxInput(env.sync.defaultMailbox, 'DEFAULT_MAILBOX'))
+      : normalizeMailboxInput(env.sync.defaultMailbox, 'DEFAULT_MAILBOX');
+    const seedMailboxes = normalizePersistedWatchMailboxes(
+      connector.sync_settings?.watchMailboxes,
+      {
+        isGmailLike: connectorIsGmailLike,
+        fallbackMailbox,
+      },
+    );
 
     const ignoredContainerMailboxes = new Set<string>(['[GMAIL]', '[GOOGLE MAIL]']);
-    const uniqueMailboxes = Array.from(new Set<string>(
-      seedMailboxes
-        .map((entry: string) => (isGmailLikeConnector(connector) ? normalizeGmailMailboxPath(entry) : entry))
-        .map((entry: string) => String(entry || '').trim())
-        .filter((entry: string): entry is string => Boolean(entry)),
-    )).filter((mailbox: string) => !ignoredContainerMailboxes.has(mailbox.toUpperCase()));
+    const uniqueMailboxes = seedMailboxes
+      .filter((mailbox: string) => !ignoredContainerMailboxes.has(mailbox.toUpperCase()));
 
-    for (const mailbox of uniqueMailboxes) {
-      await ensureIncomingConnectorState(connectorId, mailbox);
-    }
+    await ensureIncomingConnectorStatesBulk(connectorId, uniqueMailboxes);
 
     const states = await query<any>(
       `SELECT mailbox,
@@ -1588,26 +2631,48 @@ export const registerRoutes = async (app: FastifyInstance) => {
     const userId = getUserId(req);
     const connectorId = String((req.params as any).connectorId);
     const body = req.body as any;
-    const mailboxInput = body?.mailbox || env.sync.defaultMailbox;
+    let mailboxInput: string;
+    try {
+      mailboxInput = normalizeMailboxInput(body?.mailbox ?? env.sync.defaultMailbox);
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : 'invalid mailbox' });
+    }
     const connector = await getIncomingConnector(userId, connectorId);
     if (!connector) {
       return reply.code(404).send({ error: 'connector not found' });
     }
-    const mailbox = isGmailLikeConnector(connector)
+    if (!isActiveConnectorStatus(connector.status)) {
+      return reply.code(409).send({ error: 'connector is not active' });
+    }
+    const connectorIsGmailLike = isGmailLikeConnector(connector);
+    const mailbox = connectorIsGmailLike
       ? normalizeGmailMailboxPath(mailboxInput)
       : mailboxInput;
-    await startIncomingConnectorIdleWatch(userId, connectorId, mailbox);
-    const existingMailboxes = Array.isArray(connector.sync_settings?.watchMailboxes)
-      ? connector.sync_settings.watchMailboxes.map((value: unknown) => String(value))
-      : [];
-    if (!existingMailboxes.includes(mailbox)) {
-      await updateIncomingConnector(userId, connectorId, {
-        syncSettings: {
-          ...(connector.sync_settings ?? {}),
-          watchMailboxes: [...existingMailboxes, mailbox],
-        },
-      });
+    const fallbackMailbox = connectorIsGmailLike
+      ? normalizeGmailMailboxPath(normalizeMailboxInput(env.sync.defaultMailbox, 'DEFAULT_MAILBOX'))
+      : normalizeMailboxInput(env.sync.defaultMailbox, 'DEFAULT_MAILBOX');
+    const existingMailboxes = normalizePersistedWatchMailboxes(
+      connector.sync_settings?.watchMailboxes,
+      {
+        isGmailLike: connectorIsGmailLike,
+        fallbackMailbox,
+        includeFallbackWhenEmpty: false,
+      },
+    );
+    const mailboxAlreadyWatched = existingMailboxes.includes(mailbox);
+    if (!mailboxAlreadyWatched && existingMailboxes.length >= MAX_WATCH_MAILBOXES) {
+      return reply.code(400).send({ error: `watch mailbox limit exceeded (max ${MAX_WATCH_MAILBOXES})` });
     }
+    const nextMailboxes = mailboxAlreadyWatched
+      ? existingMailboxes
+      : [...existingMailboxes, mailbox];
+    await updateIncomingConnector(userId, connectorId, {
+      syncSettings: {
+        ...(connector.sync_settings ?? {}),
+        watchMailboxes: nextMailboxes,
+      },
+    });
+    await startIncomingConnectorIdleWatch(userId, connectorId, mailbox);
     return { status: 'watching', connectorId, mailbox };
   });
 
@@ -1615,27 +2680,39 @@ export const registerRoutes = async (app: FastifyInstance) => {
     const userId = getUserId(req);
     const connectorId = String((req.params as any).connectorId);
     const body = req.body as any;
-    const mailboxInput = body?.mailbox || env.sync.defaultMailbox;
+    let mailboxInput: string;
+    try {
+      mailboxInput = normalizeMailboxInput(body?.mailbox ?? env.sync.defaultMailbox);
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : 'invalid mailbox' });
+    }
     const connector = await getIncomingConnector(userId, connectorId);
     if (!connector) {
       return reply.code(404).send({ error: 'connector not found' });
     }
-    const mailbox = isGmailLikeConnector(connector)
+    const connectorIsGmailLike = isGmailLikeConnector(connector);
+    const mailbox = connectorIsGmailLike
       ? normalizeGmailMailboxPath(mailboxInput)
       : mailboxInput;
+    const fallbackMailbox = connectorIsGmailLike
+      ? normalizeGmailMailboxPath(normalizeMailboxInput(env.sync.defaultMailbox, 'DEFAULT_MAILBOX'))
+      : normalizeMailboxInput(env.sync.defaultMailbox, 'DEFAULT_MAILBOX');
+    const existingMailboxes = normalizePersistedWatchMailboxes(
+      connector.sync_settings?.watchMailboxes,
+      {
+        isGmailLike: connectorIsGmailLike,
+        fallbackMailbox,
+        includeFallbackWhenEmpty: false,
+      },
+    );
     await stopIncomingConnectorIdleWatch(userId, connectorId, mailbox);
-    const existingMailboxes = Array.isArray(connector.sync_settings?.watchMailboxes)
-      ? connector.sync_settings.watchMailboxes.map((value: unknown) => String(value))
-      : [];
     const nextMailboxes = existingMailboxes.filter((value: string) => value !== mailbox);
-    if (nextMailboxes.length !== existingMailboxes.length) {
-      await updateIncomingConnector(userId, connectorId, {
-        syncSettings: {
-          ...(connector.sync_settings ?? {}),
-          watchMailboxes: nextMailboxes,
-        },
-      });
-    }
+    await updateIncomingConnector(userId, connectorId, {
+      syncSettings: {
+        ...(connector.sync_settings ?? {}),
+        watchMailboxes: nextMailboxes,
+      },
+    });
     return { status: 'stopped', connectorId, mailbox };
   });
 
@@ -1648,19 +2725,22 @@ export const registerRoutes = async (app: FastifyInstance) => {
     if (!connector) {
       return reply.code(404).send({ error: 'connector not found' });
     }
+    if (!isActiveConnectorStatus(connector.status)) {
+      return reply.code(409).send({ error: 'connector is not active' });
+    }
     if (connector.provider !== 'gmail') {
       return reply.code(400).send({ error: 'gmail push is only supported for provider=gmail connectors' });
     }
 
     const existingSyncSettings = connector.sync_settings ?? {};
-    const fallbackMailbox = normalizeGmailMailboxPath(env.sync.defaultMailbox);
-    const existingWatchMailboxes: string[] = Array.isArray(existingSyncSettings.watchMailboxes)
-      ? existingSyncSettings.watchMailboxes.map((value: unknown) => String(value)).filter(Boolean)
-      : [];
-    const watchMailboxes: string[] = Array.from(new Set<string>(
-      (existingWatchMailboxes.length > 0 ? existingWatchMailboxes : [fallbackMailbox])
-        .map((mailbox: string) => normalizeGmailMailboxPath(mailbox)),
-    ));
+    const fallbackMailbox = normalizeGmailMailboxPath(normalizeMailboxInput(env.sync.defaultMailbox, 'DEFAULT_MAILBOX'));
+    const watchMailboxes = normalizePersistedWatchMailboxes(
+      existingSyncSettings.watchMailboxes,
+      {
+        isGmailLike: true,
+        fallbackMailbox,
+      },
+    );
 
     if (enabled) {
       if (!env.gmailPush.enabled || !env.gmailPush.topicName) {
@@ -1770,39 +2850,46 @@ export const registerRoutes = async (app: FastifyInstance) => {
       if (existingSyncSettings.gmailPush?.enabled === false) {
         continue;
       }
-      const configuredWatchMailboxes = Array.isArray(existingSyncSettings.watchMailboxes)
-        ? existingSyncSettings.watchMailboxes.map((value: unknown) => String(value)).filter(Boolean)
-        : [];
-      const fallbackMailbox = normalizeGmailMailboxPath(env.sync.defaultMailbox);
-      const targetMailboxes = Array.from(new Set(
-        (configuredWatchMailboxes.length > 0 ? configuredWatchMailboxes : [fallbackMailbox])
-          .map((mailbox) => normalizeGmailMailboxPath(mailbox)),
-      ));
+      const fallbackMailbox = normalizeGmailMailboxPath(normalizeMailboxInput(env.sync.defaultMailbox, 'DEFAULT_MAILBOX'));
+      const targetMailboxes = normalizePersistedWatchMailboxes(
+        existingSyncSettings.watchMailboxes,
+        {
+          isGmailLike: true,
+          fallbackMailbox,
+        },
+      );
+      await ensureIncomingConnectorStatesBulk(connector.id, targetMailboxes);
 
-      for (const mailbox of targetMailboxes) {
-        await ensureIncomingConnectorState(connector.id, mailbox);
-        const enqueued = await enqueueSyncWithOptions(connector.user_id, connector.id, mailbox, {
-          priority: resolveSyncQueuePriority(connector.user_id, connector.id, mailbox),
-          gmailHistoryIdHint: decoded.historyId ?? null,
-        });
-        if (enqueued) {
-          await setSyncState(connector.id, mailbox, {
-            status: 'queued',
-            syncCompletedAt: null,
-            syncError: null,
-            syncProgress: { inserted: 0, updated: 0, reconciledRemoved: 0, metadataRefreshed: 0 },
+      await Promise.all(
+        targetMailboxes.map(async (mailbox) => {
+          const enqueued = await enqueueSyncWithOptions(connector.user_id, connector.id, mailbox, {
+            priority: resolveSyncQueuePriority(connector.user_id, connector.id, mailbox),
+            gmailHistoryIdHint: decoded.historyId ?? null,
           });
-        } else {
+          if (enqueued) {
+            try {
+              await setSyncState(connector.id, mailbox, {
+                status: 'queued',
+                syncCompletedAt: null,
+                syncError: null,
+                syncProgress: { inserted: 0, updated: 0, reconciledRemoved: 0, metadataRefreshed: 0 },
+              });
+            } catch {
+              // Keep webhook handling fast even if sync-state writes are transiently unavailable.
+            }
+            return;
+          }
           void syncIncomingConnector(connector.user_id, connector.id, mailbox, {
             gmailHistoryIdHint: decoded.historyId ?? null,
           }).catch((error) => {
             req.log.warn({ error, connectorId: connector.id, mailbox }, 'gmail push fallback sync failed');
           });
-        }
-      }
+        }),
+      );
 
       const nextSyncSettings = {
         ...existingSyncSettings,
+        watchMailboxes: targetMailboxes,
         gmailPush: {
           ...(existingSyncSettings.gmailPush ?? {}),
           topicName: env.gmailPush.topicName || (existingSyncSettings.gmailPush?.topicName ?? null),
@@ -1822,85 +2909,100 @@ export const registerRoutes = async (app: FastifyInstance) => {
   app.get('/api/events', async (req) => {
     const userId = getUserId(req);
     const queryObject = req.query as any;
-    const parsedSince = Number(queryObject?.since);
-    const parsedLimit = Number(queryObject?.limit);
-    const since = Number.isFinite(parsedSince) && parsedSince >= 0 ? Math.floor(parsedSince) : 0;
-    const limit = Number.isFinite(parsedLimit) && parsedLimit > 0 ? Math.floor(parsedLimit) : 100;
+    const since = parseNonNegativeIntWithCap(queryObject?.since, 0, MAX_SYNC_EVENT_ID);
+    const limit = parsePositiveIntWithCap(queryObject?.limit, 100, MAX_EVENTS_LIMIT);
     return listSyncEvents(userId, since, limit);
   });
 
   app.get('/api/events/stream', async (req, reply) => {
     const userId = getUserId(req);
+    if (!tryAcquireEventStreamSlot(userId)) {
+      return reply.code(429).send({ error: `too many open event streams (max ${MAX_ACTIVE_EVENT_STREAMS_PER_USER})` });
+    }
     const queryObject = req.query as any;
-    const parsedSince = Number(queryObject?.since);
-    let since = Number.isFinite(parsedSince) && parsedSince >= 0 ? Math.floor(parsedSince) : 0;
-
-    reply.hijack();
-    reply.raw.writeHead(200, {
-      'Content-Type': 'text/event-stream; charset=utf-8',
-      'Cache-Control': 'no-cache, no-transform',
-      Connection: 'keep-alive',
-      'X-Accel-Buffering': 'no',
-    });
-
+    let since = parseNonNegativeIntWithCap(queryObject?.since, 0, MAX_SYNC_EVENT_ID);
     let closed = false;
     const onClose = () => {
       closed = true;
     };
-    req.raw.on('close', onClose);
-    req.raw.on('aborted', onClose);
+    try {
+      reply.hijack();
+      reply.raw.writeHead(200, {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
+        Connection: 'keep-alive',
+        'X-Accel-Buffering': 'no',
+      });
 
-    reply.raw.write(`event: ready\ndata: {"since":${since}}\n\n`);
+      req.raw.on('close', onClose);
+      req.raw.on('aborted', onClose);
 
-    while (!closed) {
-      try {
-        const events = await listSyncEvents(userId, since, 250);
-        if (events.length > 0) {
-          for (const event of events) {
-            const eventId = Number((event as any).id ?? 0);
-            if (Number.isFinite(eventId) && eventId > since) {
-              since = eventId;
+      reply.raw.write(`event: ready\ndata: {"since":${since}}\n\n`);
+
+      while (!closed) {
+        try {
+          const events = await listSyncEvents(userId, since, 250);
+          if (events.length > 0) {
+            for (const event of events) {
+              const eventId = Number((event as any).id ?? 0);
+              if (Number.isFinite(eventId) && eventId > since) {
+                since = eventId;
+              }
+              reply.raw.write(`id: ${eventId || since}\n`);
+              reply.raw.write(`event: sync\n`);
+              reply.raw.write(`data: ${JSON.stringify(event)}\n\n`);
             }
-            reply.raw.write(`id: ${eventId || since}\n`);
-            reply.raw.write(`event: sync\n`);
-            reply.raw.write(`data: ${JSON.stringify(event)}\n\n`);
+            continue;
           }
-          continue;
-        }
 
-        const signal = await waitForSyncEventSignal(userId, since, 25_000);
-        if (closed) {
-          break;
+          const signal = await waitForSyncEventSignal(userId, since, 25_000);
+          if (closed) {
+            break;
+          }
+          if (!signal) {
+            reply.raw.write(`event: ping\ndata: {"since":${since}}\n\n`);
+          }
+        } catch (error) {
+          req.log.warn({ error }, 'sync event stream polling failed');
+          reply.raw.write(`event: error\ndata: ${JSON.stringify({ error: 'event stream failed' })}\n\n`);
+          await new Promise<void>((resolve) => {
+            setTimeout(resolve, EVENT_STREAM_ERROR_BACKOFF_MS);
+          });
         }
-        if (!signal) {
-          reply.raw.write(`event: ping\ndata: {"since":${since}}\n\n`);
-        }
-      } catch (error) {
-        reply.raw.write(`event: error\ndata: ${JSON.stringify({ error: String(error) })}\n\n`);
       }
-    }
 
-    req.raw.off('close', onClose);
-    req.raw.off('aborted', onClose);
-    if (!reply.raw.writableEnded) {
-      reply.raw.end();
+      return reply;
+    } finally {
+      req.raw.off('close', onClose);
+      req.raw.off('aborted', onClose);
+      if (!reply.raw.writableEnded) {
+        reply.raw.end();
+      }
+      releaseEventStreamSlot(userId);
     }
-    return reply;
   });
 
   app.get('/api/messages', async (req) => {
     const userId = getUserId(req);
     const queryObject = req.query as any;
-    const limitInput = Number(queryObject?.limit ?? 50);
-    const offsetInput = Number(queryObject?.offset ?? 0);
-    const folder = await normalizeConnectorFolderFilter(userId, queryObject?.folder as string | undefined, queryObject?.connectorId as string | undefined);
-    const normalizedFolder = String(folder ?? '').trim().toUpperCase();
-    const folderFilter = await buildGmailFolderPredicates(
-      userId,
+    const limit = parsePositiveIntWithCap(queryObject?.limit, 50, MAX_MESSAGES_PAGE_LIMIT);
+    const offset = parseNonNegativeIntWithCap(queryObject?.offset, 0, MAX_MESSAGES_OFFSET);
+    const connectorId = String(queryObject?.connectorId ?? '').trim();
+    const resolvedConnectorIsGmailLike = connectorId
+      ? await getIncomingConnectorGmailLikeCached(userId, connectorId)
+      : null;
+    const resolvedConnector = connectorId && resolvedConnectorIsGmailLike !== null
+      ? (resolvedConnectorIsGmailLike ? { provider: 'gmail' } : { provider: 'imap' })
+      : null;
+    const folder = normalizeConnectorFolderFilterWithConnector(
       queryObject?.folder as string | undefined,
-      queryObject?.connectorId as string | undefined,
+      resolvedConnector,
     );
-    const connectorId = queryObject?.connectorId;
+    const normalizedFolder = String(folder ?? '').trim().toUpperCase();
+    const folderFilter = buildGmailFolderPredicatesWithConnector(
+      queryObject?.folder as string | undefined,
+      resolvedConnector,
+    );
     const label = queryObject?.label;
     const labelId = queryObject?.labelId;
     const hasAttachment = parseBooleanParam(queryObject?.hasAttachment);
@@ -1958,109 +3060,118 @@ export const registerRoutes = async (app: FastifyInstance) => {
     if (normalizedFolder === 'STARRED') {
       predicates.push('m.is_starred = TRUE');
     }
-    const limit = Number.isFinite(limitInput) && limitInput > 0
-      ? Math.floor(limitInput)
-      : 50;
-    const offset = Number.isFinite(offsetInput) && offsetInput >= 0
-      ? Math.floor(offsetInput)
-      : 0;
-    
     const shouldDedupeLogicalMessages = !folder || folderFilter.dedupeLogicalMessages;
+    const dedupeKeyExpr = logicalMessageKeySql('m');
 
-    const countResult = shouldDedupeLogicalMessages
-      ? await query<{ count: string }>(
-          `SELECT COUNT(*)::int as count
-             FROM (
-               SELECT DISTINCT m.incoming_connector_id, COALESCE(NULLIF(m.gmail_message_id, ''), LOWER(NULLIF(m.message_id, '')), m.id::text)
-                 FROM messages m
-                 INNER JOIN incoming_connectors ic ON ic.id = m.incoming_connector_id
-                WHERE ${predicates.join(' AND ')}
-             ) dedup`,
-          values,
-        )
-      : await query<{ count: string }>(
-          `SELECT COUNT(*)::int as count
-             FROM messages m
-             INNER JOIN incoming_connectors ic ON ic.id = m.incoming_connector_id
-            WHERE ${predicates.join(' AND ')}`,
-          values,
-        );
+    const countValues = [...values];
+    const rowsValues = [...values, limit, offset];
 
-    values.push(limit, offset);
-
-    const result = shouldDedupeLogicalMessages
-      ? await query<any>(
-          `SELECT dedup.id,
-                  dedup."incomingConnectorId",
-                  dedup."messageId",
-                  dedup.subject,
-                  dedup."fromHeader",
-                  dedup."toHeader",
-                  dedup."folderPath",
-                  dedup.snippet,
-                  dedup."receivedAt",
-                  dedup."isRead",
-                  dedup."isStarred",
-                  dedup."threadId",
-                  dedup.thread_count as "threadCount",
-                  dedup.participants
-             FROM (
-               SELECT DISTINCT ON (m.incoming_connector_id, COALESCE(NULLIF(m.gmail_message_id, ''), LOWER(NULLIF(m.message_id, '')), m.id::text))
-                      m.id,
-                      m.incoming_connector_id as "incomingConnectorId",
-                      m.message_id as "messageId",
-                      m.subject,
-                      m.from_header as "fromHeader",
-                      m.to_header as "toHeader",
-                      m.folder_path as "folderPath",
-                      m.snippet,
-                      m.received_at as "receivedAt",
-                      m.is_read as "isRead",
-                      m.is_starred as "isStarred",
-                      m.thread_id as "threadId",
+    const [countResult, result] = await Promise.all([
+      shouldDedupeLogicalMessages
+        ? query<{ count: string }>(
+            `SELECT COUNT(*)::int as count
+               FROM (
+                 SELECT DISTINCT m.incoming_connector_id, ${dedupeKeyExpr}
+                   FROM messages m
+                   INNER JOIN incoming_connectors ic ON ic.id = m.incoming_connector_id
+                  WHERE ${predicates.join(' AND ')}
+               ) dedup`,
+            countValues,
+          )
+        : query<{ count: string }>(
+            `SELECT COUNT(*)::int as count
+               FROM messages m
+               INNER JOIN incoming_connectors ic ON ic.id = m.incoming_connector_id
+              WHERE ${predicates.join(' AND ')}`,
+            countValues,
+          ),
+      shouldDedupeLogicalMessages
+        ? query<any>(
+            `WITH dedup AS (
+             SELECT DISTINCT ON (m.incoming_connector_id, ${dedupeKeyExpr})
+                    m.id,
+                    m.incoming_connector_id as "incomingConnectorId",
+                    m.message_id as "messageId",
+                    m.subject,
+                    m.from_header as "fromHeader",
+                    m.to_header as "toHeader",
+                    m.folder_path as "folderPath",
+                    m.snippet,
+                    m.received_at as "receivedAt",
+                    m.is_read as "isRead",
+                    m.is_starred as "isStarred",
+                    m.thread_id as "threadId"
+               FROM messages m
+               INNER JOIN incoming_connectors ic ON ic.id = m.incoming_connector_id
+              WHERE ${predicates.join(' AND ')}
+              ORDER BY
+                m.incoming_connector_id,
+                ${dedupeKeyExpr},
+                ${mailboxReadPreferenceRankSql},
+                m.received_at DESC NULLS LAST,
+                m.updated_at DESC,
+                m.id DESC
+           ),
+           paged AS (
+             SELECT *
+               FROM dedup
+              ORDER BY "receivedAt" DESC, id DESC
+              LIMIT $${rowsValues.length - 1} OFFSET $${rowsValues.length}
+           ),
+           thread_ids AS (
+             SELECT DISTINCT
+                    p."incomingConnectorId" as incoming_connector_id,
+                    p."threadId" as thread_id
+               FROM paged p
+              WHERE p."threadId" IS NOT NULL
+           ),
+           thread_stats AS (
+             SELECT m3.incoming_connector_id,
+                    m3.thread_id,
+                    COUNT(DISTINCT ${logicalMessageKeySql('m3')})::int as thread_count,
+                    COALESCE(
+                      jsonb_agg(DISTINCT m3.from_header) FILTER (WHERE m3.from_header IS NOT NULL),
+                      '[]'::jsonb
+                    ) as participants
+               FROM messages m3
+               INNER JOIN thread_ids ti
+                 ON ti.incoming_connector_id = m3.incoming_connector_id
+                AND ti.thread_id = m3.thread_id
+              GROUP BY m3.incoming_connector_id, m3.thread_id
+           )
+           SELECT p.id,
+                  p."incomingConnectorId",
+                  p."messageId",
+                  p.subject,
+                  p."fromHeader",
+                  p."toHeader",
+                  p."folderPath",
+                  p.snippet,
+                  p."receivedAt",
+                  p."isRead",
+                  p."isStarred",
+                  p."threadId",
+                  CASE
+                    WHEN p."threadId" IS NULL THEN 1
+                    ELSE COALESCE(ts.thread_count, 1)
+                  END as "threadCount",
+                  CASE
+                    WHEN p."threadId" IS NULL THEN
                       CASE
-                        WHEN m.thread_id IS NULL THEN 1
-                        ELSE (
-                          SELECT COUNT(DISTINCT COALESCE(NULLIF(m3.gmail_message_id, ''), LOWER(NULLIF(m3.message_id, '')), m3.id::text))
-                            FROM messages m3
-                           WHERE m3.incoming_connector_id = m.incoming_connector_id
-                             AND m3.thread_id = m.thread_id
-                        )
-                      END as thread_count,
-                      CASE
-                        WHEN m.thread_id IS NULL THEN
-                          CASE
-                            WHEN m.from_header IS NULL THEN '[]'::jsonb
-                            ELSE jsonb_build_array(m.from_header)
-                          END
-                        ELSE COALESCE((
-                          SELECT jsonb_agg(thread_participant.participant)
-                            FROM (
-                              SELECT DISTINCT m2.from_header AS participant
-                                FROM messages m2
-                               WHERE m2.incoming_connector_id = m.incoming_connector_id
-                                 AND m2.thread_id = m.thread_id
-                                 AND m2.from_header IS NOT NULL
-                            ) thread_participant
-                        ), '[]'::jsonb)
-                      END as participants
-                 FROM messages m
-                 INNER JOIN incoming_connectors ic ON ic.id = m.incoming_connector_id
-                WHERE ${predicates.join(' AND ')}
-                ORDER BY
-                  m.incoming_connector_id,
-                  COALESCE(NULLIF(m.gmail_message_id, ''), LOWER(NULLIF(m.message_id, '')), m.id::text),
-                  ${mailboxReadPreferenceRankSql},
-                  m.received_at DESC NULLS LAST,
-                  m.updated_at DESC,
-                  m.id DESC
-             ) dedup
-            ORDER BY dedup."receivedAt" DESC, dedup.id DESC
-            LIMIT $${values.length - 1} OFFSET $${values.length}`,
-          values,
-        )
-      : await query<any>(
-          `SELECT m.id,
+                        WHEN p."fromHeader" IS NULL THEN '[]'::jsonb
+                        ELSE jsonb_build_array(p."fromHeader")
+                      END
+                    ELSE COALESCE(ts.participants, '[]'::jsonb)
+                  END as participants
+             FROM paged p
+             LEFT JOIN thread_stats ts
+               ON ts.incoming_connector_id = p."incomingConnectorId"
+              AND ts.thread_id = p."threadId"
+            ORDER BY p."receivedAt" DESC, p.id DESC`,
+            rowsValues,
+          )
+        : query<any>(
+            `SELECT m.id,
                   m.incoming_connector_id as "incomingConnectorId",
                   m.message_id as "messageId",
                   m.subject,
@@ -2078,9 +3189,10 @@ export const registerRoutes = async (app: FastifyInstance) => {
             INNER JOIN incoming_connectors ic ON ic.id = m.incoming_connector_id
            WHERE ${predicates.join(' AND ')}
             ORDER BY m.received_at DESC
-            LIMIT $${values.length - 1} OFFSET $${values.length}`,
-          values,
-        );
+            LIMIT $${rowsValues.length - 1} OFFSET $${rowsValues.length}`,
+            rowsValues,
+          ),
+    ]);
     return {
       messages: result.rows,
       totalCount: Number(countResult.rows[0]?.count ?? 0),
@@ -2101,10 +3213,11 @@ export const registerRoutes = async (app: FastifyInstance) => {
       ? ['succeeded']
       : ['pending', 'processing', 'failed'];
     const searchText = String(queryObject?.q ?? '').trim();
-    const limitInput = Number(queryObject?.limit ?? 50);
-    const offsetInput = Number(queryObject?.offset ?? 0);
-    const limit = Number.isFinite(limitInput) && limitInput > 0 ? Math.floor(limitInput) : 50;
-    const offset = Number.isFinite(offsetInput) && offsetInput >= 0 ? Math.floor(offsetInput) : 0;
+    if (searchText.length > MAX_SEND_ONLY_SEARCH_CHARS) {
+      return reply.code(400).send({ error: `q exceeds ${MAX_SEND_ONLY_SEARCH_CHARS} characters` });
+    }
+    const limit = parsePositiveIntWithCap(queryObject?.limit, 50, MAX_MESSAGES_PAGE_LIMIT);
+    const offset = parseNonNegativeIntWithCap(queryObject?.offset, 0, MAX_MESSAGES_OFFSET);
 
     const values: any[] = [userId, emailAddress, statuses];
     const predicates = [
@@ -2199,20 +3312,34 @@ export const registerRoutes = async (app: FastifyInstance) => {
       }
       q = saved.queryText;
     }
-    const parsedQuery = required(q, 'q');
-    const limit = Number(body?.limit ?? 50);
-    const folder = await normalizeConnectorFolderFilter(userId, body?.folder as string | undefined, body?.connectorId as string | undefined);
+    const normalizedQuery = String(q ?? '').trim();
+    if (!normalizedQuery) {
+      return reply.code(400).send({ error: 'q is required' });
+    }
+    if (normalizedQuery.length > MAX_MESSAGES_SEARCH_QUERY_CHARS) {
+      return reply.code(400).send({ error: `q exceeds ${MAX_MESSAGES_SEARCH_QUERY_CHARS} characters` });
+    }
+    const limit = parsePositiveIntWithCap(body?.limit, 50, MAX_MESSAGES_PAGE_LIMIT);
+    const connectorId = String(body?.connectorId ?? '').trim();
+    const resolvedConnectorIsGmailLike = connectorId
+      ? await getIncomingConnectorGmailLikeCached(userId, connectorId)
+      : null;
+    const resolvedConnector = connectorId && resolvedConnectorIsGmailLike !== null
+      ? (resolvedConnectorIsGmailLike ? { provider: 'gmail' } : { provider: 'imap' })
+      : null;
+    const folder = normalizeConnectorFolderFilterWithConnector(
+      body?.folder as string | undefined,
+      resolvedConnector,
+    );
     const normalizedFolder = String(folder ?? '').trim().toUpperCase();
-    const connectorId = body?.connectorId;
 
-    const parsed = parseMessageSearchQuery(String(parsedQuery));
+    const parsed = parseMessageSearchQuery(normalizedQuery);
     const parsedResult = buildMessageSearchQuery(userId, parsed);
     const values = parsedResult.values;
     const predicates = parsedResult.predicates;
-    const folderFilter = await buildGmailFolderPredicates(
-      userId,
+    const folderFilter = buildGmailFolderPredicatesWithConnector(
       body?.folder as string | undefined,
-      body?.connectorId as string | undefined,
+      resolvedConnector,
     );
     if (normalizedFolder !== 'STARRED' && folder) {
       if (folderFilter.candidates && folderFilter.candidates.length > 0) {
@@ -2237,104 +3364,118 @@ export const registerRoutes = async (app: FastifyInstance) => {
     }
 
     const shouldDedupeLogicalMessages = !folder || folderFilter.dedupeLogicalMessages;
+    const dedupeKeyExpr = logicalMessageKeySql('m');
 
-    const countResult = shouldDedupeLogicalMessages
-      ? await query<{ count: string }>(
-          `SELECT COUNT(*)::int as count
-             FROM (
-               SELECT DISTINCT m.incoming_connector_id, COALESCE(NULLIF(m.gmail_message_id, ''), LOWER(NULLIF(m.message_id, '')), m.id::text)
-                 FROM messages m
-                 INNER JOIN incoming_connectors ic ON ic.id = m.incoming_connector_id
-                WHERE ${predicates.join(' AND ')}
-             ) dedup`,
-          values,
-        )
-      : await query<{ count: string }>(
-          `SELECT COUNT(*)::int as count
-             FROM messages m
-             INNER JOIN incoming_connectors ic ON ic.id = m.incoming_connector_id
-            WHERE ${predicates.join(' AND ')}`,
-          values,
-        );
+    const offset = parseNonNegativeIntWithCap((req.body as any)?.offset, 0, MAX_MESSAGES_OFFSET);
+    const countValues = [...values];
+    const rowsValues = [...values, limit, offset];
 
-    const offsetInput = Number((req.body as any)?.offset ?? 0);
-    const offset = Number.isFinite(offsetInput) && offsetInput >= 0 ? Math.floor(offsetInput) : 0;
-    
-    values.push(Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : 50, offset);
-
-    const result = shouldDedupeLogicalMessages
-      ? await query<any>(
-          `SELECT dedup.id,
-                  dedup."incomingConnectorId",
-                  dedup."messageId",
-                  dedup.subject,
-                  dedup."fromHeader",
-                  dedup."toHeader",
-                  dedup."folderPath",
-                  dedup.snippet,
-                  dedup."receivedAt",
-                  dedup."threadId",
-                  dedup."isRead",
-                  dedup."isStarred",
-                  dedup.thread_count as "threadCount",
-                  dedup.participants
-             FROM (
-               SELECT DISTINCT ON (m.incoming_connector_id, COALESCE(NULLIF(m.gmail_message_id, ''), LOWER(NULLIF(m.message_id, '')), m.id::text))
-                      m.id,
-                      m.incoming_connector_id as "incomingConnectorId",
-                      m.message_id as "messageId",
-                      m.subject,
-                      m.from_header as "fromHeader",
-                      m.to_header as "toHeader",
-                      m.folder_path as "folderPath",
-                      m.snippet,
-                      m.received_at as "receivedAt",
-                      m.thread_id as "threadId",
-                      m.is_read as "isRead",
-                      m.is_starred as "isStarred",
+    const [countResult, result] = await Promise.all([
+      shouldDedupeLogicalMessages
+        ? query<{ count: string }>(
+            `SELECT COUNT(*)::int as count
+               FROM (
+                 SELECT DISTINCT m.incoming_connector_id, ${dedupeKeyExpr}
+                   FROM messages m
+                   INNER JOIN incoming_connectors ic ON ic.id = m.incoming_connector_id
+                  WHERE ${predicates.join(' AND ')}
+               ) dedup`,
+            countValues,
+          )
+        : query<{ count: string }>(
+            `SELECT COUNT(*)::int as count
+               FROM messages m
+               INNER JOIN incoming_connectors ic ON ic.id = m.incoming_connector_id
+              WHERE ${predicates.join(' AND ')}`,
+            countValues,
+          ),
+      shouldDedupeLogicalMessages
+        ? query<any>(
+            `WITH dedup AS (
+             SELECT DISTINCT ON (m.incoming_connector_id, ${dedupeKeyExpr})
+                    m.id,
+                    m.incoming_connector_id as "incomingConnectorId",
+                    m.message_id as "messageId",
+                    m.subject,
+                    m.from_header as "fromHeader",
+                    m.to_header as "toHeader",
+                    m.folder_path as "folderPath",
+                    m.snippet,
+                    m.received_at as "receivedAt",
+                    m.thread_id as "threadId",
+                    m.is_read as "isRead",
+                    m.is_starred as "isStarred"
+               FROM messages m
+               INNER JOIN incoming_connectors ic ON ic.id = m.incoming_connector_id
+              WHERE ${predicates.join(' AND ')}
+              ORDER BY
+                m.incoming_connector_id,
+                ${dedupeKeyExpr},
+                ${mailboxReadPreferenceRankSql},
+                m.received_at DESC NULLS LAST,
+                m.updated_at DESC,
+                m.id DESC
+           ),
+           paged AS (
+             SELECT *
+               FROM dedup
+              ORDER BY "receivedAt" DESC, id DESC
+              LIMIT $${rowsValues.length - 1} OFFSET $${rowsValues.length}
+           ),
+           thread_ids AS (
+             SELECT DISTINCT
+                    p."incomingConnectorId" as incoming_connector_id,
+                    p."threadId" as thread_id
+               FROM paged p
+              WHERE p."threadId" IS NOT NULL
+           ),
+           thread_stats AS (
+             SELECT m3.incoming_connector_id,
+                    m3.thread_id,
+                    COUNT(DISTINCT ${logicalMessageKeySql('m3')})::int as thread_count,
+                    COALESCE(
+                      jsonb_agg(DISTINCT m3.from_header) FILTER (WHERE m3.from_header IS NOT NULL),
+                      '[]'::jsonb
+                    ) as participants
+               FROM messages m3
+               INNER JOIN thread_ids ti
+                 ON ti.incoming_connector_id = m3.incoming_connector_id
+                AND ti.thread_id = m3.thread_id
+              GROUP BY m3.incoming_connector_id, m3.thread_id
+           )
+           SELECT p.id,
+                  p."incomingConnectorId",
+                  p."messageId",
+                  p.subject,
+                  p."fromHeader",
+                  p."toHeader",
+                  p."folderPath",
+                  p.snippet,
+                  p."receivedAt",
+                  p."threadId",
+                  p."isRead",
+                  p."isStarred",
+                  CASE
+                    WHEN p."threadId" IS NULL THEN 1
+                    ELSE COALESCE(ts.thread_count, 1)
+                  END as "threadCount",
+                  CASE
+                    WHEN p."threadId" IS NULL THEN
                       CASE
-                        WHEN m.thread_id IS NULL THEN 1
-                        ELSE (
-                          SELECT COUNT(DISTINCT COALESCE(NULLIF(m3.gmail_message_id, ''), LOWER(NULLIF(m3.message_id, '')), m3.id::text))
-                            FROM messages m3
-                           WHERE m3.incoming_connector_id = m.incoming_connector_id
-                             AND m3.thread_id = m.thread_id
-                        )
-                      END as thread_count,
-                      CASE
-                        WHEN m.thread_id IS NULL THEN
-                          CASE
-                            WHEN m.from_header IS NULL THEN '[]'::jsonb
-                            ELSE jsonb_build_array(m.from_header)
-                          END
-                        ELSE COALESCE((
-                          SELECT jsonb_agg(thread_participant.participant)
-                            FROM (
-                              SELECT DISTINCT m2.from_header AS participant
-                                FROM messages m2
-                               WHERE m2.incoming_connector_id = m.incoming_connector_id
-                                 AND m2.thread_id = m.thread_id
-                                 AND m2.from_header IS NOT NULL
-                            ) thread_participant
-                        ), '[]'::jsonb)
-                      END as participants
-                 FROM messages m
-                 INNER JOIN incoming_connectors ic ON ic.id = m.incoming_connector_id
-                WHERE ${predicates.join(' AND ')}
-                ORDER BY
-                  m.incoming_connector_id,
-                  COALESCE(NULLIF(m.gmail_message_id, ''), LOWER(NULLIF(m.message_id, '')), m.id::text),
-                  ${mailboxReadPreferenceRankSql},
-                  m.received_at DESC NULLS LAST,
-                  m.updated_at DESC,
-                  m.id DESC
-             ) dedup
-            ORDER BY dedup."receivedAt" DESC, dedup.id DESC
-            LIMIT $${values.length - 1} OFFSET $${values.length}`,
-          values,
-        )
-      : await query<any>(
-          `SELECT m.id,
+                        WHEN p."fromHeader" IS NULL THEN '[]'::jsonb
+                        ELSE jsonb_build_array(p."fromHeader")
+                      END
+                    ELSE COALESCE(ts.participants, '[]'::jsonb)
+                  END as participants
+             FROM paged p
+             LEFT JOIN thread_stats ts
+               ON ts.incoming_connector_id = p."incomingConnectorId"
+              AND ts.thread_id = p."threadId"
+            ORDER BY p."receivedAt" DESC, p.id DESC`,
+            rowsValues,
+          )
+        : query<any>(
+            `SELECT m.id,
                   m.incoming_connector_id as "incomingConnectorId",
                   m.message_id as "messageId",
                   m.subject,
@@ -2352,9 +3493,10 @@ export const registerRoutes = async (app: FastifyInstance) => {
              INNER JOIN incoming_connectors ic ON ic.id = m.incoming_connector_id
             WHERE ${predicates.join(' AND ')}
             ORDER BY m.received_at DESC
-            LIMIT $${values.length - 1} OFFSET $${values.length}`,
-          values,
-        );
+            LIMIT $${rowsValues.length - 1} OFFSET $${rowsValues.length}`,
+            rowsValues,
+          ),
+    ]);
     return {
       messages: result.rows,
       totalCount: Number(countResult.rows[0]?.count ?? 0),
@@ -2363,98 +3505,133 @@ export const registerRoutes = async (app: FastifyInstance) => {
 
   app.get('/api/search/quick-filters', async (req) => {
     const userId = getUserId(req);
-    const labelRows = await query<{ key: string; name: string; count: number }>(
-      `SELECT l.key, l.name, COUNT(ml.message_id)::int as count
-         FROM labels l
-         LEFT JOIN message_labels ml ON ml.label_id = l.id
-         LEFT JOIN messages m ON m.id = ml.message_id
-         LEFT JOIN incoming_connectors ic ON ic.id = m.incoming_connector_id
-         WHERE l.user_id = $1
-           AND l.is_archived = FALSE
-           AND (ic.user_id = $1 OR m.id IS NULL)
-         GROUP BY l.key, l.name
-         ORDER BY COUNT(ml.message_id) DESC, l.name ASC`,
-      [userId],
-    );
+    const cached = getTimedCacheValue(quickFiltersCache, userId);
+    if (cached) {
+      return cached;
+    }
 
-    const starredRow = await query<{ count: number }>(
-      `SELECT COUNT(*)::int as count
-         FROM messages m
-         INNER JOIN incoming_connectors ic ON ic.id = m.incoming_connector_id
-        WHERE ic.user_id = $1 AND m.is_starred = TRUE`,
-      [userId],
-    );
+    const [labelRows, starredRow, attachmentRow, fromResult] = await Promise.all([
+      query<{ key: string; name: string; count: number }>(
+        `SELECT l.key, l.name, COUNT(ml.message_id)::int as count
+           FROM labels l
+           LEFT JOIN message_labels ml ON ml.label_id = l.id
+           LEFT JOIN messages m ON m.id = ml.message_id
+           LEFT JOIN incoming_connectors ic ON ic.id = m.incoming_connector_id
+           WHERE l.user_id = $1
+             AND l.is_archived = FALSE
+             AND (ic.user_id = $1 OR m.id IS NULL)
+           GROUP BY l.key, l.name
+           ORDER BY COUNT(ml.message_id) DESC, l.name ASC`,
+        [userId],
+      ),
+      query<{ count: number }>(
+        `SELECT COUNT(*)::int as count
+           FROM messages m
+           INNER JOIN incoming_connectors ic ON ic.id = m.incoming_connector_id
+          WHERE ic.user_id = $1 AND m.is_starred = TRUE`,
+        [userId],
+      ),
+      query<{ count: number }>(
+        `SELECT COUNT(DISTINCT m.id)::int as count
+           FROM messages m
+           INNER JOIN incoming_connectors ic ON ic.id = m.incoming_connector_id
+           INNER JOIN attachments a ON a.message_id = m.id
+          WHERE ic.user_id = $1`,
+        [userId],
+      ),
+      query<{ fromHeader: string; count: number }>(
+        `SELECT m.from_header as "fromHeader", COUNT(*)::int as count
+           FROM messages m
+           INNER JOIN incoming_connectors ic ON ic.id = m.incoming_connector_id
+          WHERE ic.user_id = $1
+            AND m.from_header IS NOT NULL
+            AND m.from_header <> ''
+          GROUP BY m.from_header
+          ORDER BY COUNT(*) DESC, m.from_header
+          LIMIT 10`,
+        [userId],
+      ),
+    ]);
 
-    const attachmentRow = await query<{ count: number }>(
-      `SELECT COUNT(DISTINCT m.id)::int as count
-         FROM messages m
-         INNER JOIN incoming_connectors ic ON ic.id = m.incoming_connector_id
-         INNER JOIN attachments a ON a.message_id = m.id
-        WHERE ic.user_id = $1`,
-      [userId],
-    );
-
-    const fromResult = await query<{ fromHeader: string }>(
-      `SELECT m.from_header as "fromHeader", COUNT(*)::int as count
-         FROM messages m
-         INNER JOIN incoming_connectors ic ON ic.id = m.incoming_connector_id
-        WHERE ic.user_id = $1
-          AND m.from_header IS NOT NULL
-          AND m.from_header <> ''
-        GROUP BY m.from_header
-        ORDER BY COUNT(*) DESC, m.from_header
-        LIMIT 10`,
-      [userId],
-    );
-
-    return {
+    const payload: QuickFiltersResponse = {
       labels: labelRows.rows,
       starred: Number(starredRow.rows[0]?.count ?? 0),
       withAttachments: Number(attachmentRow.rows[0]?.count ?? 0),
       topFrom: fromResult.rows,
     };
+    setTimedCacheValue(
+      quickFiltersCache,
+      userId,
+      payload,
+      SEARCH_QUICK_FILTERS_CACHE_TTL_MS,
+      SEARCH_QUICK_FILTERS_CACHE_MAX,
+    );
+    return payload;
   });
 
-  app.get('/api/search/suggestions', async (req) => {
+  app.get('/api/search/suggestions', async (req, reply) => {
     const userId = getUserId(req);
-    const queryText = required((req.query as any)?.q, 'q');
-    const prefix = `%${String(queryText)}%`;
-    const labelResult = await query<{ key: string; name: string }>(
-      `SELECT key, name
-         FROM labels
-        WHERE user_id = $1
-          AND is_archived = FALSE
-          AND (key ILIKE $2 OR name ILIKE $2)
-        LIMIT 10`,
-      [userId, prefix],
-    );
-    const fromResult = await query<{ fromHeader: string }>(
-      `SELECT from_header as "fromHeader", COUNT(*)::int as count
-         FROM messages m
-         INNER JOIN incoming_connectors ic ON ic.id = m.incoming_connector_id
-        WHERE ic.user_id = $1
-          AND from_header ILIKE $2
-        GROUP BY from_header
-        ORDER BY COUNT(*) DESC, from_header
-        LIMIT 10`,
-      [userId, prefix],
-    );
-    const subjectResult = await query<{ subject: string }>(
-      `SELECT subject, COUNT(*)::int as count
-         FROM messages m
-         INNER JOIN incoming_connectors ic ON ic.id = m.incoming_connector_id
-        WHERE ic.user_id = $1
-          AND subject ILIKE $2
-        GROUP BY subject
-        ORDER BY COUNT(*) DESC, subject
-        LIMIT 10`,
-      [userId, prefix],
-    );
-    return {
+    const queryText = String((req.query as any)?.q ?? '').trim();
+    if (!queryText) {
+      return reply.code(400).send({ error: 'q is required' });
+    }
+    if (queryText.length > MAX_SEARCH_SUGGESTION_QUERY_CHARS) {
+      return reply.code(400).send({ error: `q exceeds ${MAX_SEARCH_SUGGESTION_QUERY_CHARS} characters` });
+    }
+    const cacheKey = `${userId}:${queryText.toLowerCase()}`;
+    const cached = getTimedCacheValue(searchSuggestionsCache, cacheKey);
+    if (cached) {
+      return cached;
+    }
+
+    const prefix = `%${queryText}%`;
+    const [labelResult, fromResult, subjectResult] = await Promise.all([
+      query<{ key: string; name: string }>(
+        `SELECT key, name
+           FROM labels
+          WHERE user_id = $1
+            AND is_archived = FALSE
+            AND (key ILIKE $2 OR name ILIKE $2)
+          LIMIT 10`,
+        [userId, prefix],
+      ),
+      query<{ fromHeader: string; count: number }>(
+        `SELECT from_header as "fromHeader", COUNT(*)::int as count
+           FROM messages m
+           INNER JOIN incoming_connectors ic ON ic.id = m.incoming_connector_id
+          WHERE ic.user_id = $1
+            AND from_header ILIKE $2
+          GROUP BY from_header
+          ORDER BY COUNT(*) DESC, from_header
+          LIMIT 10`,
+        [userId, prefix],
+      ),
+      query<{ subject: string; count: number }>(
+        `SELECT subject, COUNT(*)::int as count
+           FROM messages m
+           INNER JOIN incoming_connectors ic ON ic.id = m.incoming_connector_id
+          WHERE ic.user_id = $1
+            AND subject ILIKE $2
+          GROUP BY subject
+          ORDER BY COUNT(*) DESC, subject
+          LIMIT 10`,
+        [userId, prefix],
+      ),
+    ]);
+
+    const payload: SearchSuggestionsResponse = {
       labels: labelResult.rows,
       from: fromResult.rows,
       subjects: subjectResult.rows,
     };
+    setTimedCacheValue(
+      searchSuggestionsCache,
+      cacheKey,
+      payload,
+      SEARCH_SUGGESTIONS_CACHE_TTL_MS,
+      SEARCH_SUGGESTIONS_CACHE_MAX,
+    );
+    return payload;
   });
 
   app.get('/api/saved-searches', async (req) => {
@@ -2468,9 +3645,20 @@ export const registerRoutes = async (app: FastifyInstance) => {
     if (!body?.name || !body?.queryText) {
       return reply.code(400).send({ error: 'name and queryText required' });
     }
+    const name = String(body.name).trim();
+    const queryText = String(body.queryText).trim();
+    if (!name || !queryText) {
+      return reply.code(400).send({ error: 'name and queryText required' });
+    }
+    if (name.length > MAX_SAVED_SEARCH_NAME_CHARS) {
+      return reply.code(400).send({ error: `name exceeds ${MAX_SAVED_SEARCH_NAME_CHARS} characters` });
+    }
+    if (queryText.length > MAX_SAVED_SEARCH_QUERY_CHARS) {
+      return reply.code(400).send({ error: `queryText exceeds ${MAX_SAVED_SEARCH_QUERY_CHARS} characters` });
+    }
     return createSavedSearch(userId, {
-      name: String(body.name),
-      queryText: String(body.queryText),
+      name,
+      queryText,
       isStarred: body.isStarred === true,
       queryAst: body.queryAst,
     });
@@ -2493,9 +3681,23 @@ export const registerRoutes = async (app: FastifyInstance) => {
     if (!body || typeof body !== 'object') {
       return reply.code(400).send({ error: 'request body required' });
     }
+    const nextName = body.name === undefined ? undefined : String(body.name).trim();
+    const nextQueryText = body.queryText === undefined ? undefined : String(body.queryText).trim();
+    if (nextName !== undefined && !nextName) {
+      return reply.code(400).send({ error: 'name cannot be empty' });
+    }
+    if (nextQueryText !== undefined && !nextQueryText) {
+      return reply.code(400).send({ error: 'queryText cannot be empty' });
+    }
+    if (nextName && nextName.length > MAX_SAVED_SEARCH_NAME_CHARS) {
+      return reply.code(400).send({ error: `name exceeds ${MAX_SAVED_SEARCH_NAME_CHARS} characters` });
+    }
+    if (nextQueryText && nextQueryText.length > MAX_SAVED_SEARCH_QUERY_CHARS) {
+      return reply.code(400).send({ error: `queryText exceeds ${MAX_SAVED_SEARCH_QUERY_CHARS} characters` });
+    }
     await updateSavedSearch(userId, id, {
-      name: body.name,
-      queryText: body.queryText,
+      name: nextName,
+      queryText: nextQueryText,
       queryAst: body.queryAst,
       isStarred: body.isStarred,
     });
@@ -2534,6 +3736,7 @@ export const registerRoutes = async (app: FastifyInstance) => {
     if (!message) {
       return reply.code(404).send({ error: 'message not found' });
     }
+    delete message.raw_blob_key;
 
     const attachments = await query<any>(
       `WITH ranked AS (
@@ -2542,7 +3745,6 @@ export const registerRoutes = async (app: FastifyInstance) => {
                 a.filename,
                 a.content_type,
                 a.size_bytes,
-                a.blob_key,
                 a.is_inline,
                 a.scan_status,
                 a.scan_result,
@@ -2559,7 +3761,7 @@ export const registerRoutes = async (app: FastifyInstance) => {
               filename,
               content_type as "contentType",
               size_bytes as "size",
-              blob_key as "blobKey",
+              NULL::text as "blobKey",
               is_inline as "isInline",
               scan_status as "scanStatus",
               scan_result as "scanResult",
@@ -2590,15 +3792,21 @@ export const registerRoutes = async (app: FastifyInstance) => {
       return reply.code(404).send({ error: 'message not found' });
     }
 
-    const data = await blobStore.getObject(row.rawBlobKey);
-    if (!data) {
+    const blob = await blobStore.getObjectStream(row.rawBlobKey);
+    if (!blob) {
       return reply.code(404).send({ error: 'message source not found' });
     }
 
     const filename = sanitizeDispositionFilename(`${messageId}.eml`, 'message.eml');
     reply.header('Content-Type', 'message/rfc822');
+    reply.header('X-Content-Type-Options', 'nosniff');
+    reply.header('Cache-Control', 'private, no-store');
+    reply.header('Pragma', 'no-cache');
     reply.header('Content-Disposition', `attachment; filename="${filename}"`);
-    return reply.send(data);
+    if (blob.size !== null) {
+      reply.header('Content-Length', String(blob.size));
+    }
+    return reply.send(blob.stream);
   });
 
   // Bulk-update multiple messages in a single request.
@@ -2609,10 +3817,26 @@ export const registerRoutes = async (app: FastifyInstance) => {
     if (!Array.isArray(rawIds) || rawIds.length === 0) {
       return reply.code(400).send({ error: 'messageIds array required' });
     }
-
-    const messageIds = rawIds.map(String).slice(0, 500); // safety cap
+    if (rawIds.length > 500) {
+      return reply.code(400).send({ error: 'messageIds exceeds 500 items' });
+    }
+    let messageIds: string[];
+    try {
+      messageIds = parseTrimmedStringArrayWithCap(rawIds, 'messageIds', 500);
+      assertUuidList(messageIds, 'messageIds');
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : 'invalid messageIds' });
+    }
     const scope = body?.scope === 'thread' ? 'thread' : 'single';
-    if (isArchiveMoveTarget(body?.moveToFolder)) {
+    let normalizedMoveToFolder: string | undefined;
+    try {
+      if (body?.moveToFolder !== undefined && body?.moveToFolder !== null && String(body.moveToFolder).trim()) {
+        normalizedMoveToFolder = normalizeMailboxInput(body.moveToFolder, 'moveToFolder');
+      }
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : 'invalid moveToFolder' });
+    }
+    if (isArchiveMoveTarget(normalizedMoveToFolder)) {
       return reply.code(400).send({ error: 'archive is no longer supported' });
     }
 
@@ -2623,9 +3847,24 @@ export const registerRoutes = async (app: FastifyInstance) => {
     }
 
     for (const chunk of chunks) {
+      const chunkMessagesResult = await query<any>(
+        `SELECT m.id,
+                m.incoming_connector_id,
+                m.folder_path,
+                m.uid
+           FROM messages m
+           INNER JOIN incoming_connectors ic ON ic.id = m.incoming_connector_id
+          WHERE ic.user_id = $1
+            AND m.id::text = ANY($2::text[])`,
+        [userId, chunk],
+      );
+      const messageById = new Map<string, any>(
+        chunkMessagesResult.rows.map((row) => [String(row.id), row]),
+      );
+
       await Promise.all(chunk.map(async (messageId) => {
         try {
-          const message = await getMessageAndConnectorForUser(userId, messageId);
+          const message = messageById.get(messageId) ?? null;
           if (!message) {
             results.push({ id: messageId, status: 'not_found' });
             return;
@@ -2635,7 +3874,7 @@ export const registerRoutes = async (app: FastifyInstance) => {
             await applyThreadMessageActions(userId, message.id, {
               isRead: body?.isRead,
               isStarred: body?.isStarred,
-              moveToFolder: body?.moveToFolder,
+              moveToFolder: normalizedMoveToFolder,
               delete: body?.delete,
             });
           } else {
@@ -2645,8 +3884,15 @@ export const registerRoutes = async (app: FastifyInstance) => {
             if (body?.isStarred !== undefined) {
               await setMessageStarredState(userId, message.id, message.incoming_connector_id, message.folder_path, message.uid === null || message.uid === undefined ? null : Number(message.uid), Boolean(body.isStarred));
             }
-            if (body?.moveToFolder) {
-              await moveMessageInMailbox(userId, message.id, message.incoming_connector_id, message.folder_path, String(body.moveToFolder), message.uid === null || message.uid === undefined ? null : Number(message.uid));
+            if (normalizedMoveToFolder) {
+              await moveMessageInMailbox(
+                userId,
+                message.id,
+                message.incoming_connector_id,
+                message.folder_path,
+                normalizedMoveToFolder,
+                message.uid === null || message.uid === undefined ? null : Number(message.uid),
+              );
             }
             if (body?.delete === true) {
               await deleteMessageFromMailbox(userId, message.id, message.incoming_connector_id, message.folder_path, message.uid === null || message.uid === undefined ? null : Number(message.uid));
@@ -2659,6 +3905,7 @@ export const registerRoutes = async (app: FastifyInstance) => {
       }));
     }
 
+    clearSearchCachesForUser(userId);
     return { results };
   });
 
@@ -2676,7 +3923,23 @@ export const registerRoutes = async (app: FastifyInstance) => {
     if (!body || typeof body !== 'object') {
       return reply.code(400).send({ error: 'request body required' });
     }
-    if (isArchiveMoveTarget(body?.moveToFolder)) {
+    let normalizedMoveToFolder: string | undefined;
+    let addLabelKeys: string[] | undefined;
+    let removeLabelKeys: string[] | undefined;
+    try {
+      if (body?.moveToFolder !== undefined && body?.moveToFolder !== null && String(body.moveToFolder).trim()) {
+        normalizedMoveToFolder = normalizeMailboxInput(body.moveToFolder, 'moveToFolder');
+      }
+      if (body?.addLabelKeys !== undefined) {
+        addLabelKeys = parseTrimmedStringArrayWithCap(body.addLabelKeys, 'addLabelKeys', MAX_LABEL_MUTATION_ITEMS);
+      }
+      if (body?.removeLabelKeys !== undefined) {
+        removeLabelKeys = parseTrimmedStringArrayWithCap(body.removeLabelKeys, 'removeLabelKeys', MAX_LABEL_MUTATION_ITEMS);
+      }
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : 'invalid message action payload' });
+    }
+    if (isArchiveMoveTarget(normalizedMoveToFolder)) {
       return reply.code(400).send({ error: 'archive is no longer supported' });
     }
 
@@ -2684,11 +3947,12 @@ export const registerRoutes = async (app: FastifyInstance) => {
       await applyThreadMessageActions(userId, message.id, {
         isRead: body?.isRead,
         isStarred: body?.isStarred,
-        moveToFolder: body?.moveToFolder,
+        moveToFolder: normalizedMoveToFolder,
         delete: body?.delete,
-        addLabelKeys: Array.isArray(body?.addLabelKeys) ? body.addLabelKeys : undefined,
-        removeLabelKeys: Array.isArray(body?.removeLabelKeys) ? body.removeLabelKeys : undefined,
+        addLabelKeys,
+        removeLabelKeys,
       });
+      clearSearchCachesForUser(userId);
       return { status: 'thread_updated', id: messageId };
     }
 
@@ -2714,20 +3978,20 @@ export const registerRoutes = async (app: FastifyInstance) => {
       );
     }
 
-    if (Array.isArray(body?.addLabelKeys)) {
-      await addLabelsToMessageByKey(userId, message.id, body.addLabelKeys);
+    if (addLabelKeys?.length) {
+      await addLabelsToMessageByKey(userId, message.id, addLabelKeys);
     }
-    if (Array.isArray(body?.removeLabelKeys)) {
-      await removeLabelsFromMessageByKey(userId, message.id, body.removeLabelKeys);
+    if (removeLabelKeys?.length) {
+      await removeLabelsFromMessageByKey(userId, message.id, removeLabelKeys);
     }
 
-    if (body?.moveToFolder) {
+    if (normalizedMoveToFolder) {
       await moveMessageInMailbox(
         userId,
         message.id,
         message.incoming_connector_id,
         message.folder_path,
-        String(body.moveToFolder),
+        normalizedMoveToFolder,
         message.uid === null || message.uid === undefined ? null : Number(message.uid),
       );
     }
@@ -2740,16 +4004,23 @@ export const registerRoutes = async (app: FastifyInstance) => {
         message.folder_path,
         message.uid === null || message.uid === undefined ? null : Number(message.uid),
       );
+      clearSearchCachesForUser(userId);
       return { status: 'deleted', id: messageId };
     }
 
     const after = await query<any>(
-      `SELECT * FROM messages m
+      `SELECT m.*
+       FROM messages m
        INNER JOIN incoming_connectors ic ON ic.id = m.incoming_connector_id
        WHERE m.id = $1 AND ic.user_id = $2`,
       [messageId, userId],
     );
-    return after.rows[0];
+    const refreshed = after.rows[0];
+    if (refreshed) {
+      delete refreshed.raw_blob_key;
+    }
+    clearSearchCachesForUser(userId);
+    return refreshed;
   });
 
   app.get('/api/messages/:messageId/attachments', async (req) => {
@@ -2762,7 +4033,6 @@ export const registerRoutes = async (app: FastifyInstance) => {
                 a.filename,
                 a.content_type,
                 a.size_bytes,
-                a.blob_key,
                 a.is_inline,
                 a.scan_status,
                 a.scan_result,
@@ -2781,7 +4051,7 @@ export const registerRoutes = async (app: FastifyInstance) => {
               filename,
               content_type as "contentType",
               size_bytes as "size",
-              blob_key as "blobKey",
+              NULL::text as "blobKey",
               is_inline as "isInline",
               scan_status as "scanStatus",
               scan_result as "scanResult",
@@ -2797,6 +4067,9 @@ export const registerRoutes = async (app: FastifyInstance) => {
   app.get('/api/attachments/:attachmentId/download', async (req, reply) => {
     const userId = getUserId(req);
     const attachmentId = String((req.params as any).attachmentId);
+    if (!UUID_PATTERN.test(attachmentId)) {
+      return reply.code(400).send({ error: 'invalid attachmentId' });
+    }
     const attachmentResult = await query<any>(
       `SELECT a.filename,
               a.blob_key,
@@ -2812,54 +4085,73 @@ export const registerRoutes = async (app: FastifyInstance) => {
     if (!attachment) {
       return reply.code(404).send({ error: 'attachment not found' });
     }
-    if (attachment.scanStatus === 'infected') {
-      return reply.code(403).send({ error: 'attachment blocked: malware detected' });
+    const scanBlock = getAttachmentScanBlock(attachment.scanStatus);
+    if (scanBlock) {
+      return reply.code(scanBlock.statusCode).send({ error: scanBlock.error });
     }
 
-    const data = await blobStore.getObject(attachment.blob_key);
-    if (!data) {
-      return reply.code(404).send({ error: 'attachment blob not found' });
-    }
-
-    const filename = sanitizeDispositionFilename(attachment.filename, 'attachment');
-    reply.header('Content-Type', attachment.contentType || 'application/octet-stream');
-    reply.header('Content-Disposition', `attachment; filename="${filename}"`);
-    return reply.send(data);
-  });
-
-  app.get('/api/attachments/:attachmentId/view', async (req, reply) => {
-    const userId = getUserId(req);
-    const attachmentId = String((req.params as any).attachmentId);
-    const attachmentResult = await query<any>(
-      `SELECT a.filename,
-              a.blob_key,
-              a.content_type as "contentType",
-              a.scan_status as "scanStatus"
-         FROM attachments a
-         INNER JOIN messages m ON m.id = a.message_id
-         INNER JOIN incoming_connectors ic ON ic.id = m.incoming_connector_id
-        WHERE a.id = $1 AND ic.user_id = $2`,
-      [attachmentId, userId],
-    );
-    const attachment = attachmentResult.rows[0];
-    if (!attachment) {
-      return reply.code(404).send({ error: 'attachment not found' });
-    }
-    if (attachment.scanStatus === 'infected') {
-      return reply.code(403).send({ error: 'attachment blocked: malware detected' });
-    }
-
-    const data = await blobStore.getObject(attachment.blob_key);
-    if (!data) {
+    const blob = await blobStore.getObjectStream(attachment.blob_key);
+    if (!blob) {
       return reply.code(404).send({ error: 'attachment blob not found' });
     }
 
     const filename = sanitizeDispositionFilename(attachment.filename, 'attachment');
     reply.header('Content-Type', attachment.contentType || 'application/octet-stream');
     reply.header('X-Content-Type-Options', 'nosniff');
-    reply.header('Content-Security-Policy', "sandbox; default-src 'none'; img-src data: blob: https:; media-src data: blob: https:; style-src 'unsafe-inline'");
+    reply.header('Cache-Control', 'private, no-store');
+    reply.header('Pragma', 'no-cache');
+    reply.header('Content-Disposition', `attachment; filename="${filename}"`);
+    if (blob.size !== null) {
+      reply.header('Content-Length', String(blob.size));
+    }
+    return reply.send(blob.stream);
+  });
+
+  app.get('/api/attachments/:attachmentId/view', async (req, reply) => {
+    const userId = getUserId(req);
+    const attachmentId = String((req.params as any).attachmentId);
+    if (!UUID_PATTERN.test(attachmentId)) {
+      return reply.code(400).send({ error: 'invalid attachmentId' });
+    }
+    const attachmentResult = await query<any>(
+      `SELECT a.filename,
+              a.blob_key,
+              a.content_type as "contentType",
+              a.scan_status as "scanStatus"
+         FROM attachments a
+         INNER JOIN messages m ON m.id = a.message_id
+         INNER JOIN incoming_connectors ic ON ic.id = m.incoming_connector_id
+        WHERE a.id = $1 AND ic.user_id = $2`,
+      [attachmentId, userId],
+    );
+    const attachment = attachmentResult.rows[0];
+    if (!attachment) {
+      return reply.code(404).send({ error: 'attachment not found' });
+    }
+    const scanBlock = getAttachmentScanBlock(attachment.scanStatus);
+    if (scanBlock) {
+      return reply.code(scanBlock.statusCode).send({ error: scanBlock.error });
+    }
+
+    const blob = await blobStore.getObjectStream(attachment.blob_key);
+    if (!blob) {
+      return reply.code(404).send({ error: 'attachment blob not found' });
+    }
+
+    const filename = sanitizeDispositionFilename(attachment.filename, 'attachment');
+    reply.header('Content-Type', attachment.contentType || 'application/octet-stream');
+    reply.header('X-Content-Type-Options', 'nosniff');
+    reply.header(
+      'Content-Security-Policy',
+      "sandbox; default-src 'none'; img-src data: blob:; media-src data: blob:; style-src 'unsafe-inline'",
+    );
+    reply.header('Cache-Control', 'private, no-store');
+    reply.header('Pragma', 'no-cache');
     reply.header('Content-Disposition', `inline; filename="${filename}"`);
-    return reply.send(data);
+    if (blob.size !== null) {
+      reply.header('Content-Length', String(blob.size));
+    }
+    return reply.send(blob.stream);
   });
 
   app.post('/api/messages/send', async (req, reply) => {
@@ -2887,7 +4179,12 @@ export const registerRoutes = async (app: FastifyInstance) => {
       return reply.code(404).send({ error: 'identity not found' });
     }
 
-    const idempotencyKey = normalizeSendIdempotencyKey(body.idempotencyKey ?? idempotencyHeader);
+    let idempotencyKey: string;
+    try {
+      idempotencyKey = normalizeSendIdempotencyKey(body.idempotencyKey ?? idempotencyHeader);
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : 'invalid idempotency key' });
+    }
     const toList = parseAddressList(body.to);
     if (!toList || toList.length === 0) {
       return reply.code(400).send({ error: 'to must include at least one valid email address' });
@@ -3072,6 +4369,9 @@ export const registerRoutes = async (app: FastifyInstance) => {
     }
     const attachmentId = String(body.attachmentId);
     const messageId = String(body.messageId);
+    if (!UUID_PATTERN.test(messageId) || !UUID_PATTERN.test(attachmentId)) {
+      return reply.code(400).send({ error: 'messageId and attachmentId must be valid UUID values' });
+    }
 
     const attachmentBelongs = await query<{ id: string; size_bytes: number | null; scan_status: string }>(
       `SELECT a.id, a.size_bytes, a.scan_status
@@ -3099,7 +4399,7 @@ export const registerRoutes = async (app: FastifyInstance) => {
         `UPDATE attachments
             SET scan_status = $2, scan_result = $3
           WHERE id = $1`,
-        [body.attachmentId, decision.status, decision.verdictHint],
+        [attachmentId, decision.status, decision.verdictHint],
       );
       return {
         status: decision.disposition === 'skip' ? decision.status : 'not_queued',
@@ -3119,7 +4419,7 @@ export const registerRoutes = async (app: FastifyInstance) => {
         `UPDATE attachments
          SET scan_status = 'pending', scan_result = NULL
          WHERE id = $1`,
-        [body.attachmentId],
+        [attachmentId],
       );
     }
 
@@ -3133,14 +4433,34 @@ export const registerRoutes = async (app: FastifyInstance) => {
     if (!body?.endpoint || !body?.p256dh || !body?.auth) {
       return reply.code(400).send({ error: 'endpoint, p256dh, auth required' });
     }
-    await assertSafePushEndpoint(String(body.endpoint));
+    const endpoint = String(body.endpoint).trim();
+    const p256dh = String(body.p256dh).trim();
+    const auth = String(body.auth).trim();
+    const userAgent = body.userAgent === undefined || body.userAgent === null
+      ? undefined
+      : String(body.userAgent).trim();
+
+    if (!endpoint || !p256dh || !auth) {
+      return reply.code(400).send({ error: 'endpoint, p256dh, auth required' });
+    }
+    if (endpoint.length > MAX_PUSH_ENDPOINT_CHARS) {
+      return reply.code(400).send({ error: `endpoint exceeds ${MAX_PUSH_ENDPOINT_CHARS} characters` });
+    }
+    if (p256dh.length > MAX_PUSH_KEY_CHARS || auth.length > MAX_PUSH_KEY_CHARS) {
+      return reply.code(400).send({ error: `p256dh/auth exceeds ${MAX_PUSH_KEY_CHARS} characters` });
+    }
+    if (userAgent && userAgent.length > MAX_PUSH_USER_AGENT_CHARS) {
+      return reply.code(400).send({ error: `userAgent exceeds ${MAX_PUSH_USER_AGENT_CHARS} characters` });
+    }
+
+    await assertSafePushEndpoint(endpoint);
 
     const subscription = await createPushSubscription({
       userId,
-      endpoint: String(body.endpoint),
-      p256dh: String(body.p256dh),
-      auth: String(body.auth),
-      userAgent: body.userAgent,
+      endpoint,
+      p256dh,
+      auth,
+      userAgent,
     });
     return subscription;
   });
@@ -3151,7 +4471,11 @@ export const registerRoutes = async (app: FastifyInstance) => {
     if (!body?.endpoint) {
       return reply.code(400).send({ error: 'endpoint required' });
     }
-    await removePushSubscription(userId, String(body.endpoint));
+    const endpoint = String(body.endpoint).trim();
+    if (!endpoint) {
+      return reply.code(400).send({ error: 'endpoint required' });
+    }
+    await removePushSubscription(userId, endpoint);
     return { status: 'deleted' };
   });
 };

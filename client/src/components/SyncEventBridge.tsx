@@ -1,38 +1,22 @@
 import { useEffect } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { api } from '../services/api';
+import { api, getAuthToken } from '../services/api';
+import { readStorageNumber, writeStorageString } from '../services/storage';
 
-const CURSOR_STORAGE_KEY = 'BETTERMAIL_SYNC_EVENT_CURSOR';
-const TOKEN_STORAGE_KEY = 'BETTERMAIL_USER_TOKEN';
-
-const resolveToken = () => {
-  const envToken = (import.meta.env.VITE_BETTERMAIL_USER_TOKEN as string | undefined)?.trim();
-  try {
-    const sessionToken = sessionStorage.getItem(TOKEN_STORAGE_KEY);
-    if (sessionToken) {
-      return sessionToken;
-    }
-    const legacyToken = localStorage.getItem(TOKEN_STORAGE_KEY);
-    if (legacyToken) {
-      sessionStorage.setItem(TOKEN_STORAGE_KEY, legacyToken);
-      localStorage.removeItem(TOKEN_STORAGE_KEY);
-      return legacyToken;
-    }
-  } catch {
-    // ignore storage failures and fall through to env token
-  }
-  return envToken ?? null;
-};
+const CURSOR_STORAGE_KEY = 'SIMPLEMAIL_SYNC_EVENT_CURSOR';
 
 const parseCursor = () => {
-  const raw = localStorage.getItem(CURSOR_STORAGE_KEY);
-  if (!raw) return 0;
-  const parsed = Number(raw);
-  return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : 0;
+  const parsed = readStorageNumber(CURSOR_STORAGE_KEY);
+  return parsed === null ? 0 : Math.max(0, Math.floor(parsed));
 };
 
 const saveCursor = (cursor: number) => {
-  localStorage.setItem(CURSOR_STORAGE_KEY, String(cursor));
+  writeStorageString(CURSOR_STORAGE_KEY, String(cursor));
+};
+
+type SyncEventPayload = {
+  incomingConnectorId?: string;
+  eventType?: string;
 };
 
 const parseSseFrame = (frame: string) => {
@@ -59,13 +43,13 @@ const parseSseFrame = (frame: string) => {
     }
   }
   if (dataLines.length === 0) {
-    return { id, eventName, payload: null as any };
+    return { id, eventName, payload: null as unknown };
   }
   const data = dataLines.join('\n');
   try {
-    return { id, eventName, payload: JSON.parse(data) as any };
+    return { id, eventName, payload: JSON.parse(data) as unknown };
   } catch {
-    return { id, eventName, payload: null as any };
+    return { id, eventName, payload: null as unknown };
   }
 };
 
@@ -142,7 +126,26 @@ const SyncEventBridge = () => {
         }
 
         if (shouldRefreshThreads) {
-          queryClient.invalidateQueries({ queryKey: ['thread'], refetchType: 'active' });
+          if (hasConnectorScope) {
+            queryClient.invalidateQueries({
+              predicate: (query) => {
+                if (!Array.isArray(query.queryKey) || query.queryKey[0] !== 'thread') {
+                  return false;
+                }
+                const scope = query.queryKey[2];
+                if (typeof scope !== 'string') {
+                  return true;
+                }
+                if (scope === 'all') {
+                  return true;
+                }
+                return connectorSet.has(scope);
+              },
+              refetchType: 'active',
+            });
+          } else {
+            queryClient.invalidateQueries({ queryKey: ['thread'], refetchType: 'active' });
+          }
         }
 
         if (shouldRefreshEvents) {
@@ -151,12 +154,13 @@ const SyncEventBridge = () => {
       }, 250);
     };
 
-    const markDirtyFromSyncEvent = (payload: any) => {
-      const connectorId = typeof payload?.incomingConnectorId === 'string'
-        ? payload.incomingConnectorId.trim()
+    const markDirtyFromSyncEvent = (payload: unknown) => {
+      const eventPayload = payload as SyncEventPayload | null;
+      const connectorId = typeof eventPayload?.incomingConnectorId === 'string'
+        ? eventPayload.incomingConnectorId.trim()
         : '';
-      const eventType = typeof payload?.eventType === 'string'
-        ? payload.eventType.trim().toLowerCase()
+      const eventType = typeof eventPayload?.eventType === 'string'
+        ? eventPayload.eventType.trim().toLowerCase()
         : '';
 
       if (connectorId) {
@@ -184,7 +188,7 @@ const SyncEventBridge = () => {
 
     const consumeStream = async () => {
       while (!disposed) {
-        const token = resolveToken();
+        const token = getAuthToken();
         if (!token) {
           await new Promise((resolve) => window.setTimeout(resolve, reconnectDelayMs));
           reconnectDelayMs = Math.min(reconnectDelayMs * 2, 10_000);
@@ -216,6 +220,7 @@ const SyncEventBridge = () => {
               break;
             }
             buffer += decoder.decode(value, { stream: true });
+            buffer = buffer.replace(/\r\n/g, '\n');
 
             let splitIndex = buffer.indexOf('\n\n');
             while (splitIndex >= 0) {
@@ -237,7 +242,7 @@ const SyncEventBridge = () => {
             }
           }
         } catch {
-          // ignore and retry
+          return;
         }
 
         if (!disposed) {

@@ -43,20 +43,20 @@ const Select = ({
 
   const triggerClasses = variant === 'minimal' 
     ? "w-full h-8 px-0 bg-transparent text-sm text-text-primary flex items-center justify-between transition-colors focus:outline-none"
-    : "w-full h-9 px-3 bg-black/[0.02] dark:bg-white/[0.02] border border-border rounded-md text-sm text-text-primary flex items-center justify-between hover:bg-black/[0.04] dark:hover:bg-white/[0.04] transition-colors focus:outline-none focus:ring-1 focus:ring-accent";
+    : "w-full h-9 px-3 bg-black/[0.02] dark:bg-white/[0.02] border border-border rounded-md text-sm text-text-primary flex items-center justify-between hover:bg-black/[0.04] dark:hover:bg-white/[0.04] transition-colors focus:outline-none focus:ring-1 focus:ring-inset focus:ring-accent";
 
   return (
     <div className={`relative ${className}`} ref={dropdownRef}>
-      {label && <label className="text-sm font-semibold text-text-secondary block mb-1.5">{label}</label>}
+      {label && <label className="label">{label}</label>}
       <button
         type="button"
         onClick={() => setIsOpen(!isOpen)}
         className={triggerClasses}
       >
-        <div className="flex items-center gap-2 truncate">
+        <div className="flex items-center gap-3 truncate">
           {selectedOption?.icon}
-          <div className="flex items-baseline gap-2 truncate">
-            <span className="truncate">{selectedOption ? selectedOption.label : placeholder}</span>
+          <div className="flex items-baseline gap-3 truncate">
+            <span className="truncate font-semibold">{selectedOption ? selectedOption.label : placeholder}</span>
             {variant === 'minimal' && selectedOption?.description && (
               <span className="text-xs text-text-secondary opacity-60 truncate font-normal">
                 &lt;{selectedOption.description}&gt;
@@ -64,7 +64,7 @@ const Select = ({
             )}
           </div>
         </div>
-        <ChevronDown className={`w-4 h-4 text-text-secondary opacity-60 transition-transform duration-200 ${isOpen ? 'rotate-180' : ''}`} />
+        <ChevronDown className="w-4 h-4 text-text-secondary opacity-60 shrink-0 transition-transform duration-200" style={{ transform: isOpen ? 'rotate(180deg)' : 'none' }} />
       </button>
 
       {isOpen && (
@@ -78,14 +78,14 @@ const Select = ({
                   onChange(option.value);
                   setIsOpen(false);
                 }}
-                className={`w-full flex items-center gap-2.5 px-2.5 py-1.5 rounded-md text-sm transition-colors ${value === option.value ? 'bg-black/5 dark:bg-white/10 text-text-primary font-semibold' : 'hover:bg-black/5 dark:hover:bg-white/10 text-text-secondary font-medium'}`}
+                className={`w-full flex items-center gap-3 px-2 py-1.5 rounded-md text-sm transition-colors ${value === option.value ? 'bg-black/5 dark:bg-white/10 text-text-primary font-bold' : 'hover:bg-black/5 dark:hover:bg-white/10 text-text-secondary font-semibold'}`}
               >
-                {option.icon}
+                <div className="shrink-0 w-4 flex justify-center">{option.icon}</div>
                 <div className="flex-1 min-w-0 text-left">
                   <div className="truncate">{option.label}</div>
                   {option.description && <div className="text-[10px] opacity-60 truncate font-normal">{option.description}</div>}
                 </div>
-                {value === option.value && <Check className="w-3.5 h-3.5 text-accent" />}
+                {value === option.value && <Check className="w-3.5 h-3.5 text-accent shrink-0" />}
               </button>
             ))}
           </div>

@@ -8,6 +8,18 @@ export default defineConfig({
     react(),
     tailwindcss(),
   ],
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          router: ['react-router-dom'],
+          query: ['@tanstack/react-query'],
+          icons: ['lucide-react'],
+          date: ['date-fns'],
+        },
+      },
+    },
+  },
   server: {
     proxy: {
       '/api': 'http://localhost:3000'

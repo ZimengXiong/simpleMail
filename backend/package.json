@@ -1,5 +1,5 @@
 {
-  "name": "bettermail-backend",
+  "name": "simplemail-backend",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -7,7 +7,7 @@
     "dev": "npm run migrate && tsx watch server.ts",
     "start": "node dist/server.js",
     "build": "tsc -p tsconfig.json",
-    "test": "tsx src/services/__tests__/threadingUtils.test.ts && tsx tests/conversationThreading.test.ts && tsx tests/clientThreadingAdditional.test.ts && tsx src/services/__tests__/syncPriority.test.ts && tsx src/services/__tests__/search.test.ts && tsx src/services/__tests__/searchQueryBuilder.test.ts && tsx src/services/__tests__/imapMailboxNormalization.test.ts && tsx src/services/__tests__/scanPolicy.test.ts && tsx src/services/__tests__/networkGuard.test.ts && tsx src/services/__tests__/googleOAuth.test.ts && tsx src/services/__tests__/imapProtocolBehavior.test.ts && tsx src/services/__tests__/smtpBehavior.test.ts && tsx tests/clientSyncState.test.ts && tsx tests/clientApi.test.ts",
+    "test": "tsx scripts/run-tests.ts",
     "worker": "tsx src/worker/run.ts",
     "migrate": "tsx scripts/migrate.ts",
     "worker:migrate": "tsx scripts/worker-migrate.ts",
@@ -17,14 +17,15 @@
     "@aws-sdk/client-s3": "^3.870.0",
     "dotenv": "^16.6.1",
     "fastify": "^5.6.1",
-    "graphile-worker": "^0.16.5",
     "google-auth-library": "^9.0.0",
+    "graphile-worker": "^0.16.5",
     "imapflow": "^1.0.164",
-    "nodemailer": "^6.10.1",
-    "postal-mime": "^2.2.5",
+    "jose": "^5.10.0",
+    "nodemailer": "^8.0.1",
     "pg": "^8.16.3",
-    "web-push": "^3.6.7",
-    "uuid": "^11.0.5"
+    "postal-mime": "^2.2.5",
+    "uuid": "^11.0.5",
+    "web-push": "^3.6.7"
   },
   "devDependencies": {
     "@types/node": "^22.13.4",

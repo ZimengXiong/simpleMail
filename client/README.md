@@ -1,5 +1,14 @@
 # React + TypeScript + Vite
 
+## OIDC development defaults
+
+The frontend authenticates through Keycloak OIDC.
+Defaults are in `client/.env.example`:
+
+- `VITE_OIDC_BASE_URL=http://localhost:8080`
+- `VITE_OIDC_REALM=simplemail`
+- `VITE_OIDC_CLIENT_ID=simplemail-web`
+
 This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
 
 Currently, two official plugins are available:

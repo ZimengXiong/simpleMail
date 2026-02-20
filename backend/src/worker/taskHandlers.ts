@@ -21,9 +21,17 @@ export interface SyncIncomingTaskPayload {
 
 export const syncIncomingConnectorTask = async (payload: SyncIncomingTaskPayload) => {
   const mailbox = payload.mailbox ?? 'INBOX';
-  await syncIncomingConnector(payload.userId, payload.connectorId, mailbox, {
-    gmailHistoryIdHint: payload.gmailHistoryIdHint ?? null,
-  });
+  try {
+    await syncIncomingConnector(payload.userId, payload.connectorId, mailbox, {
+      gmailHistoryIdHint: payload.gmailHistoryIdHint ?? null,
+    });
+  } catch (error) {
+    const message = String(error ?? '').toLowerCase();
+    if (message.includes('incoming connector') && (message.includes('not found') || message.includes('not active'))) {
+      return;
+    }
+    throw error;
+  }
 };
 
 export interface GmailHydrationTaskPayload {

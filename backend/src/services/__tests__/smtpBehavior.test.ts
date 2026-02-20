@@ -33,6 +33,30 @@ test('returns empty recipient list when no addresses are present', () => {
   assert.deepEqual(parseEnvelopeRecipients('', ['   ']), []);
 });
 
+test('ignores header-injection characters and still extracts valid addresses', () => {
+  const recipients = parseEnvelopeRecipients(
+    'victim@example.com\r\nBcc: attacker@example.com',
+    ['"Sender" <sender@example.com>\nX-Test: evil'],
+  );
+  assert.deepEqual(recipients, [
+    'victim@example.com',
+    'attacker@example.com',
+    'sender@example.com',
+  ]);
+});
+
+test('extracts recipients from quoted display names and mixed separators', () => {
+  const recipients = parseEnvelopeRecipients(
+    '"Alice Example" <alice@example.com>, bob@example.com; Carol <carol@example.net>',
+    [],
+  );
+  assert.deepEqual(recipients, [
+    'alice@example.com',
+    'bob@example.com',
+    'carol@example.net',
+  ]);
+});
+
 test('marks transient SMTP status codes as recoverable', () => {
   assert.equal(isRecoverableSmtpError({ responseCode: 421 }), true);
   assert.equal(isRecoverableSmtpError({ responseCode: 451 }), true);

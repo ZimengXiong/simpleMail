@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, type FormEvent } from 'react';
+import { createPortal } from 'react-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { api } from '../services/api';
 import {
@@ -17,6 +18,7 @@ import {
 import { v4 as uuidv4 } from 'uuid';
 import Select from './Select';
 import Avatar from './Avatar';
+import { useMediaQuery } from '../services/layout';
 
 interface ComposeModalProps {
   onClose: () => void;
@@ -39,6 +41,11 @@ interface PendingAttachment {
   size: number;
 }
 
+const MAX_ATTACHMENTS = 20;
+const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+const MAX_TOTAL_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+const DEFAULT_ATTACHMENT_CONTENT_TYPE = 'application/octet-stream';
+
 const ComposeModal = ({
   onClose,
   initialTo = '',
@@ -53,6 +60,7 @@ const ComposeModal = ({
   initialFocus = 'body',
 }: ComposeModalProps) => {
   const queryClient = useQueryClient();
+  const isMobile = useMediaQuery('(max-width: 768px)');
   const [to, setTo] = useState(initialTo);
   const [cc, setCc] = useState(initialCc);
   const [bcc, setBcc] = useState(initialBcc);
@@ -76,12 +84,7 @@ const ComposeModal = ({
     queryKey: ['identities'],
     queryFn: () => api.identities.list(),
   });
-
-  useEffect(() => {
-    if (identities && identities.length > 0 && !identityId && !initialIdentityId) {
-      setIdentityId(identities[0].id);
-    }
-  }, [identities, identityId, initialIdentityId]);
+  const resolvedIdentityId = identityId || initialIdentityId || identities?.[0]?.id || '';
 
   useEffect(() => {
     if (isMinimized) return;
@@ -91,20 +94,18 @@ const ComposeModal = ({
       } else if (bodyTextRef.current) {
         const textarea = bodyTextRef.current;
         textarea.focus();
-        // If it's a reply or forward, start at the very top (before the leading newlines)
         const shouldStartAtTop = bodyText.startsWith('\n\nOn ') || bodyText.startsWith('\n\n---------- Forwarded message');
         const cursorPosition = shouldStartAtTop ? 0 : bodyText.length;
         textarea.setSelectionRange(cursorPosition, cursorPosition);
       }
     }, 0);
     return () => window.clearTimeout(timer);
-  }, [isMinimized, initialBodyText, initialFocus]);
+  }, [isMinimized, initialBodyText, initialFocus, bodyText]);
 
-  // High-performance Dragging using refs
   const dragData = useRef({ isDragging: false, startX: 0, startY: 0, initialX: 0, initialY: 0 });
 
   const handlePointerDown = (e: React.PointerEvent) => {
-    if (!modalRef.current) return;
+    if (!modalRef.current || isMobile) return;
     dragData.current = {
       isDragging: true,
       startX: e.clientX,
@@ -117,7 +118,7 @@ const ComposeModal = ({
 
   useEffect(() => {
     const handleMove = (e: PointerEvent) => {
-      if (!dragData.current.isDragging || !modalRef.current) return;
+      if (!dragData.current.isDragging || !modalRef.current || isMobile) return;
       const dx = e.clientX - dragData.current.startX;
       const dy = e.clientY - dragData.current.startY;
       const x = dragData.current.initialX + dx;
@@ -126,7 +127,7 @@ const ComposeModal = ({
     };
 
     const handleUp = (e: PointerEvent) => {
-      if (!dragData.current.isDragging || !modalRef.current) return;
+      if (!dragData.current.isDragging || !modalRef.current || isMobile) return;
       const dx = e.clientX - dragData.current.startX;
       const dy = e.clientY - dragData.current.startY;
       dragData.current.initialX += dx;
@@ -141,12 +142,12 @@ const ComposeModal = ({
       window.removeEventListener('pointermove', handleMove);
       window.removeEventListener('pointerup', handleUp);
     };
-  }, []);
+  }, [isMobile]);
 
   const sendMutation = useMutation({
-    mutationFn: (data: any) => api.messages.send(data, idempotencyKey),
+    mutationFn: (data: Parameters<typeof api.messages.send>[0]) => api.messages.send(data, idempotencyKey),
     onSuccess: async (res) => {
-      const selectedIdentity = identities?.find((identity) => identity.id === identityId);
+      const selectedIdentity = identities?.find((identity) => identity.id === resolvedIdentityId);
       const connectorId = selectedIdentity?.sentToIncomingConnectorId ?? null;
       const refreshMailboxState = () => {
         queryClient.invalidateQueries({ queryKey: ['messages'] });
@@ -178,10 +179,11 @@ const ComposeModal = ({
         setTimeout(() => onClose(), 1500);
       }
     },
-    onError: (err: any) => {
+    onError: (err: unknown) => {
       setSendStatus('failed');
-      setSendErrorMessage(err?.message || 'Failed to send message.');
-      console.error(err?.message || 'Failed to send message.');
+      const errorMessage = err instanceof Error ? err.message : 'Failed to send message.';
+      setSendErrorMessage(errorMessage);
+      console.error(errorMessage);
     }
   });
 
@@ -190,17 +192,22 @@ const ComposeModal = ({
     const normalizedTo = to.trim();
     const normalizedSubject = subject.trim();
     const recipients = normalizedTo.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g) ?? [];
-    if (!identityId || !normalizedSubject) return;
+    if (!resolvedIdentityId || !normalizedSubject) return;
     if (recipients.length === 0) {
       setSendStatus('failed');
       setSendErrorMessage('Please enter at least one valid recipient email.');
       return;
     }
+
+    if (isMobile && !window.confirm('Send this message?')) {
+      return;
+    }
+
     setSendErrorMessage(null);
     setSendStatus('sending');
     const shouldAttachToThread = Boolean(initialThreadId && (initialInReplyTo || initialReferences));
     sendMutation.mutate({
-      identityId,
+      identityId: resolvedIdentityId,
       to: normalizedTo,
       cc: cc.split(',').map(e => e.trim()).filter(Boolean),
       bcc: bcc.split(',').map(e => e.trim()).filter(Boolean),
@@ -213,41 +220,26 @@ const ComposeModal = ({
     });
   };
 
-  const headerClasses = "h-11 border-b border-border/60 flex items-center justify-between px-3 bg-black/[0.02] dark:bg-white/[0.02] shrink-0 cursor-grab active:cursor-grabbing select-none";
+  const headerClasses = `h-11 border-b border-border/60 flex items-center justify-between px-3 bg-black/[0.02] dark:bg-white/[0.02] shrink-0 ${!isMobile ? 'cursor-grab active:cursor-grabbing' : ''} select-none`;
 
-  if (isMinimized) {
-    return (
-      <div
-        ref={modalRef}
-        className="fixed bottom-18 right-8 w-72 bg-bg-card border border-border/60 rounded-md z-50 overflow-hidden animate-in slide-in-from-bottom-2 transition-[background-color,border-color]"
-      >
-        <div className={headerClasses} onPointerDown={handlePointerDown}>
-          <div className="flex items-center gap-2 min-w-0">
-            <GripHorizontal className="w-3.5 h-3.5 text-text-secondary opacity-60 shrink-0" />
-            <span className="text-sm font-semibold text-text-primary truncate">{subject || 'New Message'}</span>
-          </div>
-          <div className="flex gap-0.5">
-            <button className="p-1 hover:bg-black/5 dark:hover:bg-white/5 rounded-md text-text-secondary" onPointerDown={e => e.stopPropagation()} onClick={() => setIsMinimized(false)}><Maximize2 className="w-3.5 h-3.5" /></button>
-            <button className="p-1 hover:bg-black/5 dark:hover:bg-white/5 rounded-md text-text-secondary" onPointerDown={e => e.stopPropagation()} onClick={onClose}><X className="w-3.5 h-3.5" /></button>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  return (
+  const modalContent = (
     <div
       ref={modalRef}
-      className="fixed bottom-18 right-8 w-[500px] h-[540px] bg-bg-card border border-border/60 rounded-md flex flex-col z-50 animate-in slide-in-from-bottom-4 duration-300 transition-[background-color,border-color]"
+      className={`
+        fixed bg-bg-card border border-border/60 flex flex-col z-[1000] animate-in duration-300 transition-[background-color,border-color]
+        ${isMobile 
+          ? 'inset-0 h-full w-full rounded-none slide-in-from-bottom-full' 
+          : 'bottom-18 right-8 w-[500px] h-[540px] rounded-md slide-in-from-bottom-4 shadow-xl'}
+      `}
     >
       <div className={headerClasses} onPointerDown={handlePointerDown}>
         <div className="flex items-center gap-2">
-          <GripHorizontal className="w-3.5 h-3.5 text-text-secondary opacity-60" />
-          <span className="text-sm font-semibold text-text-primary uppercase tracking-wider opacity-60">Compose</span>
+          {!isMobile && <GripHorizontal className="w-3.5 h-3.5 text-text-secondary opacity-60" />}
+          <span className="text-sm font-semibold text-text-primary uppercase tracking-wider opacity-60">{isMobile ? (subject || 'New Message') : 'Compose'}</span>
         </div>
         <div className="flex gap-1">
-          <button onPointerDown={e => e.stopPropagation()} onClick={() => setIsMinimized(true)} className="p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-md text-text-secondary transition-colors"><Minimize2 className="w-3.5 h-3.5" /></button>
-          <button onPointerDown={e => e.stopPropagation()} onClick={onClose} className="p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-md text-text-secondary transition-colors"><X className="w-3.5 h-3.5" /></button>
+          {!isMobile && <button onPointerDown={e => e.stopPropagation()} onClick={() => setIsMinimized(true)} className="p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-md text-text-secondary transition-colors"><Minimize2 className="w-3.5 h-3.5" /></button>}
+          <button onPointerDown={e => e.stopPropagation()} onClick={onClose} className="p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-md text-text-secondary transition-colors"><X className="w-4 h-4 md:w-3.5 md:h-3.5" /></button>
         </div>
       </div>
 
@@ -259,7 +251,7 @@ const ComposeModal = ({
               <Select
                 className="flex-1"
                 variant="minimal"
-                value={identityId}
+                value={resolvedIdentityId}
                 onChange={(val) => setIdentityId(val)}
                 options={identities?.map(id => ({
                   value: id.id,
@@ -306,29 +298,100 @@ const ComposeModal = ({
           </div>
         )}
 
-        <div className="pt-4 border-t border-border/60 flex items-center justify-between shrink-0">
+        <div className="pt-4 border-t border-border/60 flex items-center justify-between shrink-0 mb-safe">
           <input ref={fileInputRef} type="file" multiple className="hidden" onChange={(e) => {
             const files = Array.from(e.target.files || []);
-            files.forEach(async f => {
-              const reader = new FileReader();
-              reader.onload = () => setAttachments(curr => [...curr, { filename: f.name, contentType: f.type, size: f.size, contentBase64: (reader.result as string).split(',')[1] }]);
-              reader.readAsDataURL(f);
+            if (files.length === 0) {
+              return;
+            }
+            const currentTotalBytes = attachments.reduce((sum, attachment) => sum + attachment.size, 0);
+            const availableSlots = Math.max(0, MAX_ATTACHMENTS - attachments.length);
+            const filesToRead = files.slice(0, availableSlots);
+
+            if (files.length > availableSlots) {
+              setSendErrorMessage(`Only ${MAX_ATTACHMENTS} attachments are allowed per message.`);
+            }
+
+            let runningBytes = currentTotalBytes;
+            const acceptedFiles = filesToRead.filter((file) => {
+              if (file.size > MAX_ATTACHMENT_BYTES) {
+                setSendErrorMessage(`"${file.name}" exceeds the 10 MB per-file limit.`);
+                return false;
+              }
+              if (runningBytes + file.size > MAX_TOTAL_ATTACHMENT_BYTES) {
+                setSendErrorMessage('Total attachment size exceeds 25 MB.');
+                return false;
+              }
+              runningBytes += file.size;
+              return true;
             });
+
+            acceptedFiles.forEach((file) => {
+              const reader = new FileReader();
+              reader.onload = () => {
+                const dataUrl = typeof reader.result === 'string' ? reader.result : '';
+                const [, base64 = ''] = dataUrl.split(',', 2);
+                if (!base64) {
+                  setSendErrorMessage(`Failed to attach "${file.name}".`);
+                  return;
+                }
+                setAttachments((current) => [
+                  ...current,
+                  {
+                    filename: file.name,
+                    contentType: file.type || DEFAULT_ATTACHMENT_CONTENT_TYPE,
+                    size: file.size,
+                    contentBase64: base64,
+                  },
+                ]);
+              };
+              reader.onerror = () => {
+                setSendErrorMessage(`Failed to read "${file.name}".`);
+              };
+              reader.readAsDataURL(file);
+            });
+
+            if (e.target) {
+              e.target.value = '';
+            }
           }} />
           <div className="flex items-center gap-3">
-            <button type="submit" disabled={['sending', 'queued', 'success'].includes(sendStatus)} className={`px-5 py-1.5 rounded-md text-sm font-bold shadow-xs transition-all flex items-center gap-2 disabled:opacity-70 active:scale-[0.98] ${sendStatus === 'success' ? 'bg-green-600 text-white' : 'bg-accent hover:bg-accent-hover'}`} style={sendStatus !== 'success' ? { color: 'var(--accent-contrast)' } : {}}>
+            <button type="submit" disabled={['sending', 'queued', 'success'].includes(sendStatus)} className={`btn-primary px-6 md:px-5 py-2 md:py-1.5 ${sendStatus === 'success' ? 'bg-green-600 text-white' : ''}`}>
               {sendStatus === 'sending' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : sendStatus === 'success' ? <CheckCircle2 className="w-3.5 h-3.5" /> : <Send className="w-3.5 h-3.5" />}
               {sendStatus === 'sending' ? 'Sending...' : sendStatus === 'success' ? 'Sent' : 'Send'}
             </button>
-            <button type="button" onClick={() => fileInputRef.current?.click()} className="p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-md text-text-secondary transition-colors" title="Attach file"><Paperclip className="w-4 h-4" /></button>
+            <button type="button" onClick={() => fileInputRef.current?.click()} className="p-2 md:p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-md text-text-secondary transition-colors" title="Attach file"><Paperclip className="w-5 h-5 md:w-4 md:h-4" /></button>
           </div>
-          <button type="button" onClick={onClose} className="p-1.5 hover:bg-red-50 dark:hover:bg-red-900/20 text-text-secondary hover:text-red-500 rounded-md transition-colors"><Trash2 className="w-4 h-4" /></button>
+          <button type="button" onClick={onClose} className="btn-danger p-2 md:p-1.5"><Trash2 className="w-5 h-5 md:w-4 md:h-4" /></button>
         </div>
         {sendStatus === 'failed' && sendErrorMessage && (
           <div className="text-xs text-red-500">{sendErrorMessage}</div>
         )}
       </form>
     </div>
+  );
+
+  const minimizedContent = (
+    <div
+      ref={modalRef}
+      className="fixed bottom-18 right-8 w-72 bg-bg-card border border-border/60 rounded-md z-[1000] overflow-hidden animate-in slide-in-from-bottom-2 transition-[background-color,border-color] shadow-xl"
+    >
+      <div className={headerClasses} onPointerDown={handlePointerDown}>
+        <div className="flex items-center gap-2 min-w-0">
+          <GripHorizontal className="w-3.5 h-3.5 text-text-secondary opacity-60 shrink-0" />
+          <span className="text-sm font-semibold text-text-primary truncate">{subject || 'New Message'}</span>
+        </div>
+        <div className="flex gap-0.5">
+          <button className="p-1 hover:bg-black/5 dark:hover:bg-white/5 rounded-md text-text-secondary" onPointerDown={e => e.stopPropagation()} onClick={() => setIsMinimized(false)}><Maximize2 className="w-3.5 h-3.5" /></button>
+          <button className="p-1 hover:bg-black/5 dark:hover:bg-white/5 rounded-md text-text-secondary" onPointerDown={e => e.stopPropagation()} onClick={onClose}><X className="w-3.5 h-3.5" /></button>
+        </div>
+      </div>
+    </div>
+  );
+
+  return createPortal(
+    isMinimized && !isMobile ? minimizedContent : modalContent,
+    document.body
   );
 };
 

@@ -8,9 +8,9 @@ const OAuthCallbackView = () => {
   const [searchParams] = useSearchParams();
 
   const status = searchParams.get('status');
-  const connectorType = searchParams.get('type');
-  const connectorId = searchParams.get('id');
-  const errorMessage = searchParams.get('message') || 'An unexpected error occurred during authorization.';
+  const connectorType = searchParams.get('connectorType') || searchParams.get('type');
+  const connectorId = searchParams.get('connectorId') || searchParams.get('id');
+  const errorMessage = searchParams.get('error') || searchParams.get('message') || 'An unexpected error occurred during authorization.';
   const shouldTrackSync = Boolean(
     status === 'ok'
     && connectorType === 'incoming'
@@ -71,6 +71,9 @@ const OAuthCallbackView = () => {
                 <h1 className="text-xl font-bold text-text-primary">Gmail Connected</h1>
                 <p className="text-sm text-text-secondary">
                   Connector authorized. Initial full sync is running across all folders.
+                </p>
+                <p className="text-xs text-text-secondary mt-1">
+                  Sync starts with metadata (folder + headers/snippets), then downloads full message bodies and attachments in follow-up hydration.
                 </p>
               </div>
             </div>

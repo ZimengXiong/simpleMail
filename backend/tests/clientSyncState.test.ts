@@ -57,6 +57,24 @@ test('rejects future syncStartedAt timestamps', () => {
   );
 });
 
+test('treats null or unsupported states as inactive', () => {
+  assert.equal(isSyncStateActive(null as any, now), false);
+  assert.equal(isSyncStateActive(undefined as any, now), false);
+  assert.equal(isSyncStateActive({ status: 'idle', syncStartedAt: '2026-02-19T19:59:00.000Z' } as any, now), false);
+  assert.equal(isSyncStateActive({ status: 'error', syncStartedAt: '2026-02-19T19:59:00.000Z' } as any, now), false);
+});
+
+test('queued state is active exactly at stale boundary and inactive just beyond', () => {
+  assert.equal(
+    isSyncStateActive({ status: 'queued', syncStartedAt: '2026-02-19T19:58:00.000Z' } as any, now),
+    true,
+  );
+  assert.equal(
+    isSyncStateActive({ status: 'queued', syncStartedAt: '2026-02-19T19:57:59.999Z' } as any, now),
+    false,
+  );
+});
+
 test('counts active states with the same internal now snapshot', () => {
   const originalNow = Date.now;
   Date.now = () => now;
@@ -70,6 +88,8 @@ test('counts active states with the same internal now snapshot', () => {
     assert.equal(count, 2);
     assert.equal(hasActiveSyncStates([{ status: 'idle', syncStartedAt: null } as any]), false);
     assert.equal(hasActiveSyncStates([{ status: 'syncing', syncStartedAt: null } as any]), true);
+    assert.equal(countActiveSyncStates([]), 0);
+    assert.equal(countActiveSyncStates(undefined as any), 0);
   } finally {
     Date.now = originalNow;
   }

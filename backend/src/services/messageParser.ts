@@ -140,6 +140,7 @@ export const parseAndPersistMessage = async (
     contentType?: string;
     encoding?: string;
     disposition?: string;
+    contentId?: string;
   }>;
 
   const existingAttachments = await query<{ blob_key: string | null }>(
@@ -189,8 +190,8 @@ export const parseAndPersistMessage = async (
 
     const attachmentInsert = await query<{ id: string }>(
       `INSERT INTO attachments
-       (message_id, filename, content_type, size_bytes, blob_key, is_inline, scan_status, scan_result, search_text)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       (message_id, filename, content_type, size_bytes, blob_key, is_inline, scan_status, scan_result, search_text, content_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
        RETURNING id`,
       [
         messageId,
@@ -198,10 +199,11 @@ export const parseAndPersistMessage = async (
         contentType,
         attachmentBuffer.length,
         attachmentKey,
-        attachment.disposition === 'inline',
+        attachment.disposition === 'inline' || Boolean(attachment.contentId),
         scanStatus,
         scanResult,
         searchText,
+        attachment.contentId || null,
       ],
     );
 

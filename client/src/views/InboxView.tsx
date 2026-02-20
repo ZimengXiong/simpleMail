@@ -1,5 +1,5 @@
-import { useState, useEffect, memo, useCallback } from 'react';
-import { useQuery, useMutation, useQueryClient, keepPreviousData, useQueries } from '@tanstack/react-query';
+import { useState, useEffect, useCallback, lazy, Suspense, useTransition, useMemo, useRef } from 'react';
+import { useQuery, useMutation, useQueryClient, keepPreviousData, useQueries, type Query } from '@tanstack/react-query';
 import { useSearchParams } from 'react-router-dom';
 import { api } from '../services/api';
 import { format, isToday, isThisYear } from 'date-fns';
@@ -12,43 +12,51 @@ import {
   X,
   ChevronLeft,
   ChevronRight,
-  Star,
   Trash2,
   Mail as MailIcon,
   MailOpen,
   CheckSquare,
   Square,
+  PenBox,
 } from 'lucide-react';
-import type { MessageRecord } from '../types/index';
+import type { ConnectorSyncStatesResponse, MessageRecord } from '../types/index';
 import EmptyState from '../components/EmptyState';
-import ThreadDetail from '../components/ThreadDetail';
-import { useLayoutMode } from '../services/layout';
+import { useLayoutMode, useMediaQuery } from '../services/layout';
 import { hasActiveSyncStates } from '../services/syncState';
+import { InboxColumnItem, InboxListItem } from '../components/inbox/InboxListItems';
+import {
+  buildInboxSearchParams,
+  persistInboxState,
+  readPersistedInboxState,
+  reduceInboxState,
+  resolveInboxViewState,
+  type InboxStateEvent,
+} from '../services/inboxStateMachine';
 
 const PAGE_SIZE = 50;
 type MessagesQueryResult = { messages: MessageRecord[]; totalCount: number };
+type MessagePatch = { delete?: boolean; moveToFolder?: string; isRead?: boolean; isStarred?: boolean };
+type SelectionState = {
+  scopeKey: string;
+  messageIds: Set<string>;
+};
 const isStarredFolderToken = (value: unknown) => String(value ?? '').trim().toUpperCase().includes('STARRED');
+const loadThreadDetail = () => import('../components/ThreadDetail');
+const ThreadDetail = lazy(loadThreadDetail);
+const loadComposeModal = () => import('../components/ComposeModal');
+const ComposeModal = lazy(loadComposeModal);
 
 const InboxView = () => {
   const [searchParams, setSearchParams] = useSearchParams();
   const queryClient = useQueryClient();
-  const layoutMode = useLayoutMode();
-
-  const folder = searchParams.get('folder');
-  const connectorIdFromParams = searchParams.get('connectorId');
-  const profileType = searchParams.get('profile');
-  const sendOnlyEmail = profileType === 'send-only'
-    ? String(searchParams.get('sendEmail') ?? '').trim().toLowerCase()
-    : '';
-  const isSendOnlyMode = Boolean(sendOnlyEmail);
-  const query = searchParams.get('q') || '';
-  const page = parseInt(searchParams.get('page') || '1', 10);
-  const offset = (page - 1) * PAGE_SIZE;
-
-  const [selectedThreadId, setSelectedThreadId] = useState<string | null>(null);
-  const [searchInput, setSearchInput] = useState(query);
-  const [selectedMessageIds, setSelectedMessageIds] = useState<Set<string>>(new Set());
+  const preferredInboxState = readPersistedInboxState();
+  const layoutPreference = useLayoutMode();
+  const isMobile = useMediaQuery('(max-width: 768px)');
+  const layoutMode = isMobile ? 'list' : layoutPreference;
+  const [searchInput, setSearchInput] = useState('');
   const [isTabVisible, setIsTabVisible] = useState(() => document.visibilityState === 'visible');
+  const [isComposeOpen, setIsComposeOpen] = useState(false);
+  const [, startTransition] = useTransition();
 
   useEffect(() => {
     const onVisibilityChange = () => setIsTabVisible(document.visibilityState === 'visible');
@@ -56,40 +64,91 @@ const InboxView = () => {
     return () => document.removeEventListener('visibilitychange', onVisibilityChange);
   }, []);
 
-  useEffect(() => {
-    setSelectedThreadId(null);
-    setSelectedMessageIds(new Set());
-  }, [folder, connectorIdFromParams, sendOnlyEmail, query, page]);
-
   const { data: connectors, isLoading: loadingConnectors } = useQuery({
     queryKey: ['connectors', 'incoming'],
     queryFn: () => api.connectors.listIncoming(),
   });
 
-  const firstConnectorId = connectors?.[0]?.id;
-  const effectiveConnectorId = isSendOnlyMode
-    ? undefined
-    : (connectorIdFromParams || firstConnectorId);
-  const activeMailboxForPriority = folder || 'INBOX';
+  const connectorIds = useMemo(
+    () => (connectors ?? []).map((connector) => connector.id),
+    [connectors],
+  );
+  const sendOnlyEmailFromParams = String(searchParams.get('sendEmail') ?? '').trim().toLowerCase();
+  const resolvedRouteState = useMemo(
+    () => resolveInboxViewState(searchParams, {
+      incomingConnectorIds: connectorIds,
+      sendOnlyEmails: sendOnlyEmailFromParams ? [sendOnlyEmailFromParams] : [],
+      preferredState: preferredInboxState,
+    }),
+    [connectorIds, preferredInboxState, searchParams, sendOnlyEmailFromParams],
+  );
+  const routeState = resolvedRouteState.state;
 
   useEffect(() => {
-    if (!isSendOnlyMode || folder) {
+    if (!routeState) {
       return;
     }
-    const params = new URLSearchParams(searchParams);
-    params.set('folder', 'OUTBOX');
-    setSearchParams(params, { replace: true });
-  }, [folder, isSendOnlyMode, searchParams, setSearchParams]);
+    if (!resolvedRouteState.changed) {
+      return;
+    }
+    setSearchParams(resolvedRouteState.searchParams, { replace: true });
+  }, [resolvedRouteState, routeState, setSearchParams]);
 
   useEffect(() => {
-    if (isSendOnlyMode || connectorIdFromParams || !firstConnectorId) {
+    if (!routeState) {
       return;
     }
-    const params = new URLSearchParams(searchParams);
-    params.set('connectorId', firstConnectorId);
-    params.delete('folder');
-    setSearchParams(params, { replace: true });
-  }, [connectorIdFromParams, firstConnectorId, isSendOnlyMode, searchParams, setSearchParams]);
+    persistInboxState(routeState);
+  }, [routeState]);
+
+  const folder = routeState?.folder ?? 'INBOX';
+  const query = routeState?.query ?? '';
+  const page = routeState?.page ?? 1;
+  const selectedThreadId = routeState?.threadId ?? null;
+  const isSendOnlyMode = routeState?.profile.kind === 'send-only';
+  const sendOnlyEmail = routeState?.profile.kind === 'send-only'
+    ? routeState.profile.sendEmail
+    : '';
+  const effectiveConnectorId = routeState?.profile.kind === 'incoming'
+    ? routeState.profile.connectorId
+    : undefined;
+  const offset = (page - 1) * PAGE_SIZE;
+  const selectionScopeKey = `${folder}|${effectiveConnectorId ?? ''}|${sendOnlyEmail}|${query}|${page}`;
+  const [selectionState, setSelectionState] = useState<SelectionState>({
+    scopeKey: selectionScopeKey,
+    messageIds: new Set(),
+  });
+  const selectedMessageIds = selectionState.scopeKey === selectionScopeKey
+    ? selectionState.messageIds
+    : new Set<string>();
+  const markReadInFlightRef = useRef<Set<string>>(new Set());
+  const setSelectedMessageIds = useCallback((next: Set<string> | ((current: Set<string>) => Set<string>)) => {
+    setSelectionState((current) => {
+      const currentIds = current.scopeKey === selectionScopeKey ? current.messageIds : new Set<string>();
+      const resolvedNext = typeof next === 'function'
+        ? next(currentIds)
+        : next;
+      return {
+        scopeKey: selectionScopeKey,
+        messageIds: new Set(resolvedNext),
+      };
+    });
+  }, [selectionScopeKey]);
+  const dispatchRouteEvent = useCallback((event: InboxStateEvent, options?: { replace?: boolean }) => {
+    if (!routeState) {
+      return;
+    }
+    const nextState = reduceInboxState(routeState, event);
+    const nextParams = buildInboxSearchParams(searchParams, nextState);
+    startTransition(() => {
+      setSearchParams(nextParams, { replace: options?.replace === true });
+    });
+  }, [routeState, searchParams, setSearchParams, startTransition]);
+  const activeMailboxForPriority = folder;
+
+  useEffect(() => {
+    setSearchInput(query);
+  }, [query]);
 
   useEffect(() => {
     if (isSendOnlyMode || !effectiveConnectorId || !isTabVisible) {
@@ -97,9 +156,7 @@ const InboxView = () => {
     }
 
     const reportActiveMailbox = () => {
-      void api.sync.setActiveMailbox(effectiveConnectorId, activeMailboxForPriority).catch(() => {
-        // best effort: prioritization heartbeat should not affect inbox rendering
-      });
+      void api.sync.setActiveMailbox(effectiveConnectorId, activeMailboxForPriority).catch(() => {});
     };
 
     reportActiveMailbox();
@@ -107,9 +164,9 @@ const InboxView = () => {
     return () => window.clearInterval(timer);
   }, [isSendOnlyMode, effectiveConnectorId, activeMailboxForPriority, isTabVisible]);
 
-  const { data: result, isLoading: loadingMessages } = useQuery({
+  const { data: result, isLoading: loadingMessages } = useQuery<MessagesQueryResult>({
     queryKey: ['messages', isSendOnlyMode ? `send-only:${sendOnlyEmail}` : effectiveConnectorId, folder, query, page],
-    queryFn: () => {
+    queryFn: ({ signal }) => {
       if (isSendOnlyMode) {
         return api.messages.listSendOnly({
           emailAddress: sendOnlyEmail,
@@ -117,34 +174,54 @@ const InboxView = () => {
           q: query || undefined,
           limit: PAGE_SIZE,
           offset,
+          signal,
         });
       }
       return query
-        ? api.messages.search({ q: query, folder: folder || undefined, connectorId: effectiveConnectorId, limit: PAGE_SIZE, offset })
+        ? api.messages.search({ q: query, folder: folder || undefined, connectorId: effectiveConnectorId, limit: PAGE_SIZE, offset, signal })
         : api.messages.list({
           folder: folder || undefined,
           connectorId: effectiveConnectorId,
           limit: PAGE_SIZE,
           offset,
+          signal,
         });
     },
     enabled: isSendOnlyMode ? Boolean(sendOnlyEmail) : !!effectiveConnectorId,
     placeholderData: keepPreviousData,
     refetchInterval: isTabVisible
-      ? (isSendOnlyMode ? 20_000 : 45_000)
-      : 180_000,
+      ? (isSendOnlyMode ? 30_000 : 90_000)
+      : 240_000,
     refetchIntervalInBackground: false,
   });
+
+  const activeMessagesQueryKey = useMemo(
+    () => ['messages', isSendOnlyMode ? `send-only:${sendOnlyEmail}` : effectiveConnectorId, folder, query, page],
+    [effectiveConnectorId, folder, isSendOnlyMode, page, query, sendOnlyEmail],
+  );
+  const activeMessageScope = isSendOnlyMode ? `send-only:${sendOnlyEmail}` : (effectiveConnectorId ?? null);
+  const isScopedMessageQuery = useCallback((queryKey: readonly unknown[]) => {
+    if (!Array.isArray(queryKey) || queryKey[0] !== 'messages') {
+      return false;
+    }
+    const scope = queryKey[1];
+    if (activeMessageScope) {
+      return scope === activeMessageScope;
+    }
+    return !(typeof scope === 'string' && scope.startsWith('send-only:'));
+  }, [activeMessageScope]);
 
   const syncStateQueries = useQueries({
     queries: (connectors ?? [])
       .filter((connector) => !isSendOnlyMode && connector.id === effectiveConnectorId)
       .map((connector) => ({
         queryKey: ['syncStates', connector.id],
-        queryFn: () => api.sync.getStates(connector.id),
+        queryFn: ({ signal }) => api.sync.getStates(connector.id, signal),
         enabled: Boolean(connector.id),
-        refetchInterval: (syncQuery: any) =>
-          hasActiveSyncStates(syncQuery.state.data?.states ?? [])
+        refetchInterval: (syncQuery: Query) =>
+          hasActiveSyncStates(
+            ((syncQuery.state.data as ConnectorSyncStatesResponse | undefined)?.states) ?? [],
+          )
             ? 4_000
             : (isTabVisible ? 15_000 : 45_000),
       })),
@@ -154,18 +231,16 @@ const InboxView = () => {
     hasActiveSyncStates(syncQuery.data?.states ?? []),
   );
 
-  // When sync becomes active, do a single targeted invalidation instead of a
-  // recurring interval (the syncStateQuery's own 2s poll drives the re-check).
   useEffect(() => {
     if (isAnySyncActive && isTabVisible) {
-      queryClient.invalidateQueries({ queryKey: ['messages'] });
+      queryClient.invalidateQueries({ queryKey: activeMessagesQueryKey, refetchType: 'active' });
     }
-  }, [isAnySyncActive, isTabVisible, queryClient]);
+  }, [activeMessagesQueryKey, isAnySyncActive, isTabVisible, queryClient]);
 
   const applyOptimisticPatch = (
     current: MessagesQueryResult | undefined,
     messageId: string,
-    patch: { delete?: boolean; moveToFolder?: string; isRead?: boolean; isStarred?: boolean },
+    patch: MessagePatch,
     options?: { removeFromStarredOnUnstar?: boolean },
   ) => {
     if (!current?.messages) {
@@ -202,14 +277,18 @@ const InboxView = () => {
   };
 
   const updateMessageMutation = useMutation({
-    mutationFn: (payload: { messageId: string; data: { delete?: boolean; moveToFolder?: string; isRead?: boolean; isStarred?: boolean } }) =>
+    mutationFn: (payload: { messageId: string; data: MessagePatch }) =>
       api.messages.update(payload.messageId, payload.data),
     onMutate: async (payload) => {
-      await queryClient.cancelQueries({ queryKey: ['messages'] });
-      const snapshots = queryClient.getQueriesData<MessagesQueryResult>({ queryKey: ['messages'] });
+      await queryClient.cancelQueries({
+        predicate: (query) => isScopedMessageQuery(query.queryKey),
+      });
+      const snapshots = queryClient.getQueriesData<MessagesQueryResult>({
+        predicate: (query) => isScopedMessageQuery(query.queryKey),
+      });
       for (const [key, data] of snapshots) {
         const queryKey = Array.isArray(key) ? key : [];
-        const removeFromStarredOnUnstar = isStarredFolderToken(queryKey[1]);
+        const removeFromStarredOnUnstar = isStarredFolderToken(queryKey[2]);
         queryClient.setQueryData<MessagesQueryResult>(
           key,
           applyOptimisticPatch(data, payload.messageId, payload.data, { removeFromStarredOnUnstar }),
@@ -223,15 +302,106 @@ const InboxView = () => {
       }
     },
     onSettled: () => {
-      queryClient.invalidateQueries({ queryKey: ['messages'] });
+      queryClient.invalidateQueries({ queryKey: activeMessagesQueryKey, refetchType: 'active' });
     },
   });
 
-  const messages = result?.messages || [];
+  const messages = useMemo<MessageRecord[]>(
+    () => result?.messages ?? [],
+    [result?.messages],
+  );
   const totalCount = result?.totalCount || 0;
   const selectedSendOnlyMessage = isSendOnlyMode && selectedThreadId
     ? messages.find((message) => (message.threadId || message.id) === selectedThreadId) ?? null
     : null;
+
+  useEffect(() => {
+    const canFetchSendOnly = isSendOnlyMode && Boolean(sendOnlyEmail);
+    const canFetchIncoming = !isSendOnlyMode && Boolean(effectiveConnectorId);
+    if (!canFetchSendOnly && !canFetchIncoming) {
+      return;
+    }
+
+    const prefetchPage = (targetPage: number) => {
+      if (targetPage < 1) {
+        return;
+      }
+      const targetOffset = (targetPage - 1) * PAGE_SIZE;
+      const queryKey = ['messages', isSendOnlyMode ? `send-only:${sendOnlyEmail}` : effectiveConnectorId, folder, query, targetPage];
+      void queryClient.prefetchQuery({
+        queryKey,
+        queryFn: ({ signal }) => {
+          if (isSendOnlyMode) {
+            return api.messages.listSendOnly({
+              emailAddress: sendOnlyEmail,
+              folder: folder || 'OUTBOX',
+              q: query || undefined,
+              limit: PAGE_SIZE,
+              offset: targetOffset,
+              signal,
+            });
+          }
+          return query
+            ? api.messages.search({ q: query, folder: folder || undefined, connectorId: effectiveConnectorId, limit: PAGE_SIZE, offset: targetOffset, signal })
+            : api.messages.list({
+              folder: folder || undefined,
+              connectorId: effectiveConnectorId,
+              limit: PAGE_SIZE,
+              offset: targetOffset,
+              signal,
+            });
+        },
+        staleTime: 20_000,
+      });
+    };
+
+    if (page > 1) {
+      prefetchPage(page - 1);
+    }
+
+    const hasNextPage = offset + messages.length < totalCount;
+    if (hasNextPage) {
+      prefetchPage(page + 1);
+    }
+  }, [
+    effectiveConnectorId,
+    folder,
+    isSendOnlyMode,
+    messages.length,
+    offset,
+    page,
+    query,
+    queryClient,
+    sendOnlyEmail,
+    totalCount,
+  ]);
+
+  useEffect(() => {
+    if (isSendOnlyMode || messages.length === 0) {
+      return;
+    }
+
+    const browserWindow = window as Window & {
+      requestIdleCallback?: (callback: IdleRequestCallback, options?: IdleRequestOptions) => number;
+      cancelIdleCallback?: (handle: number) => void;
+    };
+
+    if (typeof browserWindow.requestIdleCallback === 'function') {
+      const idleHandle = browserWindow.requestIdleCallback(() => {
+        void loadThreadDetail();
+      }, { timeout: 1_200 });
+      return () => {
+        if (typeof browserWindow.cancelIdleCallback === 'function') {
+          browserWindow.cancelIdleCallback(idleHandle);
+        }
+      };
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      void loadThreadDetail();
+    }, 350);
+    return () => window.clearTimeout(timeoutId);
+  }, [isSendOnlyMode, messages.length]);
 
   const triggerSyncMutation = useMutation({
     mutationFn: async () => {
@@ -242,20 +412,26 @@ const InboxView = () => {
       await api.sync.trigger(effectiveConnectorId, mailbox, false, false);
     },
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['syncStates'] });
-      queryClient.invalidateQueries({ queryKey: ['messages'] });
+      if (effectiveConnectorId) {
+        queryClient.invalidateQueries({ queryKey: ['syncStates', effectiveConnectorId], refetchType: 'active' });
+      }
+      queryClient.invalidateQueries({ queryKey: activeMessagesQueryKey, refetchType: 'active' });
     },
   });
 
   const bulkActionMutation = useMutation({
-    mutationFn: (data: any) => api.messages.bulkUpdate(Array.from(selectedMessageIds), { ...data, scope: 'single' }),
-    onMutate: async (data: { delete?: boolean; moveToFolder?: string; isRead?: boolean; isStarred?: boolean }) => {
-      await queryClient.cancelQueries({ queryKey: ['messages'] });
-      const snapshots = queryClient.getQueriesData<MessagesQueryResult>({ queryKey: ['messages'] });
+    mutationFn: (data: MessagePatch) => api.messages.bulkUpdate(Array.from(selectedMessageIds), { ...data, scope: 'single' }),
+    onMutate: async (data: MessagePatch) => {
+      await queryClient.cancelQueries({
+        predicate: (query) => isScopedMessageQuery(query.queryKey),
+      });
+      const snapshots = queryClient.getQueriesData<MessagesQueryResult>({
+        predicate: (query) => isScopedMessageQuery(query.queryKey),
+      });
       const ids = Array.from(selectedMessageIds);
       for (const [key, snapshot] of snapshots) {
         const queryKey = Array.isArray(key) ? key : [];
-        const removeFromStarredOnUnstar = isStarredFolderToken(queryKey[1]);
+        const removeFromStarredOnUnstar = isStarredFolderToken(queryKey[2]);
         let next = snapshot;
         for (const id of ids) {
           next = applyOptimisticPatch(next, id, data, { removeFromStarredOnUnstar });
@@ -270,7 +446,7 @@ const InboxView = () => {
       }
     },
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['messages'] });
+      queryClient.invalidateQueries({ queryKey: activeMessagesQueryKey, refetchType: 'active' });
       setSelectedMessageIds(new Set());
     }
   });
@@ -278,11 +454,15 @@ const InboxView = () => {
   const markAsReadMutation = useMutation({
     mutationFn: (messageId: string) => api.messages.update(messageId, { isRead: true, scope: 'single' }),
     onMutate: async (messageId: string) => {
-      await queryClient.cancelQueries({ queryKey: ['messages'] });
-      const snapshots = queryClient.getQueriesData<MessagesQueryResult>({ queryKey: ['messages'] });
+      await queryClient.cancelQueries({
+        predicate: (query) => isScopedMessageQuery(query.queryKey),
+      });
+      const snapshots = queryClient.getQueriesData<MessagesQueryResult>({
+        predicate: (query) => isScopedMessageQuery(query.queryKey),
+      });
       for (const [key, data] of snapshots) {
         const queryKey = Array.isArray(key) ? key : [];
-        const removeFromStarredOnUnstar = isStarredFolderToken(queryKey[1]);
+        const removeFromStarredOnUnstar = isStarredFolderToken(queryKey[2]);
         queryClient.setQueryData<MessagesQueryResult>(
           key,
           applyOptimisticPatch(data, messageId, { isRead: true }, { removeFromStarredOnUnstar }),
@@ -296,22 +476,26 @@ const InboxView = () => {
       }
     },
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['messages'] });
+      queryClient.invalidateQueries({ queryKey: activeMessagesQueryKey, refetchType: 'active' });
     }
   });
 
-  // Auto mark as read on selection
   useEffect(() => {
     if (isSendOnlyMode) {
       return;
     }
     if (selectedThreadId) {
       const msg = messages.find(m => (m.threadId || m.id) === selectedThreadId);
-      if (msg && !msg.isRead) {
-        markAsReadMutation.mutate(msg.id);
+      if (msg && !msg.isRead && !markReadInFlightRef.current.has(msg.id)) {
+        markReadInFlightRef.current.add(msg.id);
+        markAsReadMutation.mutate(msg.id, {
+          onSettled: () => {
+            markReadInFlightRef.current.delete(msg.id);
+          },
+        });
       }
     }
-  }, [isSendOnlyMode, selectedThreadId, messages]);
+  }, [isSendOnlyMode, selectedThreadId, messages, markAsReadMutation]);
 
   const toggleSelectAll = () => {
     if (isSendOnlyMode) {
@@ -335,21 +519,19 @@ const InboxView = () => {
       else next.add(id);
       return next;
     });
-  }, [isSendOnlyMode]);
+  }, [isSendOnlyMode, setSelectedMessageIds]);
+
+  const commitSearch = useCallback((nextQuery: string) => {
+    dispatchRouteEvent({ type: 'set-query', query: nextQuery });
+  }, [dispatchRouteEvent]);
 
   const handleSearchSubmit = (e?: React.FormEvent) => {
     e?.preventDefault();
-    const params = new URLSearchParams(searchParams);
-    if (searchInput) params.set('q', searchInput);
-    else params.delete('q');
-    params.set('page', '1');
-    setSearchParams(params);
+    commitSearch(searchInput);
   };
 
   const setPage = (p: number) => {
-    const params = new URLSearchParams(searchParams);
-    params.set('page', String(p));
-    setSearchParams(params);
+    dispatchRouteEvent({ type: 'set-page', page: p });
   };
 
   const formatDate = useCallback((dateStr: string | null) => {
@@ -360,16 +542,16 @@ const InboxView = () => {
     return format(date, 'MM/dd/yy');
   }, []);
 
-  const stripEmailFromName = (value: string) =>
+  const stripEmailFromName = useCallback((value: string) =>
     value
       .replace(/<[^>]*>/g, ' ')
       .replace(/\([^)]*@[^)]*\)/g, ' ')
       .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, ' ')
       .replace(/['"]/g, '')
       .replace(/\s+/g, ' ')
-      .trim();
+      .trim(), []);
 
-  const parseFromHeader = (header: string | null) => {
+  const parseFromHeader = useCallback((header: string | null) => {
     if (!header) return { name: 'Unknown', email: '' };
     const match = header.match(/^(.*?)\s*<([^>]+)>$/);
     if (match) {
@@ -383,51 +565,55 @@ const InboxView = () => {
     const cleanName = stripEmailFromName(header);
     const fallback = email ? email.split('@')[0] : '';
     return { name: cleanName || fallback || 'Unknown', email };
-  };
+  }, [stripEmailFromName]);
 
-  const renderParticipants = (msg: MessageRecord) => {
-    const userEmails = new Set((connectors ?? []).map(c => c.emailAddress.toLowerCase()));
+  const userEmails = useMemo(
+    () => new Set((connectors ?? []).map((connector) => String(connector.emailAddress ?? '').toLowerCase()).filter(Boolean)),
+    [connectors],
+  );
 
+  const participantDisplayById = useMemo(() => {
+    const byId = new Map<string, string>();
     const getDisplayName = (header: string) => {
       const parsed = parseFromHeader(header);
       if (userEmails.has(parsed.email.toLowerCase())) return 'me';
       return parsed.name;
     };
 
-    if (!msg.participants || msg.participants.length === 0) {
-      return <span className={`truncate ${!msg.isRead ? 'font-semibold text-text-primary' : 'text-text-secondary font-medium'}`}>{getDisplayName(msg.fromHeader || '')}</span>;
-    }
-
-    const names = msg.participants.map(p => getDisplayName(p));
-    const uniqueNames: string[] = [];
-    const seen = new Set<string>();
-    for (const n of names) {
-      if (!seen.has(n)) {
-        uniqueNames.push(n);
-        seen.add(n);
+    for (const msg of messages) {
+      if (!msg.participants || msg.participants.length === 0) {
+        byId.set(msg.id, getDisplayName(msg.fromHeader || ''));
+        continue;
       }
+
+      const names = msg.participants.map((participant) => getDisplayName(participant));
+      const uniqueNames: string[] = [];
+      const seen = new Set<string>();
+      for (const name of names) {
+        if (!seen.has(name)) {
+          uniqueNames.push(name);
+          seen.add(name);
+        }
+      }
+      uniqueNames.sort((left, right) => {
+        if (left === 'me') return -1;
+        if (right === 'me') return 1;
+        return left.localeCompare(right);
+      });
+      byId.set(msg.id, uniqueNames.join(', '));
     }
+    return byId;
+  }, [messages, parseFromHeader, userEmails]);
 
-    const sortedNames = uniqueNames.sort((a, b) => {
-      if (a === 'me') return -1;
-      if (b === 'me') return 1;
-      return a.localeCompare(b);
-    });
+  const formattedDateById = useMemo(() => {
+    const byId = new Map<string, string>();
+    for (const msg of messages) {
+      byId.set(msg.id, formatDate(msg.receivedAt));
+    }
+    return byId;
+  }, [formatDate, messages]);
 
-    const joined = sortedNames.join(', ');
-
-    return (
-      <div className="flex items-center gap-1 min-w-0">
-        <span className={`truncate ${!msg.isRead ? 'font-semibold text-text-primary' : 'text-text-secondary font-medium'}`}>{joined}</span>
-        {msg.threadCount && msg.threadCount > 1 && (
-          <span className="text-[11px] text-text-secondary/60 font-normal">({msg.threadCount})</span>
-        )}
-      </div>
-    );
-  };
-
-  // Stable callbacks for memo'd list items — created once per mutation identity
-  const handleUpdateMessage = useCallback((messageId: string, data: { isRead?: boolean; isStarred?: boolean; delete?: boolean; moveToFolder?: string }) => {
+  const handleUpdateMessage = useCallback((messageId: string, data: MessagePatch) => {
     if (isSendOnlyMode) {
       return;
     }
@@ -435,24 +621,36 @@ const InboxView = () => {
   }, [isSendOnlyMode, updateMessageMutation]);
 
   const handleSelectThread = useCallback((threadId: string) => {
-    setSelectedThreadId(threadId);
-  }, []);
+    void loadThreadDetail();
+    dispatchRouteEvent({ type: 'open-thread', threadId });
+  }, [dispatchRouteEvent]);
+
+  const handlePrefetchThread = useCallback((threadId: string) => {
+    if (isSendOnlyMode) {
+      return;
+    }
+    void loadThreadDetail();
+    void queryClient.prefetchQuery({
+      queryKey: ['thread', threadId, effectiveConnectorId ?? 'all'],
+      queryFn: ({ signal }) => api.messages.getThread(threadId, effectiveConnectorId, signal),
+      staleTime: 15_000,
+    });
+  }, [effectiveConnectorId, isSendOnlyMode, queryClient]);
 
   if (loadingConnectors) {
     return <div className="flex-1 flex items-center justify-center bg-bg-card"><Loader2 className="w-6 h-6 animate-spin text-text-secondary" /></div>;
   }
 
   if (!isSendOnlyMode && !connectors?.length) {
-    return <EmptyState icon={LayoutPanelLeft} title="Welcome to betterMail" description="Connect an account to get started." actionText="Add account" actionPath="/settings/connectors/new?type=incoming" />;
+    return <EmptyState icon={LayoutPanelLeft} title="Welcome to simpleMail" description="Connect an account to get started." actionText="Add account" actionPath="/settings/connectors/new?type=incoming" />;
   }
 
-  // --- BULK TOOLBAR ---
   const bulkToolbar = (
     <div className="h-12 border-b border-border/60 flex items-center px-3 gap-2 bg-accent shrink-0 animate-in slide-in-from-top-1 duration-200" style={{ color: 'var(--accent-contrast)' }}>
       <button onClick={toggleSelectAll} className="p-1.5 hover:bg-black/10 rounded">
         {selectedMessageIds.size === messages.length ? <CheckSquare className="w-4.5 h-4.5" /> : <Square className="w-4.5 h-4.5" />}
       </button>
-      <div className="text-xs font-bold mr-2">{selectedMessageIds.size} selected</div>
+      {!isMobile && <div className="text-xs font-bold mr-2">{selectedMessageIds.size} selected</div>}
       <div className="h-4 w-px bg-current opacity-20 mx-1" />
       <button onClick={() => bulkActionMutation.mutate({ delete: true })} className="p-2 hover:bg-red-500/20 rounded-md" title="Delete"><Trash2 className="w-4 h-4" /></button>
       <button onClick={() => bulkActionMutation.mutate({ isRead: true })} className="p-2 hover:bg-black/10 rounded-md" title="Mark as Read"><MailOpen className="w-4 h-4" /></button>
@@ -461,32 +659,53 @@ const InboxView = () => {
       <button onClick={() => setSelectedMessageIds(new Set())} className="p-1.5 hover:bg-black/10 rounded"><X className="w-4 h-4" /></button>
     </div>
   );
-
-  // --- PAGINATION UI ---
   const startRange = offset + 1;
   const endRange = Math.min(offset + messages.length, totalCount);
   const paginationUI = (
     <div className="flex items-center gap-4 px-2 shrink-0">
-      <div className="text-xs text-text-secondary font-semibold whitespace-nowrap opacity-70">{totalCount > 0 ? `${startRange}-${endRange} of ${totalCount}` : '0-0 of 0'}</div>
-      <div className="flex items-center gap-0.5">
-        <button onClick={() => setPage(page - 1)} disabled={page <= 1} className="p-1 hover:bg-black/5 dark:hover:bg-white/5 rounded disabled:opacity-50 transition-colors"><ChevronLeft className="w-4 h-4" /></button>
-        <button onClick={() => setPage(page + 1)} disabled={endRange >= totalCount} className="p-1 hover:bg-black/5 dark:hover:bg-white/5 rounded disabled:opacity-50 transition-colors"><ChevronRight className="w-4 h-4" /></button>
+      {!isMobile && <div className="text-xs text-text-secondary font-semibold whitespace-nowrap opacity-70">{totalCount > 0 ? `${startRange}-${endRange} of ${totalCount}` : '0-0 of 0'}</div>}
+      <div className="flex items-center gap-2 md:gap-0.5">
+        <button
+          onClick={() => setPage(page - 1)}
+          disabled={page <= 1}
+          className={`${isMobile ? 'p-3' : 'p-1.5'} hover:bg-black/5 dark:hover:bg-white/5 rounded-md text-text-secondary disabled:opacity-30 transition-colors`}
+        >
+          <ChevronLeft className={`${isMobile ? 'w-6 h-6' : 'w-4 h-4'}`} />
+        </button>
+        <button
+          onClick={() => setPage(page + 1)}
+          disabled={endRange >= totalCount}
+          className={`${isMobile ? 'p-3' : 'p-1.5'} hover:bg-black/5 dark:hover:bg-white/5 rounded-md text-text-secondary disabled:opacity-30 transition-colors`}
+        >
+          <ChevronRight className={`${isMobile ? 'w-6 h-6' : 'w-4 h-4'}`} />
+        </button>
       </div>
     </div>
   );
+  const threadDetailFallback = <div className="flex items-center justify-center h-32"><Loader2 className="w-6 h-6 animate-spin text-text-secondary" /></div>;
 
   if (layoutMode === 'list' && selectedThreadId) {
     return (
-      <div className="flex-1 flex flex-col min-h-0 min-w-0 bg-bg-card animate-in fade-in slide-in-from-right-2 duration-200">
-        <div className="h-10 border-b border-border/60 flex items-center px-2 bg-bg-card shrink-0">
-          <button onClick={() => setSelectedThreadId(null)} className="flex items-center gap-1.5 px-2 py-1 hover:bg-black/5 dark:hover:bg-white/5 rounded text-text-secondary transition-colors"><ChevronLeft className="w-4 h-4" /><span className="text-sm font-semibold text-text-primary">Back to inbox</span></button>
+      <div className="flex-1 flex flex-col min-h-0 min-w-0 bg-bg-card animate-in fade-in slide-in-from-right-2 duration-200 overflow-y-auto custom-scrollbar">
+        <div className="h-14 md:h-11 border-b border-border/60 flex items-center bg-bg-card shrink-0 sticky top-0 z-40 px-4">
+          <button
+            onClick={() => dispatchRouteEvent({ type: 'close-thread' })}
+            className="flex items-center gap-1.5 -ml-1 p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-md text-text-secondary transition-colors"
+          >
+            <ChevronLeft className="w-6 h-6 md:w-4 md:h-4" />
+            <span className="text-sm font-bold text-text-primary">Back</span>
+          </button>
         </div>
-        <div className="flex-1 min-h-0 overflow-y-auto custom-scrollbar">
+        <div className="flex-1 flex flex-col">
           {isSendOnlyMode
             ? (selectedSendOnlyMessage
               ? <SendOnlyMessageDetail message={selectedSendOnlyMessage} />
               : <div className="flex-1 flex items-center justify-center text-sm text-text-secondary">Message not found.</div>)
-            : <ThreadDetail threadId={selectedThreadId} connectorId={effectiveConnectorId} onActionComplete={() => { }} />}
+            : (
+              <Suspense fallback={threadDetailFallback}>
+                <ThreadDetail threadId={selectedThreadId} connectorId={effectiveConnectorId} onActionComplete={() => { }} />
+              </Suspense>
+            )}
         </div>
       </div>
     );
@@ -495,25 +714,47 @@ const InboxView = () => {
   return (
     <div className="flex-1 flex flex-col overflow-hidden bg-bg-card">
       {selectedMessageIds.size > 0 && !isSendOnlyMode ? bulkToolbar : (
-        <div className="h-11 border-b border-border/60 flex items-center px-3 gap-2 shrink-0 bg-bg-card relative">
+        <div className="h-12 md:h-11 border-b border-border/60 flex items-center px-3 gap-2 shrink-0 bg-bg-card relative">
           {!isSendOnlyMode && (
-            <div className="shrink-0 mr-1"><button onClick={toggleSelectAll} className="p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded text-text-secondary"><Square className="w-4 h-4 opacity-70" /></button></div>
+            <div className="shrink-0">
+              <button
+                onClick={toggleSelectAll}
+                className={`${isMobile ? 'p-2.5' : 'p-2'} hover:bg-black/5 dark:hover:bg-white/5 rounded-md text-text-secondary transition-colors`}
+              >
+                <Square className={`${isMobile ? 'w-5 h-5' : 'w-4.5 h-4.5'} opacity-70`} />
+              </button>
+            </div>
           )}
           <div className="relative flex-1 max-w-2xl mx-auto">
-            <Search className="w-3.5 h-3.5 absolute left-3 top-1/2 -translate-y-1/2 text-text-secondary opacity-60" />
-            <form onSubmit={handleSearchSubmit}><input type="text" placeholder="Search mail" className="w-full bg-sidebar border-none rounded-md pl-9 pr-8 py-1.5 text-sm text-text-primary focus:outline-none transition-all placeholder:text-text-secondary/50" value={searchInput} onChange={(e) => setSearchInput(e.target.value)} /></form>
-            {searchInput && <button onClick={() => { setSearchInput(''); handleSearchSubmit(); }} className="absolute right-2 top-1/2 -translate-y-1/2 p-0.5 hover:bg-black/5 dark:hover:bg-white/5 rounded text-text-secondary"><X className="w-3 h-3" /></button>}
+            <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-text-secondary opacity-70" />
+            <form onSubmit={handleSearchSubmit}>
+              <input
+                type="text"
+                placeholder="Search mail"
+                className="w-full bg-black/[0.03] dark:bg-white/[0.05] border-none rounded-lg pl-10 pr-10 py-2 text-sm text-text-primary focus:bg-transparent focus:ring-1 focus:ring-accent transition-all placeholder:text-text-secondary/60"
+                value={searchInput}
+                onChange={(e) => setSearchInput(e.target.value)}
+              />
+            </form>
+            {searchInput && (
+              <button
+                onClick={() => { setSearchInput(''); handleSearchSubmit(); }}
+                className={`absolute right-2 top-1/2 -translate-y-1/2 ${isMobile ? 'p-2' : 'p-1.5'} hover:bg-black/5 dark:hover:bg-white/5 rounded-md text-text-secondary transition-colors`}
+              >
+                <X className={`${isMobile ? 'w-5 h-5' : 'w-4 h-4'}`} />
+              </button>
+            )}
           </div>
-          <div className="flex-1" />
+          <div className="hidden md:flex flex-1" />
           {layoutMode === 'list' && paginationUI}
-          {!isSendOnlyMode && (
+          {!isSendOnlyMode && !isMobile && (
             <button
               onClick={() => triggerSyncMutation.mutate()}
-              className="p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded text-text-secondary disabled:opacity-50"
+              className="p-2 hover:bg-black/5 dark:hover:bg-white/5 rounded-md text-text-secondary disabled:opacity-30 transition-colors"
               disabled={triggerSyncMutation.isPending}
               title="Run full sync"
             >
-              <RefreshCw className={`w-3.5 h-3.5 ${triggerSyncMutation.isPending ? 'animate-spin' : ''}`} />
+              <RefreshCw className={`w-4 h-4 ${triggerSyncMutation.isPending ? 'animate-spin' : ''}`} />
             </button>
           )}
         </div>
@@ -530,52 +771,76 @@ const InboxView = () => {
               <div className={layoutMode === 'columns' ? 'divide-y divide-border/20' : ''}>
                 {messages.map((msg) =>
                   layoutMode === 'columns' ? (
-                    <MemoColumnItem
+                    <InboxColumnItem
                       key={msg.id}
                       msg={msg}
                       selectedThreadId={selectedThreadId}
                       isSelected={selectedMessageIds.has(msg.id)}
                       onSelect={handleSelectThread}
+                      onPrefetchThread={handlePrefetchThread}
                       onToggleSelect={toggleSelectMessage}
                       onUpdateMessage={handleUpdateMessage}
-                      participants={renderParticipants(msg)}
-                      formattedDate={formatDate(msg.receivedAt)}
+                      participants={participantDisplayById.get(msg.id) ?? 'Unknown'}
+                      formattedDate={formattedDateById.get(msg.id) ?? ''}
                       disableActions={isSendOnlyMode}
                     />
                   ) : (
-                    <MemoListItem
+                    <InboxListItem
                       key={msg.id}
                       msg={msg}
                       selectedThreadId={selectedThreadId}
                       isSelected={selectedMessageIds.has(msg.id)}
                       onSelect={handleSelectThread}
+                      onPrefetchThread={handlePrefetchThread}
                       onToggleSelect={toggleSelectMessage}
                       onUpdateMessage={handleUpdateMessage}
-                      participants={renderParticipants(msg)}
-                      formattedDate={formatDate(msg.receivedAt)}
+                      participants={participantDisplayById.get(msg.id) ?? 'Unknown'}
+                      formattedDate={formattedDateById.get(msg.id) ?? ''}
                       disableActions={isSendOnlyMode}
+                      isMobile={isMobile}
                     />
                   )
                 )}
               </div>
             )}
-            {layoutMode === 'columns' && totalCount > PAGE_SIZE && <div className="p-4 border-t border-border/20 flex justify-center bg-bg-card">{paginationUI}</div>}
+            {(layoutMode === 'columns' || isMobile) && totalCount > PAGE_SIZE && <div className="p-4 border-t border-border/20 flex justify-center bg-bg-card">{paginationUI}</div>}
           </div>
         </div>
 
-        {layoutMode === 'columns' && (
-          <div className="flex-1 flex flex-col min-w-0 bg-black/[0.02] dark:bg-white/[0.02]">
+        {layoutMode === 'columns' && !isMobile && (
+          <div className="flex-1 flex flex-col min-w-0 bg-black/[0.02] dark:bg-white/[0.02] overflow-y-auto custom-scrollbar">
             {isSendOnlyMode
               ? (selectedSendOnlyMessage
                 ? <SendOnlyMessageDetail message={selectedSendOnlyMessage} />
                 : <div className="flex-1 flex flex-col items-center justify-center text-text-secondary opacity-60"><Mail className="w-12 h-12 mb-2 stroke-1" /><p className="text-sm font-medium">Select a sent/outbox message</p><p className="text-xs mt-1">Responses will not appear without an IMAP inbox.</p></div>)
               : (selectedThreadId
-                ? <ThreadDetail threadId={selectedThreadId} connectorId={effectiveConnectorId} onActionComplete={() => { }} />
+                ? (
+                  <Suspense fallback={threadDetailFallback}>
+                    <ThreadDetail threadId={selectedThreadId} connectorId={effectiveConnectorId} onActionComplete={() => { }} />
+                  </Suspense>
+                )
                 : <div className="flex-1 flex flex-col items-center justify-center text-text-secondary opacity-70"><Mail className="w-12 h-12 mb-2 stroke-1" /><p className="text-sm font-medium">Select a message to read</p></div>)
             }
           </div>
         )}
       </div>
+
+      {isMobile && !selectedThreadId && (
+        <button
+          onClick={() => setIsComposeOpen(true)}
+          className="fixed bottom-6 right-6 w-14 h-14 rounded-full bg-accent shadow-xl flex items-center justify-center text-white active:scale-90 transition-transform z-40"
+          style={{ color: 'var(--accent-contrast)' }}
+          title="Compose"
+        >
+          <PenBox className="w-6 h-6" />
+        </button>
+      )}
+
+      {isComposeOpen && (
+        <Suspense fallback={null}>
+          <ComposeModal onClose={() => setIsComposeOpen(false)} />
+        </Suspense>
+      )}
     </div>
   );
 };
@@ -621,122 +886,3 @@ const SendOnlyMessageDetail = ({ message }: { message: MessageRecord }) => {
 };
 
 export default InboxView;
-
-// ---------------------------------------------------------------------------
-// Stable memo'd list item components — at module level so React can diff
-// them correctly across polling-triggered re-renders.
-// ---------------------------------------------------------------------------
-
-type ListItemProps = {
-  msg: MessageRecord;
-  selectedThreadId: string | null;
-  isSelected: boolean;
-  onSelect: (threadId: string) => void;
-  onToggleSelect: (id: string, e: React.MouseEvent) => void;
-  onUpdateMessage: (id: string, data: { isRead?: boolean; isStarred?: boolean; delete?: boolean; moveToFolder?: string }) => void;
-  participants: React.ReactNode;
-  formattedDate: string;
-  disableActions?: boolean;
-};
-
-const MemoColumnItem = memo(({ msg, selectedThreadId, isSelected, onSelect, onToggleSelect, participants, formattedDate, disableActions }: ListItemProps) => {
-  const threadId = msg.threadId || msg.id;
-  const subjectText = (msg.subject || '(no subject)').trim();
-  const snippetText = String(msg.snippet || '').trim();
-
-  return (
-    <div
-      onClick={() => onSelect(threadId)}
-      className={`
-        px-3 py-2.5 cursor-pointer transition-colors group relative border-l-2 flex gap-2
-        ${selectedThreadId === threadId ? 'bg-accent/5 border-l-accent' : 'hover:bg-sidebar/40 border-l-transparent'}
-        ${!msg.isRead ? 'bg-bg-card' : 'bg-black/[0.02] dark:bg-white/[0.02] opacity-60'}
-        ${isSelected ? 'bg-accent/[0.08]' : ''}
-      `}
-    >
-      {!disableActions && (
-        <div className="pt-0.5 shrink-0 z-10" onClick={(e) => onToggleSelect(msg.id, e)}>
-          <button className={`p-0.5 rounded transition-colors ${isSelected ? 'text-accent' : 'text-text-secondary opacity-60 group-hover:opacity-100'}`}>
-            {isSelected ? <CheckSquare className="w-3.5 h-3.5" /> : <Square className="w-3.5 h-3.5" />}
-          </button>
-        </div>
-      )}
-      <div className="flex-1 min-w-0">
-        <div className="flex justify-between items-baseline mb-1">
-          <div className="flex items-center gap-1.5 truncate flex-1">
-            <div className={`truncate text-xs ${!msg.isRead ? 'font-bold text-text-primary' : 'font-normal text-text-secondary opacity-70'}`}>{participants}</div>
-          </div>
-          <span className={`text-[10px] whitespace-nowrap font-medium ml-2 ${!msg.isRead ? 'text-text-primary opacity-80' : 'text-text-secondary opacity-40'}`}>{formattedDate}</span>
-        </div>
-        <div className="flex items-baseline gap-1.5 min-w-0 overflow-hidden">
-          <span className={`text-[13px] leading-snug truncate shrink-0 max-w-[85%] ${!msg.isRead ? 'font-bold text-text-primary' : 'text-text-secondary font-normal opacity-70'}`}>
-            {subjectText}
-          </span>
-          {snippetText && (
-            <span className={`text-xs font-normal truncate flex-1 min-w-0 ${!msg.isRead ? 'text-text-secondary opacity-50' : 'text-text-secondary opacity-30'}`}>
-              — {snippetText}
-            </span>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-});
-MemoColumnItem.displayName = 'MemoColumnItem';
-
-// selectedThreadId not needed in list mode but kept in type for uniformity
-const MemoListItem = memo(({ msg, isSelected, onSelect, onToggleSelect, onUpdateMessage, participants, formattedDate, disableActions }: ListItemProps) => {
-  const threadId = msg.threadId || msg.id;
-  const subjectText = (msg.subject || '(no subject)').trim();
-  const snippetText = String(msg.snippet || '').trim();
-
-  return (
-    <div
-      onClick={() => onSelect(threadId)}
-      className={`
-        flex items-center px-4 h-10 cursor-pointer border-b border-border/40 transition-colors group
-        ${!msg.isRead ? 'bg-bg-card text-text-primary' : 'bg-black/[0.01] dark:bg-white/[0.01] text-text-secondary opacity-40 hover:opacity-70 hover:bg-black/[0.03] dark:hover:bg-white/[0.03]'}
-        ${isSelected ? 'bg-accent/[0.08]' : ''}
-      `}
-    >
-      {!disableActions && (
-        <div className="shrink-0 mr-3 z-10" onClick={(e) => onToggleSelect(msg.id, e)}>
-          <button className={`p-1 rounded transition-colors ${isSelected ? 'text-accent' : 'text-text-secondary opacity-70 group-hover:opacity-100'}`}>
-            {isSelected ? <CheckSquare className="w-4 h-4" /> : <Square className="w-4 h-4" />}
-          </button>
-        </div>
-      )}
-      <div className="flex items-center gap-3 shrink-0 mr-4 w-48">
-        {!disableActions && (
-          <button
-            className="p-0.5 rounded hover:bg-black/10 dark:hover:bg-white/10"
-            onClick={(e) => { e.stopPropagation(); onUpdateMessage(msg.id, { isStarred: !msg.isStarred }); }}
-            title={msg.isStarred ? 'Unstar' : 'Star'}
-          >
-            <Star className={`w-3.5 h-3.5 ${msg.isStarred ? 'fill-yellow-400 text-yellow-400' : 'text-text-secondary opacity-60 group-hover:opacity-100'}`} />
-          </button>
-        )}
-        <div className={`flex-1 min-w-0 ${!msg.isRead ? 'font-bold' : 'font-normal'}`}>{participants}</div>
-      </div>
-      <div className="min-w-0 flex-1 flex items-baseline gap-2 pr-4">
-        <span className={`text-sm truncate shrink-0 max-w-[45%] ${!msg.isRead ? 'font-bold text-text-primary' : 'font-normal'}`}>{subjectText}</span>
-        {snippetText && (
-          <span className={`text-sm font-normal truncate min-w-0 flex-1 ${!msg.isRead ? 'text-text-secondary opacity-50' : 'opacity-60'}`}>— {snippetText}</span>
-        )}
-      </div>
-      <div className={`text-xs font-medium whitespace-nowrap shrink-0 group-hover:hidden ml-3 min-w-[3.25rem] text-right ${!msg.isRead ? 'text-text-primary' : 'opacity-40'}`}>{formattedDate}</div>
-      {!disableActions && (
-        <div className="hidden group-hover:flex items-center gap-1 shrink-0">
-          <button
-            className="p-1.5 hover:bg-black/10 dark:hover:bg-white/10 rounded text-text-secondary transition-colors"
-            onClick={(e) => { e.stopPropagation(); onUpdateMessage(msg.id, { delete: true }); }}
-            title="Delete"
-          >
-            <Trash2 className="w-4 h-4" />
-          </button>
-        </div>
-      )}
-    </div>
-  );
-});
-MemoListItem.displayName = 'MemoListItem';

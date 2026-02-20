@@ -3,6 +3,8 @@ import { env } from '../config/env.js';
 import { query } from '../db/pool.js';
 
 let queue: WorkerUtils | null = null;
+let activeWorkersCache: { expiresAtMs: number; value: boolean } | null = null;
+const ACTIVE_WORKERS_CACHE_TTL_MS = 5_000;
 
 export const createQueue = async () => {
   if (queue) return queue;
@@ -13,6 +15,10 @@ export const createQueue = async () => {
 };
 
 const hasActiveWorkers = async () => {
+  if (activeWorkersCache && activeWorkersCache.expiresAtMs > Date.now()) {
+    return activeWorkersCache.value;
+  }
+
   const heartbeatGraceSeconds = 30;
   const safeWorkerCount = async (tableName: 'workers' | '_private_workers') => {
     const result = await query<{ count: number }>(
@@ -48,24 +54,31 @@ const hasActiveWorkers = async () => {
     }
   };
 
+  let active = false;
   const workersCount = await countFrom('workers');
   if (typeof workersCount === 'number') {
-    return workersCount > 0;
+    active = workersCount > 0;
+  } else {
+    const privateWorkersCount = await countFrom('_private_workers');
+    if (typeof privateWorkersCount === 'number') {
+      active = privateWorkersCount > 0;
+    } else {
+      // Some graphile-worker schemas do not expose worker heartbeat tables.
+      // In that case, fall back to recent lock activity; if unavailable, assume
+      // no active workers so sync can run immediately in-process.
+      try {
+        active = (await countRecentlyLockedJobs()) > 0;
+      } catch {
+        active = false;
+      }
+    }
   }
 
-  const privateWorkersCount = await countFrom('_private_workers');
-  if (typeof privateWorkersCount === 'number') {
-    return privateWorkersCount > 0;
-  }
-
-  // Some graphile-worker schemas do not expose worker heartbeat tables.
-  // In that case, fall back to recent lock activity; if unavailable, assume
-  // no active workers so sync can run immediately in-process.
-  try {
-    return (await countRecentlyLockedJobs()) > 0;
-  } catch {
-    return false;
-  }
+  activeWorkersCache = {
+    value: active,
+    expiresAtMs: Date.now() + ACTIVE_WORKERS_CACHE_TTL_MS,
+  };
+  return active;
 };
 
 const hasActiveSyncClaim = async (connectorId: string, mailbox: string) => {
@@ -129,9 +142,7 @@ export const enqueueSyncWithOptions = async (
           AND attempts >= max_attempts`,
       [jobKey],
     );
-  } catch {
-    // no-op
-  }
+  } catch {}
   if (await hasActiveSyncClaim(connectorId, mailbox)) {
     return false;
   }
@@ -243,4 +254,30 @@ export const enqueueGmailHydration = async (
       jobKeyMode: 'preserve_run_at',
     },
   );
+};
+
+export const purgeIncomingConnectorSyncJobs = async (connectorId: string) => {
+  const normalizedConnectorId = String(connectorId || '').trim();
+  if (!normalizedConnectorId) {
+    return { removed: 0 };
+  }
+
+  const syncKeyPrefix = `sync:${normalizedConnectorId}:`;
+  const hydrateKeyPrefix = `gmail-hydrate:${normalizedConnectorId}:`;
+  const removed = await query<{ count: number }>(
+    `WITH deleted AS (
+       DELETE FROM graphile_worker.jobs
+        WHERE locked_at IS NULL
+          AND (
+            (task_identifier = 'syncIncomingConnector' AND key LIKE ($1 || '%'))
+            OR
+            (task_identifier = 'hydrateGmailMailboxContent' AND key LIKE ($2 || '%'))
+          )
+       RETURNING 1
+     )
+     SELECT COUNT(*)::int AS count FROM deleted`,
+    [syncKeyPrefix, hydrateKeyPrefix],
+  );
+
+  return { removed: Number(removed.rows[0]?.count ?? 0) };
 };

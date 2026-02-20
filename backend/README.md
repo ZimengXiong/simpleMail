@@ -1,4 +1,4 @@
-# BetterMail (Self-hosted MVP Backend)
+# simpleMail (Self-hosted MVP Backend)
 
 Backend implementation for Gmail + generic SMTP clients with:
 - Connector-first model for incoming IMAP and outgoing SMTP
@@ -13,7 +13,7 @@ Backend implementation for Gmail + generic SMTP clients with:
 ## Run locally (dev)
 
 ```bash
-cd /Users/zimengx/Projects/betterMail
+cd <repo-root>
 cp .env.example .env
 npm install
 npm run migrate
@@ -23,16 +23,24 @@ npm run dev
 
 API is available at `http://localhost:3000`.
 
-### Development default user
+### Development OIDC (Keycloak)
 
-To avoid manual DB seeding, set these env vars in `backend/.env` and restart the API:
+`scripts/dev.sh start` now starts a local Keycloak service from `docker-compose.dev.yml` and imports
+`deploy/keycloak/simplemail-realm.json`.
 
-- `DEV_USER_BOOTSTRAP=true`
-- `DEV_USER_EMAIL=you@local.test`
-- `DEV_USER_NAME=You`
-- `DEV_USER_TOKEN=dev-bettermail-token`
+Default dev credentials:
 
-These values create/update a user on startup with a deterministic token you can use in the frontend as `VITE_BETTERMAIL_USER_TOKEN`.
+- realm: `simplemail`
+- app user: `demo` / `demo123` (`demo@local.test`)
+- admin console: `http://localhost:8080/admin` with `admin` / `admin`
+
+OIDC defaults are preconfigured in `.env.example`:
+
+- `OIDC_ISSUER_URL=http://localhost:8080/realms/simplemail`
+- `OIDC_CLIENT_ID=simplemail-web`
+- `OIDC_REQUIRED_EMAIL=demo@local.test`
+- `OIDC_ALLOWED_ALGS=RS256`
+- `OIDC_REQUIRE_EMAIL_VERIFIED=false` (development default)
 
 ## Docker compose
 
@@ -55,8 +63,10 @@ docker compose up -d api worker
 
 ### Production guardrails
 
-- Set `API_ADMIN_TOKEN` in production. Admin routes (for bootstrap/management) require it as `x-api-key`.
-- All user routes require a user access token in `Authorization: Bearer <token>` or `x-user-token`.
+- Set `API_ADMIN_TOKEN` in production (minimum 24 chars). Admin routes (for bootstrap/management) require it as `x-api-key`.
+- Keep `ALLOW_ADMIN_USER_BOOTSTRAP=false` unless you intentionally need the legacy admin-user bootstrap endpoint.
+- All user routes require a valid OIDC access token in `Authorization: Bearer <token>`.
+- Set `OIDC_ISSUER_URL`, `OIDC_CLIENT_ID`, `OIDC_REQUIRED_EMAIL`, and `OIDC_ALLOWED_ALGS` explicitly in production.
 - `POST /api/health` and OAuth callback are intentionally public.
 - Run both migration tasks before first deployment (`migrate`, `worker-migrate`).
 - Keep API, worker, Postgres, and SeaweedFS in the same compose stack for single-host operation.

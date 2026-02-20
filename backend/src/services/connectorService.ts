@@ -55,7 +55,29 @@ export const getIncomingConnectorById = async (id: string): Promise<any | null> 
 };
 
 export const deleteIncomingConnector = async (userId: string, id: string): Promise<void> => {
-  await query('DELETE FROM incoming_connectors WHERE id = $1 AND user_id = $2', [id, userId]);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      `DELETE FROM oauth_states
+        WHERE user_id = $1
+          AND connector_type = 'incoming'
+          AND connector_id = $2`,
+      [userId, id],
+    );
+    await client.query(
+      `DELETE FROM incoming_connectors
+        WHERE id = $1
+          AND user_id = $2`,
+      [id, userId],
+    );
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
 };
 
 export const updateIncomingConnector = async (
@@ -202,6 +224,13 @@ export const deleteOutgoingConnector = async (userId: string, id: string): Promi
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    await client.query(
+      `DELETE FROM oauth_states
+        WHERE user_id = $1
+          AND connector_type = 'outgoing'
+          AND connector_id = $2`,
+      [userId, id],
+    );
     await client.query(
       `DELETE FROM send_idempotency si
         USING identities i

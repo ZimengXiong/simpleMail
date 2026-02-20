@@ -11,8 +11,8 @@ export interface IncomingConnectorRecord {
   host: string | null;
   port: number | null;
   tls: boolean | null;
-  authConfig: any;
-  syncSettings: any;
+  authConfig: unknown;
+  syncSettings: unknown;
   visual_config?: { icon?: string; emoji?: string };
   status: string;
   createdAt: string;
@@ -27,9 +27,9 @@ export interface OutgoingConnectorRecord {
   host: string | null;
   port: number | null;
   tlsMode: string;
-  authConfig: any;
-  fromEnvelopeDefaults: any;
-  sentCopyBehavior: any;
+  authConfig: unknown;
+  fromEnvelopeDefaults: unknown;
+  sentCopyBehavior: unknown;
   createdAt: string;
   updatedAt: string;
 }
@@ -52,6 +52,7 @@ export interface AttachmentRecord {
   contentType: string;
   size: number;
   blobKey: string;
+  contentId?: string | null;
   scanStatus: ScanStatus;
   scanResult: string | null;
   scannedAt: string | null;

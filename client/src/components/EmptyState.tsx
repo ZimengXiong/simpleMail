@@ -12,8 +12,6 @@ interface EmptyStateProps {
 }
 
 const EmptyState = ({ icon: Icon, title, description, actionText, actionPath, onAction }: EmptyStateProps) => {
-  const buttonClasses = "flex items-center gap-2 px-6 py-2 bg-accent hover:bg-accent-hover text-sm font-bold rounded-md transition-all shadow-sm";
-
   return (
     <div className="flex-1 flex flex-col items-center justify-center p-12 text-center animate-in fade-in duration-500">
       <div className="w-16 h-16 rounded-full bg-sidebar flex items-center justify-center mb-6 border border-border/50">
@@ -26,12 +24,12 @@ const EmptyState = ({ icon: Icon, title, description, actionText, actionPath, on
       {actionText && (
         <>
           {onAction ? (
-            <button onClick={onAction} className={buttonClasses} style={{ color: 'var(--accent-contrast)' }}>
+            <button onClick={onAction} className="btn-primary px-6 py-2 font-bold">
               <Plus className="w-4 h-4" />
               {actionText}
             </button>
           ) : actionPath ? (
-            <Link to={actionPath} className={buttonClasses} style={{ color: 'var(--accent-contrast)' }}>
+            <Link to={actionPath} className="btn-primary px-6 py-2 font-bold">
               <Plus className="w-4 h-4" />
               {actionText}
             </Link>

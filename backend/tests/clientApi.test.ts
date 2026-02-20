@@ -5,35 +5,8 @@ type FetchCall = {
   init?: RequestInit;
 };
 
-class MemoryStorage {
-  private readonly map = new Map<string, string>();
-
-  getItem(key: string) {
-    return this.map.has(key) ? this.map.get(key)! : null;
-  }
-
-  setItem(key: string, value: string) {
-    this.map.set(key, String(value));
-  }
-
-  removeItem(key: string) {
-    this.map.delete(key);
-  }
-
-  clear() {
-    this.map.clear();
-  }
-}
-
-const TOKEN_KEY = 'BETTERMAIL_USER_TOKEN';
-
-const sessionStorageMock = new MemoryStorage();
-const localStorageMock = new MemoryStorage();
-
-(globalThis as any).sessionStorage = sessionStorageMock;
-(globalThis as any).localStorage = localStorageMock;
 (globalThis as any).window = {
-  location: { href: '' },
+  location: { href: '', origin: 'http://localhost:5173' },
   setTimeout,
   open: () => null,
 };
@@ -74,29 +47,25 @@ const test = async (name: string, fn: () => Promise<void> | void) => {
   }
 };
 
-const { api } = await import('../../client/src/services/api.ts');
+const { api, getAuthToken } = await import('../../client/src/services/api.ts');
 
-await test('auth.login persists token in session storage and marks session authenticated', () => {
-  sessionStorageMock.clear();
-  localStorageMock.clear();
+await test('auth.login stores runtime token and marks session authenticated', () => {
+  api.auth.clear();
   (globalThis as any).window.location.href = '';
 
   api.auth.login('token-1');
 
-  assert.equal(sessionStorageMock.getItem(TOKEN_KEY), 'token-1');
-  assert.equal(localStorageMock.getItem(TOKEN_KEY), null);
+  assert.equal(getAuthToken(), 'token-1');
   assert.equal(api.auth.isAuthenticated(), true);
 });
 
-await test('auth.logout clears stored tokens and redirects to login', () => {
-  sessionStorageMock.setItem(TOKEN_KEY, 'token-2');
-  localStorageMock.setItem(TOKEN_KEY, 'legacy-token');
+await test('auth.logout clears runtime token and redirects to login', () => {
+  api.auth.login('token-2');
   (globalThis as any).window.location.href = '';
 
   api.auth.logout();
 
-  assert.equal(sessionStorageMock.getItem(TOKEN_KEY), null);
-  assert.equal(localStorageMock.getItem(TOKEN_KEY), null);
+  assert.equal(getAuthToken(), null);
   assert.equal((globalThis as any).window.location.href, '/login');
   assert.equal(api.auth.isAuthenticated(), false);
 });
@@ -141,21 +110,27 @@ await test('clears auth and redirects on unauthorized API responses', async () =
 
   await assert.rejects(() => api.connectors.listIncoming(), /Unauthorized/);
 
-  assert.equal(sessionStorageMock.getItem(TOKEN_KEY), null);
-  assert.equal(localStorageMock.getItem(TOKEN_KEY), null);
+  assert.equal(getAuthToken(), null);
   assert.equal((globalThis as any).window.location.href, '/login');
   assert.equal(api.auth.isAuthenticated(), false);
 });
 
-await test('migrates legacy localStorage auth token into sessionStorage on first auth check', () => {
-  sessionStorageMock.clear();
-  localStorageMock.clear();
+await test('fetches attachment preview blob with bearer auth header', async () => {
+  api.auth.login('blob-token-1');
+  setFetchResponse(() => new Response('blob-body', {
+    status: 200,
+    headers: {
+      'Content-Type': 'application/octet-stream',
+    },
+  }));
 
-  localStorageMock.setItem(TOKEN_KEY, 'legacy-token');
+  const blob = await api.attachments.getPreviewBlob('att-blob');
 
-  assert.equal(api.auth.isAuthenticated(), true);
-  assert.equal(sessionStorageMock.getItem(TOKEN_KEY), 'legacy-token');
-  assert.equal(localStorageMock.getItem(TOKEN_KEY), null);
+  assert.equal(blob instanceof Blob, true);
+  assert.equal(fetchCalls.length, 1);
+  assert.equal(String(fetchCalls[0].input), '/api/attachments/att-blob/view');
+  const headers = getCallHeaders(fetchCalls[0]);
+  assert.equal(headers.get('Authorization'), 'Bearer blob-token-1');
 });
 
 console.log(`\n${passed + failed} tests: ${passed} passed, ${failed} failed`);

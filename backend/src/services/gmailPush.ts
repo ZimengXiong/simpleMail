@@ -9,6 +9,10 @@ import {
 import { emitSyncEvent } from './imapEvents.js';
 
 const RENEW_LEAD_MS = 24 * 60 * 60 * 1000;
+const MAX_WATCH_MAILBOXES = 32;
+const MAX_MAILBOX_PATH_CHARS = 512;
+const MAX_WATCH_MAILBOX_SANITIZE_SCAN_ITEMS = MAX_WATCH_MAILBOXES * 8;
+const MAILBOX_CONTROL_CHAR_PATTERN = /[\u0000-\u001F\u007F]/;
 
 const getGmailPushAudience = () =>
   env.gmailPush.webhookAudience || `${env.appBaseUrl}${env.gmailPush.webhookPath}`;
@@ -19,15 +23,40 @@ const parseExpirationMs = (value: unknown) => {
   return Number.isFinite(parsed) ? parsed : null;
 };
 
+const normalizeMailboxCandidate = (value: unknown): string | null => {
+  const normalized = String(value ?? '').trim();
+  if (!normalized || normalized.length > MAX_MAILBOX_PATH_CHARS) {
+    return null;
+  }
+  if (MAILBOX_CONTROL_CHAR_PATTERN.test(normalized)) {
+    return null;
+  }
+  return normalized;
+};
+
 const getConfiguredWatchMailboxes = (syncSettings: Record<string, any>) => {
-  const configured = Array.isArray(syncSettings.watchMailboxes)
-    ? syncSettings.watchMailboxes.map((value: unknown) => String(value)).filter(Boolean)
+  const fallbackMailbox = normalizeGmailMailboxPath(
+    normalizeMailboxCandidate(env.sync.defaultMailbox) ?? 'INBOX',
+  );
+  const entries = Array.isArray(syncSettings.watchMailboxes)
+    ? syncSettings.watchMailboxes
     : [];
-  const fallbackMailbox = normalizeGmailMailboxPath(env.sync.defaultMailbox);
-  return Array.from(new Set(
-    (configured.length > 0 ? configured : [fallbackMailbox])
-      .map((mailbox) => normalizeGmailMailboxPath(mailbox)),
-  ));
+  const configured: string[] = [];
+  const dedupe = new Set<string>();
+  const scanLimit = Math.min(entries.length, MAX_WATCH_MAILBOX_SANITIZE_SCAN_ITEMS);
+  for (let index = 0; index < scanLimit && configured.length < MAX_WATCH_MAILBOXES; index += 1) {
+    const mailbox = normalizeMailboxCandidate(entries[index]);
+    if (!mailbox) {
+      continue;
+    }
+    const normalized = normalizeGmailMailboxPath(mailbox);
+    if (dedupe.has(normalized)) {
+      continue;
+    }
+    dedupe.add(normalized);
+    configured.push(normalized);
+  }
+  return configured.length > 0 ? configured : [fallbackMailbox];
 };
 
 const shouldRenewConnector = (syncSettings: Record<string, any>) => {
@@ -156,7 +185,8 @@ export const renewExpiringGmailPushWatches = async () => {
         error: String(error),
       }).catch(() => undefined);
 
-      const fallbackMailbox = watchMailboxes[0] ?? normalizeGmailMailboxPath(env.sync.defaultMailbox);
+      const fallbackMailbox = watchMailboxes[0]
+        ?? normalizeGmailMailboxPath(normalizeMailboxCandidate(env.sync.defaultMailbox) ?? 'INBOX');
       try {
         await startIncomingConnectorIdleWatch(connector.user_id, connector.id, fallbackMailbox);
         await emitSyncEvent(connector.id, 'sync_info', {

@@ -22,7 +22,7 @@ const RuleModal = ({ onClose }: RuleModalProps) => {
   });
 
   const createMutation = useMutation({
-    mutationFn: (data: any) => api.rules.create(data),
+    mutationFn: (data: typeof formData) => api.rules.create(data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['rules'] });
       onClose();
@@ -36,7 +36,7 @@ const RuleModal = ({ onClose }: RuleModalProps) => {
 
   return (
     <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4 font-sans">
-      <div className="bg-bg-card w-full max-w-lg rounded-2xl shadow-2xl overflow-hidden animate-in zoom-in-95 duration-200 border border-border/60">
+      <div className="bg-bg-card w-full max-w-lg rounded-2xl shadow-2xl animate-in zoom-in-95 duration-200 border border-border/60">
         <div className="px-6 py-4 border-b border-border/60 flex items-center justify-between bg-black/[0.02] dark:bg-white/[0.02]">
           <h2 className="text-sm font-bold flex items-center gap-2 text-text-primary">
             <Filter className="w-4 h-4 text-accent" />
@@ -47,11 +47,11 @@ const RuleModal = ({ onClose }: RuleModalProps) => {
         
         <form onSubmit={handleSubmit} className="p-6 space-y-6">
           <div className="space-y-1.5">
-            <label className="text-[10px] font-bold text-text-secondary uppercase tracking-widest opacity-70">Rule Name</label>
+            <label className="label">Rule Name</label>
             <input 
               type="text" 
               required
-              className="input text-sm h-10 px-3 bg-bg-app border-border/60 text-text-primary focus:ring-accent/30"
+              className="input"
               placeholder="e.g. Sort Newsletters"
               value={formData.name}
               onChange={e => setFormData({...formData, name: e.target.value})}
@@ -63,22 +63,22 @@ const RuleModal = ({ onClose }: RuleModalProps) => {
               <span className="bg-accent/10 text-accent px-1.5 py-0.5 rounded">IF</span>
               Conditions
             </h3>
-            <div className="grid grid-cols-2 gap-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div className="space-y-1.5">
-                <label className="text-[10px] font-bold text-text-secondary uppercase tracking-widest opacity-70">Subject Contains</label>
+                <label className="label">Subject Contains</label>
                 <input 
                   type="text" 
-                  className="input text-sm h-10 px-3 bg-bg-app border-border/60 text-text-primary focus:ring-accent/30"
+                  className="input"
                   placeholder="newsletter"
                   value={formData.matchConditions.subject}
                   onChange={e => setFormData({...formData, matchConditions: {...formData.matchConditions, subject: e.target.value}})}
                 />
               </div>
               <div className="space-y-1.5">
-                <label className="text-[10px] font-bold text-text-secondary uppercase tracking-widest opacity-70">From Contains</label>
+                <label className="label">From Contains</label>
                 <input 
                   type="text" 
-                  className="input text-sm h-10 px-3 bg-bg-app border-border/60 text-text-primary focus:ring-accent/30"
+                  className="input"
                   placeholder="marketing@..."
                   value={formData.matchConditions.from}
                   onChange={e => setFormData({...formData, matchConditions: {...formData.matchConditions, from: e.target.value}})}
@@ -96,17 +96,17 @@ const RuleModal = ({ onClose }: RuleModalProps) => {
               <label className="flex items-center gap-2 cursor-pointer group">
                 <input 
                   type="checkbox" 
-                  className="w-4 h-4 rounded border-border/60 bg-bg-app accent-accent"
+                  className="w-4 h-4 rounded border-border bg-bg-app accent-accent"
                   checked={formData.actions.markRead}
                   onChange={e => setFormData({...formData, actions: {...formData.actions, markRead: e.target.checked}})}
                 />
-                <span className="text-xs text-text-primary group-hover:text-accent transition-colors font-medium">Mark as Read</span>
+                <span className="text-sm text-text-primary group-hover:text-accent transition-colors font-medium">Mark as Read</span>
               </label>
               <div className="space-y-1.5">
-                <label className="text-[10px] font-bold text-text-secondary uppercase tracking-widest opacity-70">Move to Folder</label>
+                <label className="label">Move to Folder</label>
                 <input 
                   type="text" 
-                  className="input text-sm h-10 px-3 bg-bg-app border-border/60 text-text-primary focus:ring-accent/30"
+                  className="input"
                   placeholder="Destination folder"
                   value={formData.actions.moveToFolder}
                   onChange={e => setFormData({...formData, actions: {...formData.actions, moveToFolder: e.target.value}})}
@@ -119,14 +119,14 @@ const RuleModal = ({ onClose }: RuleModalProps) => {
             <button 
               type="submit" 
               disabled={createMutation.isPending}
-              className="flex-1 btn btn-primary py-2.5 font-bold text-xs shadow-lg shadow-accent/20 active:scale-[0.98] transition-all"
+              className="flex-1 btn-primary py-2.5"
             >
               {createMutation.isPending ? <Loader2 className="w-4 h-4 animate-spin mx-auto" /> : 'Create Rule'}
             </button>
             <button 
               type="button" 
               onClick={onClose}
-              className="flex-1 border border-border/60 bg-bg-card text-text-primary py-2.5 rounded-xl text-xs font-bold hover:bg-black/5 dark:hover:bg-white/5 transition-colors"
+              className="flex-1 btn-secondary py-2.5"
             >
               Cancel
             </button>

@@ -37,7 +37,17 @@ const labelSelect = `
     FROM labels
    WHERE user_id = $1`;
 
-const sanitizeKey = (value: string) => value.trim().toLowerCase().replace(/[^a-z0-9._-]/g, '');
+const sanitizeKey = (value: string) => {
+  const normalized = String(value ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, '_')
+    .replace(/[^a-z0-9._-]/g, '')
+    .replace(/[_-]{2,}/g, '_')
+    .replace(/^[_\-.]+|[_\-.]+$/g, '');
+
+  return normalized.slice(0, 96);
+};
 
 export const ensureSystemLabelsForUser = async (userId: string) => {
   for (const label of SYSTEM_LABELS) {
@@ -232,8 +242,6 @@ export const syncSystemLabelsForMessage = async (
   if (isStarred) {
     desiredKeys.add('starred');
   }
-
-  // Read existing system labels for this message (single query)
   const existing = await query<{ key: string }>(
     `SELECT l.key
        FROM message_labels ml
@@ -244,8 +252,6 @@ export const syncSystemLabelsForMessage = async (
     [messageId, userId],
   );
   const existingKeys = new Set(existing.rows.map((row) => row.key));
-
-  // Remove system labels that should not be present
   const toRemove = [...existingKeys].filter((key) => !desiredKeys.has(key));
   if (toRemove.length > 0) {
     await query(
@@ -259,8 +265,6 @@ export const syncSystemLabelsForMessage = async (
       [messageId, userId, toRemove],
     );
   }
-
-  // Add system labels that are missing
   const toAdd = [...desiredKeys].filter((key) => !existingKeys.has(key));
   for (const key of toAdd) {
     await query(

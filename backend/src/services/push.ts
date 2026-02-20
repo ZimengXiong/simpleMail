@@ -12,6 +12,12 @@ export const configurePush = () => {
 
 configurePush();
 
+const conflictError = (message: string) => {
+  const error = new Error(message) as Error & { statusCode?: number };
+  error.statusCode = 409;
+  return error;
+};
+
 export const createPushSubscription = async (subscription: {
   userId: string;
   endpoint: string;
@@ -23,11 +29,26 @@ export const createPushSubscription = async (subscription: {
     `INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth, user_agent)
      VALUES ($1,$2,$3,$4,$5)
      ON CONFLICT (endpoint)
-     DO UPDATE SET user_id = EXCLUDED.user_id, p256dh = EXCLUDED.p256dh, auth = EXCLUDED.auth, user_agent = EXCLUDED.user_agent, updated_at = NOW()
+     DO UPDATE SET p256dh = EXCLUDED.p256dh, auth = EXCLUDED.auth, user_agent = EXCLUDED.user_agent, updated_at = NOW()
+     WHERE push_subscriptions.user_id = EXCLUDED.user_id
      RETURNING id`,
     [subscription.userId, subscription.endpoint, subscription.p256dh, subscription.auth, subscription.userAgent ?? null],
   );
-  return result.rows[0];
+
+  const created = result.rows[0];
+  if (created) {
+    return created;
+  }
+
+  const existing = await query<{ user_id: string }>(
+    'SELECT user_id FROM push_subscriptions WHERE endpoint = $1',
+    [subscription.endpoint],
+  );
+  if (existing.rows[0]?.user_id && existing.rows[0].user_id !== subscription.userId) {
+    throw conflictError('push endpoint is already registered to another user');
+  }
+
+  throw new Error('failed to create push subscription');
 };
 
 export const removePushSubscription = async (userId: string, endpoint: string) => {
@@ -56,8 +77,6 @@ export const notifySubscribers = async (userId: string, payload: Record<string, 
         },
       } as any,
       subscriptionPayload,
-    ).catch(() => {
-      // ignore delivery failures
-    });
+    ).catch(() => {});
   }
 };

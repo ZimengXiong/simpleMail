@@ -14,9 +14,10 @@ import { messageIdVariants, normalizeMessageId } from './threadingUtils.js';
 
 const require = createRequire(import.meta.url);
 const MailComposer = require('nodemailer/lib/mail-composer/index.js');
-const addressparser = require('nodemailer/lib/addressparser/index.js');
 
 type SmtpTlsMode = 'ssl' | 'starttls' | 'none';
+const SMTP_HEADER_VALUE_PATTERN = /^[^\r\n]*$/;
+const SMTP_ADDRESS_PATTERN = /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,63}$/i;
 
 const normalizeSmtpTlsMode = (value: unknown): SmtpTlsMode | null => {
   const normalized = String(value ?? '').trim().toLowerCase();
@@ -238,6 +239,8 @@ const normalizeReferencesHeader = (value?: string | null): string | undefined =>
   return parts.map((part) => `<${part}>`).join(' ');
 };
 
+const ENVELOPE_EMAIL_PATTERN = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,63}/ig;
+
 export const parseEnvelopeRecipients = (value: string | undefined, extra: string[] = []) => {
   const rawEntries = [
     value ?? '',
@@ -248,22 +251,50 @@ export const parseEnvelopeRecipients = (value: string | undefined, extra: string
 
   const dedupe = new Set<string>();
   const recipients: string[] = [];
-  const parsed = (addressparser(rawEntries.join(', ')) as Array<{ address?: string }> | undefined) ?? [];
+  const normalizedInput = rawEntries
+    .join(',')
+    .replace(/[\r\n\0]/g, ' ')
+    .slice(0, 200_000);
+  const matches = normalizedInput.match(ENVELOPE_EMAIL_PATTERN) ?? [];
 
-  const candidates = parsed.length > 0
-    ? parsed.map((item) => String(item.address ?? '').trim()).filter(Boolean)
-    : rawEntries;
-
-  for (const candidate of candidates) {
-    const normalized = candidate.toLowerCase();
+  for (const candidate of matches) {
+    const normalized = candidate.trim().toLowerCase();
     if (!normalized || dedupe.has(normalized)) {
       continue;
     }
     dedupe.add(normalized);
-    recipients.push(candidate);
+    recipients.push(normalized);
   }
 
   return recipients;
+};
+
+const normalizeHeaderText = (value: unknown, fallback = '') => {
+  const normalized = String(value ?? fallback)
+    .replace(/[\r\n\0]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return normalized;
+};
+
+const normalizeSingleEmailAddress = (value: unknown, context: string) => {
+  const normalized = normalizeHeaderText(value).toLowerCase();
+  if (!normalized || !SMTP_ADDRESS_PATTERN.test(normalized)) {
+    throw new Error(`${context} is invalid`);
+  }
+  return normalized;
+};
+
+const normalizeReplyToHeader = (value: unknown): string | undefined => {
+  const normalized = normalizeHeaderText(value);
+  if (!normalized) {
+    return undefined;
+  }
+  if (!SMTP_HEADER_VALUE_PATTERN.test(normalized)) {
+    throw new Error('replyTo header is invalid');
+  }
+  const parsed = parseEnvelopeRecipients(normalized);
+  return parsed.length > 0 ? parsed.join(', ') : undefined;
 };
 
 export const sendThroughConnector = async (
@@ -325,10 +356,13 @@ export const sendThroughConnector = async (
     cid: attachment.inline ? attachment.contentId : undefined,
   }));
 
-  const fromAddress = `${identity.display_name} <${identity.email_address}>`;
+  const fromAddress = {
+    name: normalizeHeaderText(identity.display_name),
+    address: normalizeSingleEmailAddress(identity.email_address, 'identity email address'),
+  };
 
   const signature = (identity.signature ?? '').trim();
-  const replyTo = identity.reply_to || outgoing.from_envelope_defaults?.replyTo;
+  const replyTo = normalizeReplyToHeader(identity.reply_to || outgoing.from_envelope_defaults?.replyTo);
   const inReplyTo = normalizeMessageIdHeader(payload.inReplyTo);
   const references = normalizeReferencesHeader(payload.references);
   const referenceMessageIds = extractNormalizedMessageIds(references);

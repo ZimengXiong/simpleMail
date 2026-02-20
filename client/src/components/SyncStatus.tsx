@@ -1,12 +1,23 @@
-import { useMemo } from 'react';
-import { useQuery, useQueries } from '@tanstack/react-query';
+import { useEffect, useMemo, useState } from 'react';
+import { useQuery, useQueries, type Query } from '@tanstack/react-query';
 import { api } from '../services/api';
-import { RefreshCw, CheckCircle2, AlertCircle } from 'lucide-react';
+import { RefreshCw, CheckCircle2, AlertCircle, ChevronDown } from 'lucide-react';
 import type { MailboxSyncState } from '../types/index';
 import { countActiveSyncStates, hasActiveSyncStates } from '../services/syncState';
 
 const SyncStatus = () => {
-  const isTabFocused = document.visibilityState === 'visible';
+  const [isTabFocused, setIsTabFocused] = useState(() => document.visibilityState === 'visible');
+  const [hoveredConnectorId, setHoveredConnectorId] = useState<string | null>(null);
+  const [pinnedConnectorId, setPinnedConnectorId] = useState<string | null>(null);
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    const onVisibilityChange = () => {
+      setIsTabFocused(document.visibilityState === 'visible');
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', onVisibilityChange);
+  }, []);
   const { data: connectors } = useQuery({
     queryKey: ['connectors', 'incoming'],
     queryFn: () => api.connectors.listIncoming(),
@@ -17,14 +28,23 @@ const SyncStatus = () => {
   const syncStateQueries = useQueries({
     queries: (connectors ?? []).map((connector) => ({
       queryKey: ['syncStates', connector.id],
-      queryFn: () => api.sync.getStates(connector.id),
+      queryFn: ({ signal }: { signal?: AbortSignal }) => api.sync.getStates(connector.id, signal),
       enabled: Boolean(connector.id),
-      refetchInterval: (query: any) =>
-        hasActiveSyncStates(query.state.data?.states ?? [])
+      refetchInterval: (query: Query) =>
+        hasActiveSyncStates(
+          ((query.state.data as { states?: Array<MailboxSyncState & { mailbox: string }> } | undefined)?.states) ?? [],
+        )
           ? 4_000
           : (isTabFocused ? 20_000 : 60_000),
     })),
   });
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      setNow(Date.now());
+    }, 30_000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   const connectorStates = useMemo(
     () =>
@@ -32,13 +52,75 @@ const SyncStatus = () => {
     [connectors],
   );
 
+  const formatRelativeTime = (isoLike: string | null | undefined, timestamp = now) => {
+    if (!isoLike) {
+      return 'never';
+    }
+    const parsed = Date.parse(String(isoLike));
+    if (!Number.isFinite(parsed)) {
+      return 'unknown';
+    }
+    const seconds = Math.max(0, Math.floor((timestamp - parsed) / 1000));
+    if (seconds < 60) {
+      return `${seconds}s ago`;
+    }
+    if (seconds < 3600) {
+      return `${Math.floor(seconds / 60)}m ago`;
+    }
+    if (seconds < 86400) {
+      return `${Math.floor(seconds / 3600)}h ago`;
+    }
+    return `${Math.floor(seconds / 86400)}d ago`;
+  };
+
+  const statusLabel = (value: MailboxSyncState['status']) => {
+    switch (value) {
+      case 'syncing':
+        return 'Syncing';
+      case 'queued':
+        return 'Queued';
+      case 'cancel_requested':
+        return 'Cancel Requested';
+      case 'cancelled':
+        return 'Cancelled';
+      case 'completed':
+        return 'Completed';
+      case 'error':
+        return 'Error';
+      case 'idle':
+      default:
+        return 'Idle';
+    }
+  };
+
+  const statusBadgeClass = (value: MailboxSyncState['status']) => {
+    if (value === 'syncing' || value === 'queued' || value === 'cancel_requested') {
+      return 'bg-accent/10 text-accent border-accent/25';
+    }
+    if (value === 'error') {
+      return 'bg-red-50 text-red-600 border-red-200';
+    }
+    if (value === 'completed') {
+      return 'bg-green-50 text-green-700 border-green-200';
+    }
+    if (value === 'cancelled') {
+      return 'bg-amber-50 text-amber-700 border-amber-200';
+    }
+    return 'bg-black/5 text-text-secondary border-border/60 dark:bg-white/5';
+  };
+
   const summarizeStates = (states: Array<MailboxSyncState & { mailbox?: string }> = []) => {
     const total = states.length;
     const active = countActiveSyncStates(states);
     const errors = states.filter((state) => state.status === 'error');
+    const queued = states.filter((state) => state.status === 'queued' || state.status === 'cancel_requested').length;
     const firstError = errors
       .map((state) => (typeof state.syncError === 'string' ? state.syncError.trim() : ''))
       .find((value) => value.length > 0) ?? null;
+    const lastCompletedAt = states
+      .map((state) => state.syncCompletedAt ?? null)
+      .filter((value): value is string => Boolean(value))
+      .sort((left, right) => Date.parse(right) - Date.parse(left))[0] ?? null;
     const totals = states.reduce((acc, state) => {
       const progress = state.syncProgress ?? {};
       return {
@@ -47,7 +129,7 @@ const SyncStatus = () => {
         reconciled: acc.reconciled + (progress.reconciledRemoved ?? 0),
       };
     }, { inserted: 0, updated: 0, reconciled: 0 });
-    return { total, active, errors, firstError, ...totals };
+    return { total, active, queued, errors, firstError, lastCompletedAt, ...totals };
   };
 
   return (
@@ -59,7 +141,8 @@ const SyncStatus = () => {
         const status = summary.errors.length > 0
           ? 'error'
           : (summary.active > 0 ? 'syncing' : 'completed');
-        
+        const isExpanded = (pinnedConnectorId ?? hoveredConnectorId) === connector.id;
+
         const downloaded = summary.inserted;
         const total = summary.total || 0;
         const activeCount = summary.active;
@@ -67,33 +150,96 @@ const SyncStatus = () => {
         return (
           <div
             key={connector.id}
-            className="flex items-center gap-2 px-1.5 py-0.5 rounded-md transition-colors"
+            className="rounded-md border border-border/50 bg-bg-card/60 transition-colors"
+            onMouseEnter={() => setHoveredConnectorId(connector.id)}
+            onMouseLeave={() => setHoveredConnectorId(null)}
           >
-            <div className="shrink-0">
-              {status === 'syncing' ? (
-                <RefreshCw className="w-3 h-3 text-accent animate-spin" />
-              ) : status === 'error' ? (
-                <AlertCircle className="w-3 h-3 text-red-500" />
-              ) : (
-                <CheckCircle2 className="w-3 h-3 text-green-600 opacity-60" />
-              )}
-            </div>
+            <button
+              type="button"
+              onClick={() => {
+                setPinnedConnectorId((current) => (current === connector.id ? null : connector.id));
+              }}
+              className="w-full flex items-center gap-2 px-2 py-1.5 text-left hover:bg-black/5 dark:hover:bg-white/5 rounded-md transition-colors"
+            >
+              <div className="shrink-0">
+                {status === 'syncing' ? (
+                  <RefreshCw className="w-3 h-3 text-accent animate-spin" />
+                ) : status === 'error' ? (
+                  <AlertCircle className="w-3 h-3 text-red-500" />
+                ) : (
+                  <CheckCircle2 className="w-3 h-3 text-green-600 opacity-60" />
+                )}
+              </div>
 
-            <div className="min-w-0 flex-1 flex flex-col leading-tight">
-              <span className="text-[11px] font-semibold text-text-secondary truncate">
-                {connector.name || connector.emailAddress}
-              </span>
-              {status === 'syncing' && (
-                <span className="text-[9px] text-accent font-medium opacity-80">
-                  {activeCount}/{total} active · {downloaded} new
+              <div className="min-w-0 flex-1 flex flex-col leading-tight">
+                <span className="text-[11px] font-semibold text-text-secondary truncate">
+                  {connector.name || connector.emailAddress}
                 </span>
-              )}
-              {status === 'error' && (
-                <span className="text-[9px] text-red-500 font-medium truncate max-w-[180px]" title={summary.firstError ?? 'Sync failed'}>
-                  {summary.firstError ?? 'Sync failed (no details)'}
-                </span>
-              )}
-            </div>
+                {status === 'syncing' && (
+                  <span className="text-[9px] text-accent font-medium opacity-80">
+                    {activeCount}/{total} active
+                    {summary.queued > 0 ? ` · ${summary.queued} queued` : ''}
+                    {downloaded > 0 ? ` · ${downloaded} downloaded` : ''}
+                  </span>
+                )}
+                {status === 'error' && (
+                  <span className="text-[9px] text-red-500 font-medium truncate max-w-[180px]" title={summary.firstError ?? 'Sync failed'}>
+                    {summary.firstError ?? 'Sync failed (no details)'}
+                  </span>
+                )}
+                {status === 'completed' && (
+                  <span className="text-[9px] text-text-secondary font-medium opacity-80">
+                    Last completed {formatRelativeTime(summary.lastCompletedAt, now)}
+                  </span>
+                )}
+              </div>
+
+              <ChevronDown className={`w-3 h-3 text-text-secondary transition-transform ${isExpanded ? 'rotate-180' : ''}`} />
+            </button>
+
+            {isExpanded && (
+              <div className="px-2 pb-2">
+                <div className="rounded-md border border-border/60 bg-bg-app/80 max-h-44 overflow-y-auto">
+                  {states.length === 0 ? (
+                    <div className="px-2.5 py-2 text-[10px] text-text-secondary">
+                      No mailbox sync states yet.
+                    </div>
+                  ) : (
+                    states.map((state) => {
+                      const progress = state.syncProgress ?? {};
+                      const progressLabel = [
+                        Number(progress.inserted ?? 0) > 0 ? `+${progress.inserted} new` : '',
+                        Number(progress.updated ?? 0) > 0 ? `~${progress.updated} updated` : '',
+                        Number(progress.metadataRefreshed ?? 0) > 0 ? `${progress.metadataRefreshed} metadata` : '',
+                        Number(progress.reconciledRemoved ?? 0) > 0 ? `-${progress.reconciledRemoved} removed` : '',
+                      ].filter(Boolean).join(' · ');
+                      const whenText = state.status === 'syncing'
+                        ? `started ${formatRelativeTime(state.syncStartedAt, now)}`
+                        : `updated ${formatRelativeTime(state.syncCompletedAt ?? state.syncStartedAt, now)}`;
+                      return (
+                        <div key={`${connector.id}:${state.mailbox}`} className="px-2.5 py-2 border-b border-border/40 last:border-b-0">
+                          <div className="flex items-start justify-between gap-2">
+                            <div className="min-w-0">
+                              <div className="text-[10px] font-bold text-text-primary truncate">{state.mailbox}</div>
+                              <div className="text-[9px] text-text-secondary">{whenText}</div>
+                            </div>
+                            <span className={`text-[9px] font-semibold px-1.5 py-0.5 rounded border ${statusBadgeClass(state.status)}`}>
+                              {statusLabel(state.status)}
+                            </span>
+                          </div>
+                          {progressLabel ? (
+                            <div className="mt-1 text-[9px] text-text-secondary">{progressLabel}</div>
+                          ) : null}
+                          {state.status === 'error' && state.syncError ? (
+                            <div className="mt-1 text-[9px] text-red-500 break-words">{state.syncError}</div>
+                          ) : null}
+                        </div>
+                      );
+                    })
+                  )}
+                </div>
+              </div>
+            )}
           </div>
         );
       })}

@@ -2,7 +2,7 @@ import type { Notification, PoolClient } from 'pg';
 import { pool, query } from '../db/pool.js';
 import { notifySubscribers } from './push.js';
 
-const SYNC_EVENTS_NOTIFY_CHANNEL = 'bettermail_sync_events';
+const SYNC_EVENTS_NOTIFY_CHANNEL = 'simplemail_sync_events';
 const MIN_WAIT_TIMEOUT_MS = 250;
 const MAX_WAIT_TIMEOUT_MS = 60_000;
 
@@ -32,8 +32,7 @@ const dispatchSyncEventSignal = (signal: SyncEventSignal) => {
   if (!waiters || waiters.size === 0) {
     return;
   }
-  waitersByUser.delete(signal.userId);
-  for (const waiter of waiters) {
+  for (const waiter of Array.from(waiters)) {
     waiter(signal);
   }
 };
@@ -70,7 +69,6 @@ const resetListenerClient = () => {
   try {
     client.release(true);
   } catch {
-    // ignore client release failures
   }
 };
 
@@ -174,9 +172,7 @@ export const emitSyncEvent = async (
     eventType,
     incomingConnectorId,
     payload,
-  }).catch(() => {
-    // best effort: keep sync path non-blocking on notification failures
-  });
+  }).catch(() => {});
 };
 
 export const listSyncEvents = async (userId: string, since = 0, limit = 100) => {
@@ -299,4 +295,15 @@ export const pruneSyncEvents = async (options?: {
   }
 
   return { pruned };
+};
+
+export const resetSyncEventStateForTests = () => {
+  if (listenerReconnectTimer) {
+    clearTimeout(listenerReconnectTimer);
+    listenerReconnectTimer = null;
+  }
+  listenerBootstrapPromise = null;
+  resetListenerClient();
+  waitersByUser.clear();
+  latestSignalByUser.clear();
 };

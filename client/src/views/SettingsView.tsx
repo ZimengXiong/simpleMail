@@ -23,24 +23,33 @@ import EmptyState from '../components/EmptyState';
 import IdentityModal from '../components/IdentityModal';
 import { useTheme } from '../services/theme';
 import Avatar from '../components/Avatar';
+import type { IdentityRecord } from '../types';
+import { readStorageString, writeStorageString } from '../services/storage';
+
+const readLayoutModePreference = (): 'columns' | 'list' => {
+  return readStorageString('layoutMode') === 'list' ? 'list' : 'columns';
+};
+
+const persistLayoutModePreference = (mode: 'columns' | 'list') => {
+  writeStorageString('layoutMode', mode);
+};
 
 const SettingsView = () => {
   const queryClient = useQueryClient();
   const { theme, setTheme, accentColor, setAccentColor } = useTheme();
   const [activeTab, setActiveTab] = useState<'accounts' | 'identities' | 'appearance'>('accounts');
   const [isIdentityModalOpen, setIsIdentityModalOpen] = useState(false);
-  const [editingIdentity, setEditingIdentity] = useState<any | null>(null);
+  const [editingIdentity, setEditingIdentity] = useState<IdentityRecord | null>(null);
   const [gmailPushErrors, setGmailPushErrors] = useState<Record<string, string>>({});
   const [smtpTestResults, setSmtpTestResults] = useState<Record<string, { ok: boolean; message: string }>>({});
 
-  // Layout Preference
   const [layoutMode, setLayoutMode] = useState<'columns' | 'list'>(() =>
-    (localStorage.getItem('layoutMode') as 'columns' | 'list') || 'columns'
+    readLayoutModePreference()
   );
 
   const toggleLayout = (mode: 'columns' | 'list') => {
     setLayoutMode(mode);
-    localStorage.setItem('layoutMode', mode);
+    persistLayoutModePreference(mode);
     window.dispatchEvent(new Event('storage'));
   };
 
@@ -142,13 +151,13 @@ const SettingsView = () => {
         <h1 className="text-sm font-semibold">Settings</h1>
       </div>
 
-      <div className="max-w-4xl mx-auto w-full p-8 pb-32">
-        <div className="flex gap-1 mb-8">
-          {['accounts', 'identities', 'appearance'].map((tab) => (
+      <div className="max-w-4xl mx-auto w-full p-4 md:p-8 pb-32">
+        <div className="flex gap-1 mb-6 md:mb-8 overflow-x-auto pb-2 scrollbar-hide">
+          {(['accounts', 'identities', 'appearance'] as const).map((tab) => (
             <button
               key={tab}
-              onClick={() => setActiveTab(tab as any)}
-              className={`px-3 py-1.5 rounded-md text-xs font-medium transition-colors capitalize ${activeTab === tab ? 'bg-black/5 dark:bg-white/10 text-text-primary' : 'text-text-secondary hover:bg-black/5 dark:hover:bg-white/5'}`}
+              onClick={() => setActiveTab(tab)}
+              className={`px-3 py-1.5 rounded-md text-xs font-medium transition-colors capitalize whitespace-nowrap ${activeTab === tab ? 'bg-black/5 dark:bg-white/10 text-text-primary' : 'text-text-secondary hover:bg-black/5 dark:hover:bg-white/5'}`}
             >
               {tab === 'accounts' ? 'Accounts & Connectors' : tab}
             </button>
@@ -162,14 +171,13 @@ const SettingsView = () => {
         ) : (
           <>
             {activeTab === 'appearance' && (
-              <div className="space-y-12 animate-in fade-in duration-300">
-                {/* Theme Toggle */}
+              <div className="space-y-10 md:space-y-12 animate-in fade-in duration-300">
                 <section>
                   <h2 className="text-base font-semibold text-text-primary mb-4 border-b border-border pb-2 flex items-center gap-2">
                     <Palette className="w-4 h-4 text-accent" />
                     Visual Theme
                   </h2>
-                  <div className="grid grid-cols-2 gap-4">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                     <button
                       onClick={() => setTheme('light')}
                       className={`flex items-center justify-center gap-3 p-4 rounded-md border transition-all ${theme === 'light' ? 'border-accent bg-accent/5' : 'border-border bg-bg-card hover:border-text-secondary/30'}`}
@@ -187,7 +195,6 @@ const SettingsView = () => {
                   </div>
                 </section>
 
-                {/* Accent Color Picker */}
                 <section>
                   <h2 className="text-base font-semibold text-text-primary mb-4 border-b border-border pb-2">Accent Color</h2>
                   <div className="flex flex-wrap gap-3">
@@ -205,13 +212,12 @@ const SettingsView = () => {
                   </div>
                 </section>
 
-                {/* Dashboard Layout */}
                 <section>
                   <h2 className="text-base font-semibold text-text-primary mb-4 border-b border-border pb-2 flex items-center gap-2">
                     <Layout className="w-4 h-4 text-accent" />
                     Dashboard Layout
                   </h2>
-                  <div className="grid grid-cols-2 gap-6">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
                     <button
                       onClick={() => toggleLayout('columns')}
                       className={`flex flex-col gap-3 p-4 rounded-md border transition-all text-left group ${layoutMode === 'columns' ? 'border-accent bg-accent/5' : 'border-border hover:border-text-secondary/30 bg-bg-card'}`}
@@ -259,7 +265,7 @@ const SettingsView = () => {
                     <div className="flex items-center gap-2">
                       <h2 className="text-base font-semibold text-text-primary">Incoming Accounts</h2>
                     </div>
-                    <Link to="/settings/connectors/new?type=incoming" className="flex items-center gap-1.5 px-3 py-1 bg-accent hover:bg-accent-hover text-sm font-semibold rounded-md transition-all" style={{ color: 'var(--accent-contrast)' }}>
+                    <Link to="/settings/connectors/new?type=incoming" className="btn-primary">
                       <Plus className="w-3.5 h-3.5" />
                       <span>Add account</span>
                     </Link>
@@ -274,8 +280,13 @@ const SettingsView = () => {
                     <div className="grid grid-cols-1 gap-2">
                       {incomingConnectors.map(connector => {
                         const isGmailApiConnector = connector.provider === 'gmail';
+                        const connectorSyncSettings = (connector.syncSettings as {
+                          gmailPush?: {
+                            enabled?: boolean;
+                          };
+                        } | null | undefined);
                         const isGmailPushEnabled = isGmailApiConnector
-                          ? connector.syncSettings?.gmailPush?.enabled !== false
+                          ? connectorSyncSettings?.gmailPush?.enabled !== false
                           : false;
                         const isGmailPushPending = toggleGmailPush.isPending
                           && toggleGmailPush.variables?.id === connector.id;
@@ -326,7 +337,7 @@ const SettingsView = () => {
                 <section>
                   <div className="flex items-center justify-between mb-4 border-b border-border pb-2">
                     <h2 className="text-base font-semibold text-text-primary">Outgoing Servers</h2>
-                    <Link to="/settings/connectors/new?type=outgoing" className="flex items-center gap-1.5 px-3 py-1 bg-accent hover:bg-accent-hover text-sm font-semibold rounded-md transition-all" style={{ color: 'var(--accent-contrast)' }}>
+                    <Link to="/settings/connectors/new?type=outgoing" className="btn-primary">
                       <Plus className="w-3.5 h-3.5" />
                       <span>Add server</span>
                     </Link>
@@ -385,7 +396,7 @@ const SettingsView = () => {
               <div className="space-y-6 animate-in fade-in duration-300">
                 <div className="flex items-center justify-between mb-4 border-b border-border pb-2">
                   <h2 className="text-base font-semibold text-text-primary">Sender Identities</h2>
-                  <button onClick={() => setIsIdentityModalOpen(true)} className="flex items-center gap-1.5 px-3 py-1 bg-accent hover:bg-accent-hover text-sm font-semibold rounded-md transition-all" style={{ color: 'var(--accent-contrast)' }}>
+                  <button onClick={() => setIsIdentityModalOpen(true)} className="btn-primary">
                     <Plus className="w-3.5 h-3.5" />
                     <span>New Identity</span>
                   </button>
@@ -419,7 +430,15 @@ const SettingsView = () => {
         )}
       </div>
 
-      {(isIdentityModalOpen || editingIdentity) && <IdentityModal onClose={() => { setIsIdentityModalOpen(false); setEditingIdentity(null); }} incomingConnectors={incomingConnectors || []} outgoingConnectors={outgoingConnectors || []} identity={editingIdentity} />}
+      {(isIdentityModalOpen || editingIdentity) && (
+        <IdentityModal
+          key={editingIdentity?.id ?? 'new'}
+          onClose={() => { setIsIdentityModalOpen(false); setEditingIdentity(null); }}
+          incomingConnectors={incomingConnectors || []}
+          outgoingConnectors={outgoingConnectors || []}
+          identity={editingIdentity}
+        />
+      )}
     </div>
   );
 };

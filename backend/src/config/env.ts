@@ -17,17 +17,32 @@ const required = (value?: string, name = 'environment variable'): string => {
   return value;
 };
 
+const nodeEnv = process.env.NODE_ENV ?? 'development';
+const defaultOidcRequiredEmail = nodeEnv === 'production' ? '' : 'demo@local.test';
+const defaultRequireEmailVerified = nodeEnv === 'production';
+
 export const env = {
-  nodeEnv: process.env.NODE_ENV ?? 'development',
-  bootstrapDevUser: process.env.DEV_USER_BOOTSTRAP === 'true',
-  devUserEmail: process.env.DEV_USER_EMAIL ?? 'demo@local.test',
-  devUserName: process.env.DEV_USER_NAME ?? 'Demo User',
-  devUserToken: process.env.DEV_USER_TOKEN ?? '',
+  nodeEnv,
   port: Number(process.env.PORT ?? '3000'),
   apiAdminToken: process.env.API_ADMIN_TOKEN ?? '',
+  allowAdminUserBootstrap: process.env.ALLOW_ADMIN_USER_BOOTSTRAP === 'true',
   databaseUrl: required(process.env.DATABASE_URL, 'DATABASE_URL'),
   appBaseUrl: process.env.APP_BASE_URL ?? 'http://localhost:3000',
   frontendBaseUrl: process.env.FRONTEND_BASE_URL ?? 'http://localhost:5173',
+  oidc: {
+    issuerUrl: process.env.OIDC_ISSUER_URL ?? 'http://localhost:8080/realms/simplemail',
+    clientId: process.env.OIDC_CLIENT_ID ?? 'simplemail-web',
+    jwksUri: process.env.OIDC_JWKS_URI ?? '',
+    requiredEmail: (process.env.OIDC_REQUIRED_EMAIL ?? defaultOidcRequiredEmail).trim().toLowerCase(),
+    requiredSubject: String(process.env.OIDC_REQUIRED_SUBJECT ?? '').trim(),
+    allowedAlgs: (process.env.OIDC_ALLOWED_ALGS ?? 'RS256')
+      .split(',')
+      .map((value) => value.trim())
+      .filter(Boolean),
+    requireEmailVerified: process.env.OIDC_REQUIRE_EMAIL_VERIFIED
+      ? process.env.OIDC_REQUIRE_EMAIL_VERIFIED !== 'false'
+      : defaultRequireEmailVerified,
+  },
   oauthCallbackPath: process.env.OAUTH_CALLBACK_PATH ?? '/oauth/callback',
   googleClientId: process.env.GOOGLE_CLIENT_ID,
   googleClientSecret: process.env.GOOGLE_CLIENT_SECRET,
@@ -42,7 +57,7 @@ export const env = {
   seaweed: {
     endpoint: process.env.SEAWEED_S3_ENDPOINT ?? 'http://seaweed-filer:8333',
     region: process.env.SEAWEED_REGION ?? 'us-east-1',
-    bucket: process.env.SEAWEED_BUCKET ?? 'bettermail',
+    bucket: process.env.SEAWEED_BUCKET ?? 'simplemail',
     accessKeyId: process.env.SEAWEED_ACCESS_KEY_ID ?? 'seaweed_admin',
     secretAccessKey: process.env.SEAWEED_SECRET_ACCESS_KEY ?? 'seaweed_admin_secret',
     forcePathStyle: process.env.SEAWEED_FORCE_PATH_STYLE !== 'false',
@@ -72,6 +87,7 @@ export const env = {
     enabled: process.env.CLAMAV_ENABLED === 'true',
     clamHost: process.env.CLAMAV_HOST ?? 'localhost',
     clamPort: Number(process.env.CLAMAV_PORT ?? '3310'),
+    clamTimeoutMs: Number(process.env.CLAMAV_TIMEOUT_MS ?? '15000'),
     maxAttachmentBytesForScan: Number(process.env.CLAMAV_ATTACHMENT_MAX_BYTES ?? `${1024 * 1024 * 20}`),
     scanOnIngest: process.env.CLAMAV_SCAN_ON_INGEST !== 'false',
   },

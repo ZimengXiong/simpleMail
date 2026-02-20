@@ -1,16 +1,20 @@
-import { useState, useEffect } from 'react';
+import { useCallback, useEffect, useState, useSyncExternalStore } from 'react';
+import { readStorageString } from './storage';
 
 export type LayoutMode = 'columns' | 'list';
 
+const readLayoutMode = (): LayoutMode => {
+  return readStorageString('layoutMode') === 'list' ? 'list' : 'columns';
+};
+
 export const useLayoutMode = () => {
   const [mode, setMode] = useState<LayoutMode>(() => 
-    (localStorage.getItem('layoutMode') as LayoutMode) || 'columns'
+    readLayoutMode()
   );
 
   useEffect(() => {
     const handleStorage = () => {
-      const currentMode = (localStorage.getItem('layoutMode') as LayoutMode) || 'columns';
-      setMode(currentMode);
+      setMode(readLayoutMode());
     };
 
     window.addEventListener('storage', handleStorage);
@@ -18,4 +22,14 @@ export const useLayoutMode = () => {
   }, []);
 
   return mode;
+};
+
+export const useMediaQuery = (query: string) => {
+  const subscribe = useCallback((onStoreChange: () => void) => {
+    const media = window.matchMedia(query);
+    media.addEventListener('change', onStoreChange);
+    return () => media.removeEventListener('change', onStoreChange);
+  }, [query]);
+  const getSnapshot = useCallback(() => window.matchMedia(query).matches, [query]);
+  return useSyncExternalStore(subscribe, getSnapshot, () => false);
 };
