@@ -9,7 +9,7 @@ simpleMail is a self-hosted mail app stack (UI + API + worker) with OIDC login.
 ### 1. Create env file
 
 ```bash
-cp .env.docker.example .env
+cp .env.example .env
 scripts/bootstrap-env.sh .env
 ```
 

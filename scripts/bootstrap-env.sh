@@ -49,18 +49,19 @@ postgres_user="$(read_env_var POSTGRES_USER)"
 postgres_password="$(read_env_var POSTGRES_PASSWORD)"
 database_url="$(read_env_var DATABASE_URL)"
 api_admin_token="$(read_env_var API_ADMIN_TOKEN)"
+seaweed_endpoint="$(read_env_var SEAWEED_S3_ENDPOINT)"
 
 postgres_db="${postgres_db:-simplemail}"
 postgres_user="${postgres_user:-simplemail}"
 
-if [[ -z "${postgres_password}" || "${postgres_password}" == "change-me" ]]; then
+if [[ -z "${postgres_password}" || "${postgres_password}" == "change-me" || "${postgres_password}" == "simplemail" ]]; then
   postgres_password="smdb_$(gen_secret)"
   upsert_env_var POSTGRES_PASSWORD "${postgres_password}"
   echo "Generated POSTGRES_PASSWORD"
 fi
 
 expected_database_url="postgres://${postgres_user}:${postgres_password}@postgres:5432/${postgres_db}"
-if [[ -z "${database_url}" || "${database_url}" == *":change-me@"* ]]; then
+if [[ -z "${database_url}" || "${database_url}" == *":change-me@"* || "${database_url}" == *"@localhost:"* || "${database_url}" == *"@127.0.0.1:"* ]]; then
   upsert_env_var DATABASE_URL "${expected_database_url}"
   echo "Generated DATABASE_URL"
 fi
@@ -68,6 +69,11 @@ fi
 if [[ -z "${api_admin_token}" || "${api_admin_token}" == "change-me-api-admin-token" ]]; then
   upsert_env_var API_ADMIN_TOKEN "smadm_$(gen_secret)"
   echo "Generated API_ADMIN_TOKEN"
+fi
+
+if [[ -z "${seaweed_endpoint}" || "${seaweed_endpoint}" == *"localhost"* || "${seaweed_endpoint}" == *"127.0.0.1"* ]]; then
+  upsert_env_var SEAWEED_S3_ENDPOINT "http://seaweed-filer:8333"
+  echo "Set SEAWEED_S3_ENDPOINT for docker compose"
 fi
 
 echo "Prepared ${ENV_FILE}"
