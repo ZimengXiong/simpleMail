@@ -116,6 +116,7 @@ export type SyncQueuePriority = 'normal' | 'high';
 type EnqueueSyncOptions = {
   priority?: SyncQueuePriority;
   gmailHistoryIdHint?: string | null;
+  force?: boolean;
 };
 
 const toJobPriority = (priority: SyncQueuePriority | undefined) =>
@@ -138,7 +139,7 @@ export const enqueueSyncWithOptions = async (
       [jobKey],
     );
   } catch {}
-  if (await hasActiveSyncClaim(connectorId, mailbox)) {
+  if (!options.force && (await hasActiveSyncClaim(connectorId, mailbox))) {
     return false;
   }
   if (!(await hasActiveWorkers())) {

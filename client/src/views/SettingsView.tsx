@@ -120,7 +120,7 @@ const SettingsView = () => {
   });
 
   const manualSync = useMutation({
-    mutationFn: (id: string) => api.sync.trigger(id, 'INBOX', false, false),
+    mutationFn: (id: string) => api.sync.trigger(id, 'INBOX', true, false, true),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['events'] })
   });
 
@@ -289,6 +289,7 @@ const SettingsView = () => {
                     <div className="grid grid-cols-1 gap-2">
                       {incomingConnectors.map(connector => {
                         const isGmailApiConnector = connector.provider === 'gmail';
+                        const isGmailPushSupported = accessControl?.gmailPushEnabled === true;
                         const connectorSyncSettings = (connector.syncSettings as {
                           gmailPush?: {
                             enabled?: boolean;
@@ -318,7 +319,7 @@ const SettingsView = () => {
 
                             <div className="flex items-center gap-1 opacity-60 group-hover:opacity-100 transition-opacity">
                               <button onClick={() => manualSync.mutate(connector.id)} className="p-1.5 hover:bg-black/5 rounded text-text-secondary" title="Sync Now"><RefreshCw className={`w-3.5 h-3.5 ${manualSync.isPending && manualSync.variables === connector.id ? 'animate-spin' : ''}`} /></button>
-                              {isGmailApiConnector && (
+                              {isGmailApiConnector && isGmailPushSupported && (
                                 <button
                                   onClick={() => toggleGmailPush.mutate({ id: connector.id, enabled: !isGmailPushEnabled })}
                                   disabled={isGmailPushPending}

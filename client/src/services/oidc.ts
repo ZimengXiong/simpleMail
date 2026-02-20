@@ -32,9 +32,12 @@ type OidcAuthState = {
 type StoredOidcToken = {
   token: string;
   exp: number | null;
+  refreshToken?: string;
 };
 
 let discoveryPromise: Promise<OidcDiscoveryDocument> | null = null;
+let refreshPromise: Promise<boolean> | null = null;
+let refreshTimer: number | null = null;
 
 const readEnv = (key: keyof RuntimeConfig, fallback = ''): string => {
   const runtimeValue = window.__SIMPLEMAIL_CONFIG__?.[key];
@@ -88,16 +91,49 @@ const parseJwtExp = (token: string): number | null => {
   }
 };
 
-const saveToken = (token: string) => {
+const clearRefreshTimer = () => {
+  if (refreshTimer !== null) {
+    window.clearTimeout(refreshTimer);
+    refreshTimer = null;
+  }
+};
+
+const scheduleTokenRefresh = () => {
+  clearRefreshTimer();
+  const raw = window.sessionStorage.getItem(OIDC_STORAGE_KEY);
+  if (!raw) {
+    return;
+  }
+  try {
+    const stored = JSON.parse(raw) as StoredOidcToken;
+    if (!stored.refreshToken || !stored.exp) {
+      return;
+    }
+    const refreshAtMs = (stored.exp * 1000) - 60_000;
+    const delayMs = Math.max(5_000, refreshAtMs - Date.now());
+    refreshTimer = window.setTimeout(() => {
+      void refreshTokenIfNeeded(true);
+    }, delayMs);
+  } catch {
+    clearRefreshTimer();
+  }
+};
+
+const saveToken = (token: string, refreshToken?: string) => {
+  const raw = window.sessionStorage.getItem(OIDC_STORAGE_KEY);
+  const previous = raw ? (JSON.parse(raw) as StoredOidcToken) : null;
   const stored: StoredOidcToken = {
     token,
     exp: parseJwtExp(token),
+    refreshToken: refreshToken ?? previous?.refreshToken,
   };
   window.sessionStorage.setItem(OIDC_STORAGE_KEY, JSON.stringify(stored));
   api.auth.login(token);
+  scheduleTokenRefresh();
 };
 
 const clearStoredToken = () => {
+  clearRefreshTimer();
   window.sessionStorage.removeItem(OIDC_STORAGE_KEY);
   api.auth.clear();
 };
@@ -113,14 +149,88 @@ const restoreToken = () => {
       clearStoredToken();
       return;
     }
-    if (stored.exp && stored.exp * 1000 <= Date.now()) {
+    if (stored.exp && stored.exp * 1000 <= Date.now() && !stored.refreshToken) {
       clearStoredToken();
       return;
     }
+    scheduleTokenRefresh();
     api.auth.login(stored.token);
   } catch {
     clearStoredToken();
   }
+};
+
+const refreshTokenIfNeeded = async (force = false): Promise<boolean> => {
+  if (refreshPromise) {
+    return refreshPromise;
+  }
+
+  const raw = window.sessionStorage.getItem(OIDC_STORAGE_KEY);
+  if (!raw) {
+    return false;
+  }
+
+  let stored: StoredOidcToken;
+  try {
+    stored = JSON.parse(raw) as StoredOidcToken;
+  } catch {
+    clearStoredToken();
+    return false;
+  }
+
+  if (!stored.refreshToken) {
+    return false;
+  }
+
+  const expiresSoon = stored.exp ? ((stored.exp * 1000) - Date.now()) <= 60_000 : false;
+  if (!force && !expiresSoon) {
+    return true;
+  }
+
+  refreshPromise = (async () => {
+    try {
+      const discovery = await loadDiscoveryDocument();
+      const body = new URLSearchParams({
+        grant_type: 'refresh_token',
+        refresh_token: stored.refreshToken as string,
+        client_id: oidcConfig.clientId,
+      });
+
+      const response = await fetch(discovery.token_endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: body.toString(),
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => null) as { error?: unknown } | null;
+        const errorCode = String(body?.error ?? '').trim().toLowerCase();
+        if (response.status === 400 || response.status === 401 || errorCode === 'invalid_grant') {
+          clearStoredToken();
+          return false;
+        }
+        scheduleTokenRefresh();
+        return false;
+      }
+
+      const payload = await response.json() as { id_token?: string; access_token?: string; refresh_token?: string };
+      const nextToken = String(payload.id_token ?? payload.access_token ?? '').trim();
+      if (!nextToken) {
+        scheduleTokenRefresh();
+        return false;
+      }
+      saveToken(nextToken, payload.refresh_token);
+      return true;
+    } catch {
+      scheduleTokenRefresh();
+      return false;
+    } finally {
+      refreshPromise = null;
+    }
+  })();
+
+  return refreshPromise;
 };
 
 const loadDiscoveryDocument = async (): Promise<OidcDiscoveryDocument> => {
@@ -212,13 +322,13 @@ const exchangeCodeForToken = async () => {
     throw new Error(`OIDC token exchange failed (${response.status})`);
   }
 
-  const payload = await response.json() as { id_token?: string; access_token?: string };
+  const payload = await response.json() as { id_token?: string; access_token?: string; refresh_token?: string };
   const token = String(payload.id_token ?? payload.access_token ?? '').trim();
   if (!token) {
     throw new Error('OIDC token response missing id_token/access_token');
   }
 
-  saveToken(token);
+  saveToken(token, payload.refresh_token);
   clearAuthState();
 
   const redirectPath = savedState.nextPath || '/inbox';
@@ -227,6 +337,7 @@ const exchangeCodeForToken = async () => {
 
 export const initOidcAuth = async () => {
   restoreToken();
+  await refreshTokenIfNeeded(false);
   if (shouldHandleLoginCallback()) {
     await exchangeCodeForToken();
   }

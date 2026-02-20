@@ -51,6 +51,10 @@ Optional for non-HTTPS local/private OIDC providers:
 
 - `OIDC_ALLOW_INSECURE_HTTP=true`
 
+To reduce frequent sign-in prompts, include refresh scope in frontend OIDC scopes:
+
+- `VITE_OIDC_SCOPES=openid profile email offline_access`
+
 ### 3. Start the stack
 
 ```bash
@@ -68,7 +72,19 @@ docker compose up -d
 <details>
   <summary>Google / Gmail API (OAuth connector)</summary>
 
-Set these when enabling Google OAuth connector flows:
+Before adding a Gmail connector, create OAuth credentials in Google Cloud:
+
+1. Open Credentials: `https://console.cloud.google.com/apis/credentials`
+2. Create/select project: `https://console.cloud.google.com/projectcreate`
+3. Enable Gmail API: `https://console.cloud.google.com/apis/api/gmail.googleapis.com`
+4. Configure OAuth consent screen: `https://console.cloud.google.com/auth/branding`
+5. If app is in Testing, add test users: `https://console.cloud.google.com/auth/audience`
+6. Create OAuth client at `https://console.cloud.google.com/auth/clients`
+7. Use application type `Web application` and add authorized redirect URI matching `GOOGLE_REDIRECT_URI` (default `http://localhost:3000/api/oauth/google/callback`)
+
+NOTE: Gmail via IMAP is more reliable in my experience than Gmail over API.
+
+Set these env vars:
 
 - `GOOGLE_CLIENT_ID`
 - `GOOGLE_CLIENT_SECRET`
@@ -80,6 +96,14 @@ Set these when enabling Google OAuth connector flows:
   <summary>Google Gmail Pub/Sub webhooks</summary>
 
 Gmail Pub/Sub push delivery requires a public HTTPS endpoint that Google can reach. For local/self-hosted setups, use a tunnel/domain (for example Cloudflare Tunnel) and point your webhook audience/base URL to that HTTPS endpoint.
+
+Google Cloud setup:
+
+1. Enable Gmail API: `https://console.cloud.google.com/apis/api/gmail.googleapis.com`
+2. Enable Cloud Pub/Sub API: `https://console.cloud.google.com/apis/api/pubsub.googleapis.com`
+3. Create a Pub/Sub topic and subscription for Gmail push
+4. Grant publish permission on your topic to `gmail-api-push@system.gserviceaccount.com`
+5. Set webhook audience to your public HTTPS webhook URL
 
 Set these when enabling push sync:
 

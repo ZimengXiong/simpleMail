@@ -201,7 +201,11 @@ export const api = {
     },
     isAuthenticated: () => Boolean(getAuthToken()),
     session: () => request<{ id: string; email: string; name: string }>('/session'),
-    accessControl: () => request<{ allowedEmails: string[]; requiredSubject: string }>('/access-control'),
+    accessControl: () => request<{
+      allowedEmails: string[];
+      requiredSubject: string;
+      gmailPushEnabled?: boolean;
+    }>('/access-control'),
   },
 
   connectors: {
@@ -343,10 +347,16 @@ export const api = {
   },
 
   sync: {
-    trigger: (connectorId: string, mailbox = 'INBOX', useQueue = false, syncAll = false) => 
+    trigger: (
+      connectorId: string,
+      mailbox = 'INBOX',
+      useQueue = false,
+      syncAll = false,
+      force = false,
+    ) =>
       request(`/sync/${connectorId}`, { 
         method: 'POST', 
-        body: JSON.stringify({ mailbox, useQueue, syncAll }) 
+        body: JSON.stringify({ mailbox, useQueue, syncAll, force }) 
       }),
     cancel: (connectorId: string, mailbox = 'INBOX') =>
       request(`/sync/${connectorId}/cancel`, {

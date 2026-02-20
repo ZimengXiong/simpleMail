@@ -22,6 +22,7 @@ export const registerRoutes = async (app: FastifyInstance) => {
   app.get('/api/access-control', async () => ({
     allowedEmails: [...env.oidc.allowedEmails],
     requiredSubject: env.oidc.requiredSubject || '',
+    gmailPushEnabled: env.gmailPush.enabled,
   }));
 
   await registerConnectorRoutes(app);

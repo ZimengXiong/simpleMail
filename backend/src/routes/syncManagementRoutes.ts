@@ -54,6 +54,7 @@ export const registerSyncManagementRoutes = async (app: FastifyInstance) => {
       : mailboxInput;
     const useQueue = body.useQueue === true;
     const syncAll = body.syncAll === true;
+    const force = body.force === true;
     const requestedPriority = String(body.priority || '').toLowerCase() === 'high' ? 'high' : 'normal';
     const resolvePriorityForMailbox = (targetMailbox: string) =>
       requestedPriority === 'high'
@@ -77,6 +78,7 @@ export const registerSyncManagementRoutes = async (app: FastifyInstance) => {
         targets.map(async (targetMailbox) => {
           const enqueued = await enqueueSyncWithOptions(userId, connectorId, targetMailbox, {
             priority: resolvePriorityForMailbox(targetMailbox),
+            force,
           });
           if (enqueued) {
             try {
@@ -110,15 +112,19 @@ export const registerSyncManagementRoutes = async (app: FastifyInstance) => {
       try {
         const enqueued = await enqueueSyncWithOptions(userId, connectorId, mailbox, {
           priority: resolvePriorityForMailbox(mailbox),
+          force,
         });
         if (enqueued) {
+          const snapshot = force ? await getMailboxState(connectorId, mailbox).catch(() => null) : null;
           try {
-            await setSyncState(connectorId, mailbox, {
-              status: 'queued',
-              syncCompletedAt: null,
-              syncError: null,
-              syncProgress: { inserted: 0, updated: 0, reconciledRemoved: 0, metadataRefreshed: 0 },
-            });
+            if (snapshot?.status !== 'syncing') {
+              await setSyncState(connectorId, mailbox, {
+                status: 'queued',
+                syncCompletedAt: null,
+                syncError: null,
+                syncProgress: { inserted: 0, updated: 0, reconciledRemoved: 0, metadataRefreshed: 0 },
+              });
+            }
           } catch {
           }
           return { status: 'queued' };

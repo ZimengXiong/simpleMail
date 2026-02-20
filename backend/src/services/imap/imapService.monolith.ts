@@ -3037,6 +3037,10 @@ export const reapStaleSyncStates = async () => {
   const staleMs = Number.isFinite(env.sync.syncClaimStaleMs) && env.sync.syncClaimStaleMs > 0
     ? Math.floor(env.sync.syncClaimStaleMs)
     : 900000;
+  const heartbeatStaleMs = Number.isFinite(env.sync.syncClaimHeartbeatStaleMs) && env.sync.syncClaimHeartbeatStaleMs > 0
+    ? Math.floor(env.sync.syncClaimHeartbeatStaleMs)
+    : 45000;
+  const reaperStaleMs = Math.max(staleMs + (heartbeatStaleMs * 8), staleMs);
 
   try {
     const result = await query<{
@@ -3051,11 +3055,11 @@ export const reapStaleSyncStates = async () => {
               sync_completed_at = NOW(),
               sync_error = COALESCE(NULLIF(sync_error, ''), 'stale sync state reaped by maintenance'),
               updated_at = NOW()
-        WHERE status IN ('syncing', 'queued', 'cancel_requested')
+        WHERE status IN ('syncing', 'cancel_requested')
           AND COALESCE(updated_at, sync_started_at) IS NOT NULL
           AND COALESCE(updated_at, sync_started_at) < NOW() - ($1::double precision * INTERVAL '1 millisecond')
       RETURNING incoming_connector_id, mailbox, status, sync_started_at, updated_at`,
-      [staleMs],
+      [reaperStaleMs],
     );
 
     for (const row of result.rows) {
