@@ -4,9 +4,10 @@ type AppBrandProps = {
   variant?: 'default' | 'compact';
   className?: string;
   accent?: string;
+  showText?: boolean;
 } & Omit<HTMLAttributes<HTMLDivElement>, 'className'>;
 
-const AppBrand = ({ variant = 'default', className = '', accent }: AppBrandProps) => {
+const AppBrand = ({ variant = 'default', className = '', accent, showText = true }: AppBrandProps) => {
   const isCompact = variant === 'compact';
   const iconSize = isCompact ? 26 : 34;
   const textClass = isCompact ? 'text-base' : 'text-lg';
@@ -46,7 +47,7 @@ const AppBrand = ({ variant = 'default', className = '', accent }: AppBrandProps
           strokeLinecap="square"
         />
       </svg>
-      <span className={`font-semibold tracking-wide ${textClass}`}>SimpleMail</span>
+      {showText ? <span className={`font-semibold tracking-wide ${textClass}`}>SimpleMail</span> : null}
     </div>
   );
 };

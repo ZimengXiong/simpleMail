@@ -90,10 +90,15 @@ const LoginView = () => {
   return (
     <div className="min-h-screen w-full bg-bg-app flex items-center justify-center p-4">
       <div className="w-full max-w-[360px] p-10 border border-border bg-bg-card text-center shadow-xs">
-        <div className="mb-6">
-          <AppBrand className="justify-center" accent="#39ff14" />
+        <div
+          className="mb-6"
+          style={{ filter: 'drop-shadow(0 0 8px rgba(0, 255, 0, 0.45))' }}
+        >
+          <AppBrand className="justify-center" accent="#00ff00" showText={false} />
         </div>
-        <h1 className="text-lg font-bold text-text-primary mb-8">Sign in to SimpleMail with OIDC</h1>
+        <h1 className="text-lg font-bold text-text-primary mb-8">
+          Sign in to <span style={{ color: '#00ff00' }}>SimpleMail</span> with OIDC
+        </h1>
 
         {isVerifying ? (
           <div className="text-xs text-text-secondary py-4">
