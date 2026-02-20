@@ -25,6 +25,12 @@ Set these values:
 - `VITE_OIDC_ISSUER_URL`
 - `VITE_OIDC_CLIENT_ID`
 
+OIDC setup is bring-your-own provider (external to this repository). The bundled Keycloak service is dev-only and only starts when explicitly using the `dev-oidc` profile.
+
+If your backend container cannot reach your issuer URL directly, also set:
+
+- `OIDC_JWKS_URI` (container-reachable JWKS endpoint for the same issuer)
+
 Optional for non-HTTPS local/private OIDC providers:
 
 - `OIDC_ALLOW_INSECURE_HTTP=true`
