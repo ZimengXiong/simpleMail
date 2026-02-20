@@ -1,7 +1,3 @@
-/**
- * Unit tests for message search query parsing.
- * Run with: npx tsx src/services/__tests__/search.test.ts
- */
 import assert from 'node:assert/strict';
 import { parseMessageSearchQuery } from '../search.js';
 

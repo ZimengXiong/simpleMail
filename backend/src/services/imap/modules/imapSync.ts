@@ -1,4 +1,4 @@
 export {
   hydrateGmailMailboxContentBatch,
   syncIncomingConnector,
-} from '../imap/imapService.monolith.js';
+} from '../imapService.monolith.js';

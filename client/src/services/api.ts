@@ -201,6 +201,7 @@ export const api = {
     },
     isAuthenticated: () => Boolean(getAuthToken()),
     session: () => request<{ id: string; email: string; name: string }>('/session'),
+    accessControl: () => request<{ allowedEmails: string[]; requiredSubject: string }>('/access-control'),
   },
 
   connectors: {

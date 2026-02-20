@@ -1,10 +1,11 @@
 import { createRequire } from 'node:module';
+import net from 'node:net';
 import nodemailer from 'nodemailer';
 import { query } from '../db/pool.js';
 import { env } from '../config/env.js';
 import { appendMessageToMailbox } from './imap.js';
 import { enqueueSync } from './queue.js';
-import { assertSafeOutboundHost } from './networkGuard.js';
+import { resolveSafeOutboundHost } from './networkGuard.js';
 import {
   ensureValidGoogleAccessToken,
   isGoogleTokenExpiringSoon,
@@ -69,7 +70,8 @@ const getTransport = async (connector: any, authConfig: Record<string, any>) => 
   if (!host) {
     throw new Error('SMTP connector host is required');
   }
-  await assertSafeOutboundHost(String(host), { context: 'outgoing connector host' });
+  const resolvedHost = await resolveSafeOutboundHost(String(host), { context: 'outgoing connector host' });
+  const tlsServername = net.isIP(resolvedHost.host) > 0 ? undefined : resolvedHost.host;
 
   const tlsOptions = tlsMode === 'none'
     ? {}
@@ -77,6 +79,7 @@ const getTransport = async (connector: any, authConfig: Record<string, any>) => 
         tls: {
           minVersion: 'TLSv1.2',
           rejectUnauthorized: true,
+          ...(tlsServername ? { servername: tlsServername } : {}),
         },
       };
 
@@ -89,7 +92,7 @@ const getTransport = async (connector: any, authConfig: Record<string, any>) => 
       throw new Error('Gmail OAuth2 SMTP requires an access token or refresh token');
     }
     return nodemailer.createTransport({
-      host,
+      host: resolvedHost.address,
       port,
       secure: tlsMode === 'ssl',
       requireTLS: tlsMode === 'starttls',
@@ -113,7 +116,7 @@ const getTransport = async (connector: any, authConfig: Record<string, any>) => 
   }
 
   return nodemailer.createTransport({
-    host,
+    host: resolvedHost.address,
     port,
     secure: tlsMode === 'ssl',
     requireTLS: tlsMode === 'starttls',
@@ -568,7 +571,6 @@ export const sendThroughConnector = async (
       try {
         await enqueueSync(userId, incomingConnector.id, incomingConnector.provider === 'gmail' ? 'SENT' : folder);
       } catch {
-        // Sent copy append succeeded; sync enqueue failure should not fail outbound send.
       }
     } catch (error) {
       sentCopyError = String(error);
@@ -579,7 +581,6 @@ export const sendThroughConnector = async (
     try {
       await enqueueSync(userId, saveSentToConnectorId, 'SENT');
     } catch {
-      // Sending already succeeded; background sync failure is non-fatal.
     }
   }
 

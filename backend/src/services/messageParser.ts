@@ -89,7 +89,6 @@ export const parseAndPersistMessage = async (
   messageId: string,
   source: Buffer,
 ): Promise<ParsedMessageSummary> => {
-  // PostalMime parser instances are single-use; create a fresh one per message.
   const parser = new PostalMime();
   const parsed = await parser.parse(source);
 

@@ -5,4 +5,4 @@ export {
   stopIncomingConnectorIdleWatch,
   runIdleWatchdog,
   resumeConfiguredIdleWatches,
-} from '../imap/imapService.monolith.js';
+} from '../imapService.monolith.js';

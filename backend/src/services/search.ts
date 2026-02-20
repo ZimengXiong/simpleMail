@@ -385,14 +385,11 @@ export const buildMessageSearchQuery = (userId: string, parsed: ParsedMessageSea
     values.push(...subjectClause.values);
   }
 
-  // Free-text: use the GIN-indexed tsvector exclusively — no LIKE scan.
   const textQuery = [...parsed.freeTerms, ...parsed.freeNegatedTerms.map((t) => `-${t}`)]
     .map((term) => term.trim())
     .filter(Boolean)
     .join(' ');
 
-  // Field-operator tsvector terms (from:, to:, subject:) — build a compound
-  // websearch_to_tsquery combining all terms so we get a single index seek.
   const fieldTextQuery = [...parsed.fromTerms, ...parsed.toTerms, ...parsed.subjectTerms]
     .map((term) => term.trim())
     .filter(Boolean)

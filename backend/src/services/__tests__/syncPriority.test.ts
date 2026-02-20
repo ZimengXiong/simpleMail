@@ -1,7 +1,3 @@
-/**
- * Unit tests for sync priority active-mailbox logic.
- * Run with: npx tsx src/services/__tests__/syncPriority.test.ts
- */
 import assert from 'node:assert/strict';
 import { markActiveMailbox, resolveSyncQueuePriority } from '../syncPriority.js';
 

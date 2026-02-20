@@ -18,8 +18,14 @@ const required = (value?: string, name = 'environment variable'): string => {
 };
 
 const nodeEnv = process.env.NODE_ENV ?? 'development';
-const defaultOidcRequiredEmail = nodeEnv === 'production' ? '' : 'demo@local.test';
 const defaultRequireEmailVerified = nodeEnv === 'production';
+const normalizeEmail = (value: string | undefined) => String(value ?? '').trim().toLowerCase();
+const parseOidcEmailAllowlist = (value: string | undefined) =>
+  String(value ?? '')
+    .split(',')
+    .map((entry) => normalizeEmail(entry))
+    .filter(Boolean);
+const oidcAllowedEmails = Array.from(new Set(parseOidcEmailAllowlist(process.env.OIDC_ALLOWED_EMAILS)));
 
 export const env = {
   nodeEnv,
@@ -33,7 +39,7 @@ export const env = {
     issuerUrl: process.env.OIDC_ISSUER_URL ?? 'http://localhost:8080/realms/simplemail',
     clientId: process.env.OIDC_CLIENT_ID ?? 'simplemail-web',
     jwksUri: process.env.OIDC_JWKS_URI ?? '',
-    requiredEmail: (process.env.OIDC_REQUIRED_EMAIL ?? defaultOidcRequiredEmail).trim().toLowerCase(),
+    allowedEmails: oidcAllowedEmails,
     requiredSubject: String(process.env.OIDC_REQUIRED_SUBJECT ?? '').trim(),
     allowedAlgs: (process.env.OIDC_ALLOWED_ALGS ?? 'RS256')
       .split(',')
@@ -58,8 +64,8 @@ export const env = {
     endpoint: process.env.SEAWEED_S3_ENDPOINT ?? 'http://seaweed-filer:8333',
     region: process.env.SEAWEED_REGION ?? 'us-east-1',
     bucket: process.env.SEAWEED_BUCKET ?? 'simplemail',
-    accessKeyId: process.env.SEAWEED_ACCESS_KEY_ID ?? 'seaweed_admin',
-    secretAccessKey: process.env.SEAWEED_SECRET_ACCESS_KEY ?? 'seaweed_admin_secret',
+    accessKeyId: required(process.env.SEAWEED_ACCESS_KEY_ID, 'SEAWEED_ACCESS_KEY_ID'),
+    secretAccessKey: required(process.env.SEAWEED_SECRET_ACCESS_KEY, 'SEAWEED_SECRET_ACCESS_KEY'),
     forcePathStyle: process.env.SEAWEED_FORCE_PATH_STYLE !== 'false',
   },
   sync: {

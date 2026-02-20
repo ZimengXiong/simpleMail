@@ -1,7 +1,3 @@
-/**
- * Unit tests for message search SQL predicate/query generation.
- * Run with: npx tsx src/services/__tests__/searchQueryBuilder.test.ts
- */
 import assert from 'node:assert/strict';
 import { buildMessageSearchQuery, parseMessageSearchQuery, type ParsedMessageSearch } from '../search.js';
 

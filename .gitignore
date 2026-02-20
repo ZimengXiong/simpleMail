@@ -15,6 +15,7 @@ backend/node_modules/
 .env.production.local
 .env.development.local
 .env.test.local
+.env.backup-*
 
 # Logs
 *.log
@@ -51,6 +52,8 @@ postgres_data_dev/
 seaweed_master_data_dev/
 seaweed_volume_data_dev/
 seaweed_filer_data_dev/
+deploy/seaweedfs/s3.json
+client/public/runtime-config.js
 
 # Runtime snapshots
 *.sqlite

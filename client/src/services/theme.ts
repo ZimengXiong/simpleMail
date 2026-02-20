@@ -62,6 +62,39 @@ export const useTheme = () => {
     safeStorageGet('accentColor') || '#2B1D3A'
   );
 
+  const setThemeFavicon = (accent: string) => {
+    if (typeof document === 'undefined') {
+      return;
+    }
+
+    const svg = `<svg width="200" height="200" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="metal-gloss" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#333" stop-opacity="1" />
+      <stop offset="50%" stop-color="#111" stop-opacity="1" />
+      <stop offset="100%" stop-color="#000" stop-opacity="1" />
+    </linearGradient>
+  </defs>
+  <path d="M12 32 L92 32 L82 82 L22 82 Z" fill="#000" opacity="0.5" />
+  <path d="M10 30 L90 30 L80 80 L20 80 Z" fill="url(#metal-gloss)" stroke="${accent}" stroke-width="2.5" stroke-linejoin="miter" />
+  <path d="M10 30 L50 68 L90 30" fill="none" stroke="${accent}" stroke-width="3" stroke-linecap="square" />
+  <line x1="25" y1="40" x2="40" y2="55" stroke="#fff" stroke-width="1" opacity="0.6" />
+</svg>`;
+    const faviconHref = `data:image/svg+xml,${encodeURIComponent(svg)}`;
+    const existing = document.querySelector<HTMLLinkElement>("link[rel='icon']");
+
+    if (existing) {
+      existing.href = faviconHref;
+      return;
+    }
+
+    const link = document.createElement('link');
+    link.rel = 'icon';
+    link.type = 'image/svg+xml';
+    link.href = faviconHref;
+    document.head.appendChild(link);
+  };
+
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme);
     safeStorageSet('theme', theme);
@@ -96,6 +129,7 @@ export const useTheme = () => {
     };
     
     document.documentElement.style.setProperty('--accent-contrast', getContrastColor(adjustedAccent));
+    setThemeFavicon(adjustedAccent);
     
     safeStorageSet('accentColor', accentColor);
   }, [accentColor, theme]);

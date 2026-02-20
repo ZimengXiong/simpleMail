@@ -8,4 +8,4 @@ export {
   shouldResetMailboxForUidValidity,
   getImapClient,
   getMailboxState,
-} from '../imap/imapService.monolith.js';
+} from '../imapService.monolith.js';

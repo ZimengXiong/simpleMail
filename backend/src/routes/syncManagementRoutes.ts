@@ -63,10 +63,10 @@ export const registerSyncManagementRoutes = async (app: FastifyInstance) => {
     if (syncAll) {
       const mailboxes = await listConnectorMailboxes(userId, connectorId);
       const queueTargets = mailboxes
-        .map((entry) => isGmailLikeConnector(connector)
+        .map((entry: { path: string }) => isGmailLikeConnector(connector)
           ? normalizeGmailMailboxPath(entry.path)
           : entry.path)
-        .filter((entry) => Boolean(entry && String(entry).trim()));
+        .filter((entry: string) => Boolean(entry && String(entry).trim()));
       const fallbackMailbox = isGmailLikeConnector(connector)
         ? normalizeGmailMailboxPath(normalizeMailboxInput(env.sync.defaultMailbox, 'DEFAULT_MAILBOX'))
         : normalizeMailboxInput(env.sync.defaultMailbox, 'DEFAULT_MAILBOX');

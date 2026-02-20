@@ -207,6 +207,7 @@ const getUserId = (request: any) => {
 
 
 export const registerOAuthCallbackRoutes = async (app: FastifyInstance) => {
+  app.get('/api/oauth/google/callback', async (req, reply) => {
     const redirectToFrontend = (status: 'ok' | 'error', extras: Record<string, string> = {}) => {
       const redirectUrl = new URL(env.oauthCallbackPath, env.frontendBaseUrl);
       redirectUrl.searchParams.set('status', status);
@@ -445,16 +446,15 @@ export const registerOAuthCallbackRoutes = async (app: FastifyInstance) => {
           try {
             await startIncomingConnectorIdleWatch(targetUserId, connectorId, fallbackMailbox);
           } catch {
-            // best effort: initial sync queueing should still continue even if watcher startup fails
           }
         }
 
         const mailboxes = await listConnectorMailboxes(targetUserId, connectorId);
         const queueTargets = mailboxes
-          .map((mailbox) => isGmailLikeConnector({ provider, sync_settings: connectorSyncSettings, syncSettings: connectorSyncSettings })
+          .map((mailbox: any) => isGmailLikeConnector({ provider, sync_settings: connectorSyncSettings, syncSettings: connectorSyncSettings })
             ? normalizeGmailMailboxPath(mailbox.path)
             : mailbox.path)
-          .filter((mailbox) => Boolean(mailbox && String(mailbox).trim()));
+          .filter((mailbox: any) => Boolean(mailbox && String(mailbox).trim()));
         const targets = buildInitialSyncTargets(
           { provider, sync_settings: connectorSyncSettings, syncSettings: connectorSyncSettings },
           queueTargets,
@@ -462,7 +462,7 @@ export const registerOAuthCallbackRoutes = async (app: FastifyInstance) => {
         );
         await ensureIncomingConnectorStatesBulk(connectorId, targets);
         await Promise.all(
-          targets.map(async (mailbox) => {
+          targets.map(async (mailbox: string) => {
             const enqueued = await enqueueSyncWithOptions(targetUserId, connectorId, mailbox, {
               priority: resolveSyncQueuePriority(targetUserId, connectorId, mailbox),
             });
@@ -476,9 +476,8 @@ export const registerOAuthCallbackRoutes = async (app: FastifyInstance) => {
                   syncProgress: { inserted: 0, updated: 0, reconciledRemoved: 0, metadataRefreshed: 0 },
                 });
               } catch {
-                // Ignore sync-state persistence failures so fallback sync still starts.
               }
-              void syncIncomingConnector(targetUserId, connectorId, mailbox).catch((error) => {
+              void syncIncomingConnector(targetUserId, connectorId, mailbox).catch((error: unknown) => {
                 app.log.warn({ error, connectorId, mailbox }, 'oauth callback fallback sync failed');
               });
               return;
@@ -491,12 +490,10 @@ export const registerOAuthCallbackRoutes = async (app: FastifyInstance) => {
                 syncProgress: { inserted: 0, updated: 0, reconciledRemoved: 0, metadataRefreshed: 0 },
               });
             } catch {
-              // Keep queueing responsive even when sync-state persistence is unavailable.
             }
           }),
         );
       } catch {
-        // no-op: callback should still succeed even if background queue is temporarily unavailable
       }
     } else {
       await updateOutgoingConnectorAuth(connectorId, nextAuth, targetUserId);
@@ -510,5 +507,4 @@ export const registerOAuthCallbackRoutes = async (app: FastifyInstance) => {
     });
   });
 
-};
 };

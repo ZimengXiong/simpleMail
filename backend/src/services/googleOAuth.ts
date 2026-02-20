@@ -77,8 +77,6 @@ export const consumeOAuthState = async (state: string): Promise<OAuthState | nul
       };
     }
   } catch {
-    // Fail closed if state cannot be atomically consumed from persistent storage.
-    // This avoids replay if DB deletes temporarily fail.
     return null;
   }
   return null;

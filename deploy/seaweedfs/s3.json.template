@@ -4,8 +4,8 @@
       "name": "admin",
       "credentials": [
         {
-          "accessKey": "seaweed_admin",
-          "secretKey": "seaweed_admin_secret"
+          "accessKey": "__SEAWEED_ACCESS_KEY_ID__",
+          "secretKey": "__SEAWEED_SECRET_ACCESS_KEY__"
         }
       ],
       "actions": [

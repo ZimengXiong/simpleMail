@@ -312,7 +312,6 @@ export const ensureIncomingConnectorStatesBulk = async (
       [connectorId, normalized],
     );
   } catch {
-    // Fall back to per-mailbox inserts if bulk path fails.
     for (const mailbox of normalized) {
       await ensureIncomingConnectorState(connectorId, mailbox);
     }

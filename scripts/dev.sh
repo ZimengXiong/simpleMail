@@ -12,6 +12,7 @@ TUNNEL_ENABLED="${SIMPLEMAIL_TUNNEL_ENABLED:-true}"
 TUNNEL_NAME="${SIMPLEMAIL_TUNNEL_NAME:-simplemail-api}"
 TUNNEL_CONFIG="${SIMPLEMAIL_TUNNEL_CONFIG:-${HOME}/.cloudflared/config.yml}"
 KEYCLOAK_WELL_KNOWN_URL="${SIMPLEMAIL_KEYCLOAK_WELL_KNOWN_URL:-http://localhost:8080/realms/simplemail/.well-known/openid-configuration}"
+ENV_PREPARE_SCRIPT="${ROOT_DIR}/scripts/prepare-env.sh"
 
 require_cmd() {
   local name="$1"
@@ -26,6 +27,9 @@ session_exists() {
 }
 
 start_infra() {
+  if [[ -x "${ENV_PREPARE_SCRIPT}" ]]; then
+    "${ENV_PREPARE_SCRIPT}" "${ROOT_DIR}/.env"
+  fi
   echo "Starting docker services via ${COMPOSE_FILE}..."
   docker compose -f "${COMPOSE_FILE}" up -d
 }

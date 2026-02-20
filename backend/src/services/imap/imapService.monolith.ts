@@ -1,21 +1,22 @@
 import { ImapFlow } from 'imapflow';
+import net from 'node:net';
 import { v4 as uuidv4 } from 'uuid';
-import { query, now } from '../db/pool.js';
-import { blobStore } from '../storage/seaweedS3BlobStore.js';
-import { env } from '../config/env.js';
-import { parseAndPersistMessage } from './messageParser.js';
-import { computeThreadForMessage } from './threading.js';
-import { emitSyncEvent } from './imapEvents.js';
-import { enqueueGmailHydration } from './queue.js';
-import { ensureValidGoogleAccessToken, isGoogleTokenExpiringSoon } from './googleOAuth.js';
-import { gmailApiRequest, listAllGmailPages } from './gmailApi.js';
+import { query, now } from '../../db/pool.js';
+import { blobStore } from '../../storage/seaweedS3BlobStore.js';
+import { env } from '../../config/env.js';
+import { parseAndPersistMessage } from '../messageParser.js';
+import { computeThreadForMessage } from '../threading.js';
+import { emitSyncEvent } from '../imapEvents.js';
+import { enqueueGmailHydration } from '../queue.js';
+import { ensureValidGoogleAccessToken, isGoogleTokenExpiringSoon } from '../googleOAuth.js';
+import { gmailApiRequest, listAllGmailPages } from '../gmailApi.js';
 import {
   addLabelsToMessageByKey,
   ensureSystemLabelsForUser,
   removeLabelsFromMessageByKey,
   syncSystemLabelsForMessage,
-} from './labels.js';
-import { assertSafeOutboundHost } from './networkGuard.js';
+} from '../labels.js';
+import { resolveSafeOutboundHost } from '../networkGuard.js';
 import {
   getConnectorAuth,
   getSyncStateColumns,
@@ -30,7 +31,7 @@ import {
   toNumberUid,
   toNumberUidList,
   chunkArray,
-} from './imap/utils.js';
+} from './utils.js';
 
 export const setSyncState = async (
   connectorId: string,
@@ -771,7 +772,8 @@ export const getImapClient = async (connector: any, options: GetImapClientOption
   }
 
   const port = assertValidImapPort(connector.port || (isGmailImapConnector(connector) ? 993 : undefined));
-  await assertSafeOutboundHost(String(host), { context: 'incoming connector host' });
+  const resolvedHost = await resolveSafeOutboundHost(String(host), { context: 'incoming connector host' });
+  const tlsServername = net.isIP(resolvedHost.host) > 0 ? undefined : resolvedHost.host;
   const tlsMode = resolveImapTlsMode(connector, port);
   assertAllowedImapTlsMode(tlsMode);
   const secure = tlsMode === 'ssl';
@@ -799,7 +801,7 @@ export const getImapClient = async (connector: any, options: GetImapClientOption
   }
 
   return new ImapFlow({
-    host,
+    host: resolvedHost.address,
     port,
     secure,
     ...(doSTARTTLS !== undefined ? { doSTARTTLS } : {}),
@@ -809,6 +811,7 @@ export const getImapClient = async (connector: any, options: GetImapClientOption
           tls: {
             minVersion: 'TLSv1.2',
             rejectUnauthorized: true,
+            ...(tlsServername ? { servername: tlsServername } : {}),
           },
         }),
     auth: imapAuth as any,

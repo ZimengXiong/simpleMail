@@ -15,6 +15,7 @@ Backend implementation for Gmail + generic SMTP clients with:
 ```bash
 cd <repo-root>
 cp .env.example .env
+scripts/prepare-env.sh .env
 npm install
 npm run migrate
 npm run worker:migrate
@@ -38,9 +39,11 @@ OIDC defaults are preconfigured in `.env.example`:
 
 - `OIDC_ISSUER_URL=http://localhost:8080/realms/simplemail`
 - `OIDC_CLIENT_ID=simplemail-web`
-- `OIDC_REQUIRED_EMAIL=demo@local.test`
+- `OIDC_ALLOWED_EMAILS=demo@local.test`
 - `OIDC_ALLOWED_ALGS=RS256`
 - `OIDC_REQUIRE_EMAIL_VERIFIED=false` (development default)
+
+`OIDC_ALLOWED_EMAILS` is single-user in current backend scope and must contain exactly one email.
 
 ## Docker compose
 
@@ -66,7 +69,7 @@ docker compose up -d api worker
 - Set `API_ADMIN_TOKEN` in production (minimum 24 chars). Admin routes (for bootstrap/management) require it as `x-api-key`.
 - Keep `ALLOW_ADMIN_USER_BOOTSTRAP=false` unless you intentionally need the legacy admin-user bootstrap endpoint.
 - All user routes require a valid OIDC access token in `Authorization: Bearer <token>`.
-- Set `OIDC_ISSUER_URL`, `OIDC_CLIENT_ID`, `OIDC_REQUIRED_EMAIL`, and `OIDC_ALLOWED_ALGS` explicitly in production.
+- Set `OIDC_ISSUER_URL`, `OIDC_CLIENT_ID`, `OIDC_ALLOWED_EMAILS`, and `OIDC_ALLOWED_ALGS` explicitly in production.
 - `POST /api/health` and OAuth callback are intentionally public.
 - Run both migration tasks before first deployment (`migrate`, `worker-migrate`).
 - Keep API, worker, Postgres, and SeaweedFS in the same compose stack for single-host operation.

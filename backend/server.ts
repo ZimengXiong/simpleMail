@@ -59,6 +59,23 @@ const isSecureExternalUrl = (value: string) => {
   }
 };
 
+const looksWeakSharedCredential = (value: string) => {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (!normalized) return true;
+  if (normalized.length < 16) return true;
+  const blocked = new Set([
+    'seaweed_admin',
+    'seaweed_admin_secret',
+    'simplemail',
+    'change-me',
+    'changeme',
+    'password',
+    'secret',
+    'admin',
+  ]);
+  return blocked.has(normalized);
+};
+
 const isSafeAbsolutePath = (value: string) => {
   const trimmed = String(value || '').trim();
   if (!trimmed || !trimmed.startsWith('/') || trimmed.startsWith('//')) {
@@ -113,10 +130,16 @@ if (env.nodeEnv === 'production') {
   if (env.oidc.jwksUri && !isSecureExternalUrl(env.oidc.jwksUri)) {
     throw new Error('OIDC_JWKS_URI must use HTTPS in production');
   }
+  if (looksWeakSharedCredential(env.seaweed.accessKeyId)) {
+    throw new Error('SEAWEED_ACCESS_KEY_ID is too weak for production');
+  }
+  if (looksWeakSharedCredential(env.seaweed.secretAccessKey)) {
+    throw new Error('SEAWEED_SECRET_ACCESS_KEY is too weak for production');
+  }
 }
 
-if (!env.oidc.requiredEmail) {
-  throw new Error('OIDC_REQUIRED_EMAIL must be set for single-user authentication');
+if (env.oidc.allowedEmails.length !== 1) {
+  throw new Error('OIDC_ALLOWED_EMAILS must contain exactly one email');
 }
 
 if (env.gmailPush.enabled && !env.gmailPush.pushServiceAccountEmail) {
@@ -369,7 +392,7 @@ server.addHook('onRequest', async (request, reply) => {
     return reply.code(401).send({ error: message });
   }
 
-  if (identity.email !== env.oidc.requiredEmail) {
+  if (!env.oidc.allowedEmails.includes(identity.email)) {
     return reply.code(403).send({ error: 'authenticated user is not allowed' });
   }
 

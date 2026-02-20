@@ -16,7 +16,8 @@ import {
   Moon,
   Sun,
   Palette,
-  ShieldCheck
+  ShieldCheck,
+  LogOut
 } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import EmptyState from '../components/EmptyState';
@@ -25,6 +26,7 @@ import { useTheme } from '../services/theme';
 import Avatar from '../components/Avatar';
 import type { IdentityRecord } from '../types';
 import { readStorageString, writeStorageString } from '../services/storage';
+import { logoutOidc } from '../services/oidc';
 
 const readLayoutModePreference = (): 'columns' | 'list' => {
   return readStorageString('layoutMode') === 'list' ? 'list' : 'columns';
@@ -68,6 +70,11 @@ const SettingsView = () => {
   const { data: identities, isLoading: loadingIdentities } = useQuery({
     queryKey: ['identities'],
     queryFn: () => api.identities.list(),
+    staleTime: 60_000,
+  });
+  const { data: accessControl } = useQuery({
+    queryKey: ['access-control'],
+    queryFn: () => api.auth.accessControl(),
     staleTime: 60_000,
   });
 
@@ -388,6 +395,48 @@ const SettingsView = () => {
                       })}
                     </div>
                   )}
+                </section>
+
+                <section>
+                  <div className="mb-4 border-b border-border pb-2">
+                    <h2 className="text-base font-semibold text-text-primary">Access Control</h2>
+                  </div>
+                  <div className="rounded-md border border-border bg-bg-card p-4 space-y-3">
+                    <div>
+                      <p className="text-size-sm font-semibold text-text-primary">
+                        Configured User Email
+                      </p>
+                      <p className="text-size-xs text-text-secondary mt-1">
+                        Only this OIDC email can access the app.
+                      </p>
+                    </div>
+                    {accessControl?.allowedEmails?.[0] ? (
+                      <span className="text-size-xs px-2 py-1 rounded bg-black/5 dark:bg-white/10 text-text-primary inline-block">
+                        {accessControl.allowedEmails[0]}
+                      </span>
+                    ) : (
+                      <span className="text-size-xs text-text-secondary">No user email configured.</span>
+                    )}
+                    {accessControl?.requiredSubject && (
+                      <p className="text-size-xs text-text-secondary">
+                        Required subject: <span className="font-mono">{accessControl.requiredSubject}</span>
+                      </p>
+                    )}
+                  </div>
+                </section>
+
+                <section>
+                  <div className="mb-4 border-b border-border pb-2">
+                    <h2 className="text-base font-semibold text-text-primary">Session</h2>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => { void logoutOidc(); }}
+                    className="inline-flex items-center gap-2 px-3 py-2 rounded-md border border-border bg-bg-card hover:bg-black/5 dark:hover:bg-white/5 text-size-sm font-semibold text-text-primary transition-colors"
+                  >
+                    <LogOut className="w-4 h-4" />
+                    Log out
+                  </button>
                 </section>
               </div>
             )}

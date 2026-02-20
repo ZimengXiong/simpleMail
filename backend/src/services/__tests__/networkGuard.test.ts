@@ -1,7 +1,3 @@
-/**
- * Unit tests for outbound network target validation.
- * Run with: npx tsx src/services/__tests__/networkGuard.test.ts
- */
 import assert from 'node:assert/strict';
 import dns from 'node:dns/promises';
 import { env } from '../../config/env.js';

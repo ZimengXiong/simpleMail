@@ -1,5 +1,5 @@
 import { useState, useMemo, lazy, Suspense, useCallback, useEffect } from 'react';
-import { NavLink, useSearchParams } from 'react-router-dom';
+import { NavLink, useSearchParams, Link } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../services/api';
 import { 
@@ -14,7 +14,9 @@ import {
   AlertOctagon,
   Clock
 } from 'lucide-react';
+import { Github } from 'lucide-react';
 import ProfileSwitcher from './ProfileSwitcher';
+import AppBrand from './AppBrand';
 import type { MailboxInfo } from '../types';
 import {
   reduceInboxState,
@@ -109,6 +111,30 @@ const Sidebar = () => {
   const effectiveConnectorId = routeState?.profile.kind === 'incoming'
     ? routeState.profile.connectorId
     : null;
+  const firstConnectorId = connectors?.[0]?.id ?? null;
+  const firstSendOnlyEmail = sendOnlyProfiles[0]?.emailAddress ?? null;
+  const brandInboxPath = useMemo(() => {
+    if (firstConnectorId) {
+      return toInboxPath({
+        profile: {
+          kind: 'incoming',
+          connectorId: firstConnectorId,
+        },
+        folder: 'INBOX',
+        query: '',
+        page: 1,
+        threadId: null,
+      });
+    }
+    if (firstSendOnlyEmail) {
+      const params = new URLSearchParams();
+      params.set('profile', 'send-only');
+      params.set('sendEmail', firstSendOnlyEmail);
+      params.set('folder', 'OUTBOX');
+      return `/inbox?${params.toString()}`;
+    }
+    return '/inbox';
+  }, [firstConnectorId, firstSendOnlyEmail]);
   const activeFolder = routeState?.folder ?? (isSendOnlyProfile ? 'OUTBOX' : 'INBOX');
   const dispatchToInbox = useCallback((event: InboxStateEvent) => {
     if (!routeState) {
@@ -253,6 +279,20 @@ const Sidebar = () => {
 
   return (
     <div className="flex-1 flex flex-col min-h-0 bg-sidebar border-r border-border font-sans select-none">
+      <div className="px-3 py-2 border-b border-border/60 flex items-center justify-between gap-2">
+        <Link to={brandInboxPath} title="Open first mail inbox" className="inline-flex">
+          <AppBrand variant="compact" />
+        </Link>
+        <a
+          href="https://github.com/ZimengXiong/simpleMail"
+          target="_blank"
+          rel="noopener noreferrer"
+          title="GitHub"
+          className="p-1.5 rounded-md text-text-secondary hover:bg-black/5 dark:hover:bg-white/5 transition-colors"
+        >
+          <Github className="w-4 h-4" />
+        </a>
+      </div>
       <ProfileSwitcher incomingConnectors={connectors || []} sendOnlyProfiles={sendOnlyProfiles} />
 
       <div className="p-3 pt-0 hidden md:block">

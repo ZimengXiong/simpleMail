@@ -7,9 +7,14 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-simplemail}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
     ports:
-      - '5432:5432'
+      - '127.0.0.1:5432:5432'
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-simplemail} -d ${POSTGRES_DB:-simplemail}']
+      interval: 5s
+      timeout: 5s
+      retries: 20
     restart: unless-stopped
 
   seaweed-master:
@@ -41,8 +46,27 @@ services:
       - seaweed-master
       - seaweed-volume
     ports:
-      - '8333:8333'
-      - '8888:8888'
+      - '127.0.0.1:8333:8333'
+      - '127.0.0.1:8888:8888'
+    restart: unless-stopped
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.1
+    container_name: simplemail-keycloak
+    profiles:
+      - dev-oidc
+    command:
+      - start-dev
+      - --http-port=8080
+      - --import-realm
+    environment:
+      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN:-admin}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+    ports:
+      - '127.0.0.1:8080:8080'
+    volumes:
+      - ./deploy/keycloak:/opt/keycloak/data/import:ro
+      - keycloak_data:/opt/keycloak/data
     restart: unless-stopped
 
   api:
@@ -59,7 +83,7 @@ services:
       FRONTEND_BASE_URL: ${FRONTEND_BASE_URL:?FRONTEND_BASE_URL is required}
       OIDC_ISSUER_URL: ${OIDC_ISSUER_URL:?OIDC_ISSUER_URL is required}
       OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:?OIDC_CLIENT_ID is required}
-      OIDC_REQUIRED_EMAIL: ${OIDC_REQUIRED_EMAIL:?OIDC_REQUIRED_EMAIL is required}
+      OIDC_ALLOWED_EMAILS: ${OIDC_ALLOWED_EMAILS:?OIDC_ALLOWED_EMAILS is required}
       OIDC_REQUIRED_SUBJECT: ${OIDC_REQUIRED_SUBJECT:-}
       SEAWEED_S3_ENDPOINT: ${SEAWEED_S3_ENDPOINT:-http://seaweed-filer:8333}
       SEAWEED_REGION: ${SEAWEED_REGION:-us-east-1}
@@ -68,10 +92,32 @@ services:
       SEAWEED_SECRET_ACCESS_KEY: ${SEAWEED_SECRET_ACCESS_KEY:?SEAWEED_SECRET_ACCESS_KEY is required}
       SEAWEED_FORCE_PATH_STYLE: 'true'
     depends_on:
-      - postgres
-      - seaweed-filer
+      postgres:
+        condition: service_healthy
+      seaweed-filer:
+        condition: service_started
+      migrate:
+        condition: service_completed_successfully
+      worker-migrate:
+        condition: service_completed_successfully
     ports:
       - '3000:3000'
+    restart: unless-stopped
+
+  client:
+    build:
+      context: ./client
+      dockerfile: Dockerfile
+    container_name: simplemail-client
+    environment:
+      VITE_OIDC_BASE_URL: ${VITE_OIDC_BASE_URL:?VITE_OIDC_BASE_URL is required}
+      VITE_OIDC_REALM: ${VITE_OIDC_REALM:?VITE_OIDC_REALM is required}
+      VITE_OIDC_CLIENT_ID: ${VITE_OIDC_CLIENT_ID:?VITE_OIDC_CLIENT_ID is required}
+    depends_on:
+      api:
+        condition: service_started
+    ports:
+      - '5173:80'
     restart: unless-stopped
 
   worker:
@@ -90,10 +136,14 @@ services:
       SEAWEED_SECRET_ACCESS_KEY: ${SEAWEED_SECRET_ACCESS_KEY:?SEAWEED_SECRET_ACCESS_KEY is required}
       SEAWEED_FORCE_PATH_STYLE: 'true'
     depends_on:
-      - postgres
-      - seaweed-filer
-      - api
-      - worker-migrate
+      postgres:
+        condition: service_healthy
+      seaweed-filer:
+        condition: service_started
+      api:
+        condition: service_started
+      worker-migrate:
+        condition: service_completed_successfully
     restart: unless-stopped
 
   worker-migrate:
@@ -105,7 +155,8 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
     restart: 'no'
 
   migrate:
@@ -117,7 +168,8 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
     restart: 'no'
 
 volumes:
@@ -125,3 +177,4 @@ volumes:
   seaweed_master_data:
   seaweed_volume_data:
   seaweed_filer_data:
+  keycloak_data:

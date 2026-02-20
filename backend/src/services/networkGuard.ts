@@ -6,6 +6,12 @@ type OutboundHostValidationOptions = {
   context?: string;
 };
 
+export type SafeOutboundTarget = {
+  host: string;
+  address: string;
+  family: 4 | 6;
+};
+
 const IPV4_PRIVATE_RANGES: Array<{ base: number; maskBits: number }> = [
   { base: 0x00000000, maskBits: 8 }, // 0.0.0.0/8
   { base: 0x0a000000, maskBits: 8 }, // 10.0.0.0/8
@@ -199,39 +205,66 @@ const badRequest = (message: string) => {
   return error;
 };
 
-export const assertSafeOutboundHost = async (
+const pickPreferredLookupAddress = (
+  lookupResult: Array<{ address: string; family: number }>,
+) => lookupResult.find((entry) => entry.family === 4) ?? lookupResult[0];
+
+export const resolveSafeOutboundHost = async (
   hostInput: string,
   options: OutboundHostValidationOptions = {},
-) => {
+): Promise<SafeOutboundTarget> => {
   const context = options.context ?? 'host';
   const host = normalizeHost(String(hostInput ?? ''));
   if (!host) {
     throw badRequest(`${context} is required`);
   }
-  if (mustAllowPrivateTargets()) {
-    return;
-  }
-  if (isBlockedHostname(host)) {
-    throw badRequest(`${context} targets a blocked hostname`);
-  }
 
   const directIpFamily = net.isIP(host);
   if (directIpFamily > 0) {
-    if (isPrivateOrReservedIp(host)) {
+    if (!mustAllowPrivateTargets() && isPrivateOrReservedIp(host)) {
       throw badRequest(`${context} targets a private or reserved IP`);
     }
-    return;
+    return {
+      host,
+      address: host,
+      family: directIpFamily as 4 | 6,
+    };
+  }
+
+  if (!mustAllowPrivateTargets() && isBlockedHostname(host)) {
+    throw badRequest(`${context} targets a blocked hostname`);
   }
 
   const lookupResult = await dns.lookup(host, { all: true, verbatim: true }).catch(() => null);
   if (!lookupResult || lookupResult.length === 0) {
     throw badRequest(`${context} could not be resolved`);
   }
-  for (const resolved of lookupResult) {
-    if (isPrivateOrReservedIp(resolved.address)) {
-      throw badRequest(`${context} resolves to a private or reserved IP`);
+
+  if (!mustAllowPrivateTargets()) {
+    for (const resolved of lookupResult) {
+      if (isPrivateOrReservedIp(resolved.address)) {
+        throw badRequest(`${context} resolves to a private or reserved IP`);
+      }
     }
   }
+
+  const selected = pickPreferredLookupAddress(lookupResult);
+  if (!selected || (selected.family !== 4 && selected.family !== 6)) {
+    throw badRequest(`${context} could not be resolved`);
+  }
+
+  return {
+    host,
+    address: selected.address,
+    family: selected.family,
+  };
+};
+
+export const assertSafeOutboundHost = async (
+  hostInput: string,
+  options: OutboundHostValidationOptions = {},
+) => {
+  await resolveSafeOutboundHost(hostInput, options);
 };
 
 export const assertSafePushEndpoint = async (endpointInput: string) => {

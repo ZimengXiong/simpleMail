@@ -339,5 +339,4 @@ export const registerOAuthAuthorizeRoutes = async (app: FastifyInstance) => {
     return { authorizeUrl: url };
   });
 
-  app.get('/api/oauth/google/callback', async (req, reply) => {
 };

@@ -63,9 +63,6 @@ const hasActiveWorkers = async () => {
     if (typeof privateWorkersCount === 'number') {
       active = privateWorkersCount > 0;
     } else {
-      // Some graphile-worker schemas do not expose worker heartbeat tables.
-      // In that case, fall back to recent lock activity; if unavailable, assume
-      // no active workers so sync can run immediately in-process.
       try {
         active = (await countRecentlyLockedJobs()) > 0;
       } catch {
@@ -131,8 +128,6 @@ export const enqueueSyncWithOptions = async (
   options: EnqueueSyncOptions = {},
 ) => {
   const jobKey = `sync:${connectorId}:${mailbox}`;
-  // Best-effort cleanup only; some graphile-worker versions expose `jobs` via a view.
-  // Enqueue must still proceed if this maintenance query is unsupported.
   try {
     await query(
       `DELETE FROM graphile_worker.jobs
@@ -161,10 +156,6 @@ export const enqueueSyncWithOptions = async (
     {
       maxAttempts: 5,
       jobKey,
-      // preserve_run_at: if a running job has this key, schedule a new run
-      // after it completes rather than silently dropping the request.  This
-      // prevents push notifications / IDLE triggers from going missing while
-      // a long sync is in progress.
       jobKeyMode: 'preserve_run_at',
       priority: toJobPriority(options.priority),
     },

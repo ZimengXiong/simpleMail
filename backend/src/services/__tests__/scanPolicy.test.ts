@@ -1,7 +1,3 @@
-/**
- * Unit tests for attachment scan policy decisions.
- * Run with: npx tsx src/services/__tests__/scanPolicy.test.ts
- */
 import assert from 'node:assert/strict';
 import { env } from '../../config/env.js';
 import { getAttachmentScanDecision } from '../scanPolicy.js';

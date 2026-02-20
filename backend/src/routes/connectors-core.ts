@@ -375,7 +375,6 @@ export const registerConnectorCoreRoutes = async (app: FastifyInstance) => {
       try {
         await startIncomingConnectorIdleWatch(userId, result.id, firstMailbox);
       } catch {
-        // best effort: connector creation should not fail if watcher cannot start immediately
       }
     }
 

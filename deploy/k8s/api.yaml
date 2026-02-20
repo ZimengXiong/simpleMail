@@ -36,11 +36,11 @@ spec:
               value: https://auth.yourdomain.tld/realms/simplemail
             - name: OIDC_CLIENT_ID
               value: simplemail-web
-            - name: OIDC_REQUIRED_EMAIL
+            - name: OIDC_ALLOWED_EMAILS
               valueFrom:
                 secretKeyRef:
                   name: simplemail-secrets
-                  key: oidc_required_email
+                  key: oidc_allowed_emails
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:

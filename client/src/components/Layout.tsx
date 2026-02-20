@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { Outlet, NavLink, useLocation } from 'react-router-dom';
+import { Link, NavLink, Outlet, useLocation } from 'react-router-dom';
 import Sidebar from './Sidebar';
 import SyncStatus from './SyncStatus';
 import { useTheme } from '../services/theme';
@@ -7,6 +7,8 @@ import { Settings, Menu, X } from 'lucide-react';
 import { useQuery } from '@tanstack/react-query';
 import { api } from '../services/api';
 import ProfileSwitcher from './ProfileSwitcher';
+import AppBrand from './AppBrand';
+import { toInboxPath } from '../services/inboxStateMachine';
 
 const Layout = () => {
   useTheme();
@@ -61,6 +63,30 @@ const Layout = () => {
     }
     return profiles;
   }, [identities, incomingEmails, outgoingConnectors]);
+  const firstConnectorId = connectors?.[0]?.id ?? null;
+  const firstSendOnlyEmail = sendOnlyProfiles[0]?.emailAddress ?? null;
+  const mobileBrandInboxPath = useMemo(() => {
+    if (firstConnectorId) {
+      return toInboxPath({
+        profile: {
+          kind: 'incoming',
+          connectorId: firstConnectorId,
+        },
+        folder: 'INBOX',
+        query: '',
+        page: 1,
+        threadId: null,
+      });
+    }
+    if (firstSendOnlyEmail) {
+      const params = new URLSearchParams();
+      params.set('profile', 'send-only');
+      params.set('sendEmail', firstSendOnlyEmail);
+      params.set('folder', 'OUTBOX');
+      return `/inbox?${params.toString()}`;
+    }
+    return '/inbox';
+  }, [firstConnectorId, firstSendOnlyEmail]);
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-bg-app selection:bg-accent/10 font-sans relative">
@@ -116,8 +142,14 @@ const Layout = () => {
           >
             <Menu className="w-5 h-5" />
           </button>
-          
+
           <div className="flex-1 min-w-0 ml-2">
+            <Link to={mobileBrandInboxPath} className="inline-flex">
+              <AppBrand variant="compact" />
+            </Link>
+          </div>
+
+          <div className="ml-2">
             <ProfileSwitcher 
               incomingConnectors={connectors || []} 
               sendOnlyProfiles={sendOnlyProfiles}

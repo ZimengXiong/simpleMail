@@ -643,7 +643,7 @@ const InboxView = () => {
   }
 
   if (!isSendOnlyMode && !connectors?.length) {
-    return <EmptyState icon={LayoutPanelLeft} title="Welcome to simpleMail" description="Connect an account to get started." actionText="Add account" actionPath="/settings/connectors/new?type=incoming" />;
+    return <EmptyState icon={LayoutPanelLeft} title="Welcome to SimpleMail" description="Connect an account to get started." actionText="Add account" actionPath="/settings/connectors/new?type=incoming" />;
   }
 
   const bulkToolbar = (

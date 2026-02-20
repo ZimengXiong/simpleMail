@@ -7,6 +7,13 @@ import {
   parseTrimmedStringArrayWithCap,
   assertUuidList,
   listThreadMessages,
+  normalizeMailboxInput,
+  isArchiveMoveTarget,
+  applyThreadMessageActions,
+  setMessageReadState,
+  setMessageStarredState,
+  moveMessageInMailbox,
+  deleteMessageFromMailbox,
   clearSearchCachesForUser,
 } from './messages-context.js';
 
@@ -105,7 +112,6 @@ export const registerMessageDetailRoutes = async (app: FastifyInstance) => {
     return reply.send(blob.stream);
   });
 
-  // Bulk-update multiple messages in a single request.
   app.post('/api/messages/bulk', async (req, reply) => {
     const userId = getUserId(req);
     const body = req.body as any;

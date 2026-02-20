@@ -1,8 +1,17 @@
 import Keycloak from 'keycloak-js';
 import { api } from './api';
 
+type RuntimeConfig = Partial<Record<'VITE_OIDC_BASE_URL' | 'VITE_OIDC_REALM' | 'VITE_OIDC_CLIENT_ID', string>>;
+
+declare global {
+  interface Window {
+    __SIMPLEMAIL_CONFIG__?: RuntimeConfig;
+  }
+}
+
 const readEnv = (key: string, fallback: string): string => {
-  const value = (import.meta.env[key] as string | undefined)?.trim();
+  const runtimeValue = window.__SIMPLEMAIL_CONFIG__?.[key as keyof RuntimeConfig];
+  const value = (runtimeValue ?? (import.meta.env[key] as string | undefined))?.trim();
   return value && value.length > 0 ? value : fallback;
 };
 
@@ -16,6 +25,7 @@ const keycloak = new Keycloak({
   realm: readEnv('VITE_OIDC_REALM', 'simplemail'),
   clientId: readEnv('VITE_OIDC_CLIENT_ID', 'simplemail-web'),
 });
+const AUTO_LOGIN_DISABLED_KEY = 'simplemail:oidc:auto-login-disabled';
 
 let initialized = false;
 let initializePromise: Promise<void> | null = null;
@@ -57,8 +67,9 @@ export const initOidcAuth = async () => {
   }
 
   initializePromise = (async () => {
+    const autoLoginDisabled = window.sessionStorage.getItem(AUTO_LOGIN_DISABLED_KEY) === '1';
     const authenticated = await keycloak.init({
-      onLoad: 'check-sso',
+      onLoad: autoLoginDisabled ? undefined : 'check-sso',
       pkceMethod: 'S256',
       checkLoginIframe: false,
     });
@@ -76,6 +87,16 @@ export const initOidcAuth = async () => {
 };
 
 export const startOidcLogin = async (redirectUri?: string) => {
+  window.sessionStorage.removeItem(AUTO_LOGIN_DISABLED_KEY);
   const target = String(redirectUri || '').trim();
   await keycloak.login({ redirectUri: target || window.location.href });
+};
+
+export const logoutOidc = async () => {
+  window.sessionStorage.setItem(AUTO_LOGIN_DISABLED_KEY, '1');
+  try {
+    keycloak.clearToken();
+  } catch {
+  }
+  api.auth.logout();
 };

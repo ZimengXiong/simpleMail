@@ -104,9 +104,6 @@ const assignThreadIdForLogicalMessage = async (
     return;
   }
 
-  // Scope guard: only propagate thread_id to siblings that share the same
-  // normalized subject (or have no subject yet).  This prevents Message-ID
-  // collisions from two genuinely different conversations from merging.
   let subjectGuard = '';
   if (normalizedSubjectHint) {
     values.push(normalizedSubjectHint);
@@ -192,8 +189,6 @@ export const computeThreadForMessage = async (message: {
       .map((value) => value.trim())
       .filter(Boolean);
 
-    // Collect all variants for all references in one go, then do a single
-    // batched ANY() query instead of N sequential per-reference queries.
     const allRefVariants = refs.flatMap((ref) => messageIdVariants(ref));
     if (allRefVariants.length > 0) {
       const referencesMatch = await query<{ thread_id: string; message_id: string; received_at: string }>(
@@ -208,8 +203,6 @@ export const computeThreadForMessage = async (message: {
       );
 
       if (referencesMatch.rows.length > 0) {
-        // Prefer the most direct parent: iterate refs from last to first and
-        // pick the first ref that has a matching row.
         let threadId: string | null = null;
         for (let refIdx = refs.length - 1; refIdx >= 0 && !threadId; refIdx--) {
           const variants = new Set(messageIdVariants(refs[refIdx]));
@@ -251,10 +244,6 @@ export const computeThreadForMessage = async (message: {
     return fallbackThreadId;
   }
 
-  // Subject-based fallback: tighter 7-day window, require participant
-  // overlap (current sender in candidate's to/cc, or vice versa) rather
-  // than just same-sender.  This prevents unrelated emails with the same
-  // subject from merging into a single thread.
   const candidateThreads = await query<{
     thread_id: string;
     from_header: string | null;
@@ -288,8 +277,6 @@ export const computeThreadForMessage = async (message: {
     const candidateTo = extractEmails(candidate.to_header);
     const candidateAllParticipants = new Set([...candidateFrom, ...candidateTo]);
 
-    // Require at least one participant overlap between the two messages.
-    // This catches both reply directions: A→B then B→A.
     let hasOverlap = false;
     for (const participant of currentAllParticipants) {
       if (candidateAllParticipants.has(participant)) {

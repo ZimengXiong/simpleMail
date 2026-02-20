@@ -22,6 +22,7 @@ import {
   MAX_SEND_ATTACHMENT_BYTES,
   MAX_SEND_TOTAL_ATTACHMENT_BYTES,
   MAX_SEND_HEADER_CHARS,
+  MAX_LABEL_MUTATION_ITEMS,
   normalizeSendIdempotencyKey,
   getIdentity,
   estimateBase64PayloadBytes,

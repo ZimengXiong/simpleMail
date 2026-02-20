@@ -1,8 +1,3 @@
-/**
- * Pure utility functions used by the threading system.
- * Extracted from threading.ts so they can be unit-tested without a DB.
- */
-
 export const GENERIC_SUBJECTS = new Set([
   'hi',
   'hello',

@@ -6,4 +6,4 @@ export {
   deleteMessageFromMailbox,
   applyThreadMessageActions,
   listConnectorMailboxes,
-} from '../imap/imapService.monolith.js';
+} from '../imapService.monolith.js';

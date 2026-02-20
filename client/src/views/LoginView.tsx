@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
-import { Loader2, ShieldCheck } from 'lucide-react';
 import { startOidcLogin } from '../services/oidc';
 import { api, getAuthToken } from '../services/api';
 import { resolveSafeNextPath, toAbsoluteAppUrl } from '../services/authRedirect';
+import AppBrand from '../components/AppBrand';
 
 const LoginView = () => {
   const navigate = useNavigate();
@@ -14,6 +14,8 @@ const LoginView = () => {
     return value || '';
   }, [searchParams]);
   const [error, setError] = useState(initialError);
+  const [isVerifying, setIsVerifying] = useState(false);
+
   const nextFromState = useMemo(() => {
     const state = (location.state as { from?: { pathname?: string; search?: string; hash?: string } } | null) ?? null;
     const from = state?.from;
@@ -68,10 +70,12 @@ const LoginView = () => {
         cancelled = true;
       };
     }
+    setIsVerifying(true);
     void verifyBackendSession().then(({ ok, message }) => {
       if (cancelled) {
         return;
       }
+      setIsVerifying(false);
       if (ok) {
         navigate(nextPath, { replace: true });
         return;
@@ -86,38 +90,38 @@ const LoginView = () => {
 
   return (
     <div className="min-h-screen w-full bg-bg-app flex items-center justify-center p-4">
-      <div className="w-full max-w-md card shadow-sm border-border p-8 bg-bg-card text-center">
-        <div className="w-14 h-14 bg-accent rounded-2xl flex items-center justify-center mx-auto mb-4 shadow-lg shadow-accent/20">
-          <ShieldCheck className="w-7 h-7" style={{ color: 'var(--accent-contrast)' }} />
+      <div className="w-full max-w-[360px] p-10 border border-border bg-bg-card text-center shadow-xs">
+        <div className="mb-6">
+          <AppBrand className="justify-center" />
         </div>
-        <h1 className="text-xl font-bold text-text-primary tracking-tight">Sign in with OIDC</h1>
-        <p className="text-sm text-text-secondary mt-2">
-          Click below to continue to your identity provider.
-        </p>
+        <h1 className="text-lg font-bold text-text-primary mb-8">Sign in to SimpleMail with OIDC</h1>
 
-        <div className="mt-5 flex items-center justify-center gap-2 text-xs text-text-secondary">
-          <Loader2 className="w-4 h-4" />
-          Waiting for sign-in
-        </div>
-
-        {error ? (
-          <div className="mt-6 p-3 bg-red-50 border border-red-100 rounded-md text-red-600 text-xs font-medium">
-            {error}
+        {isVerifying ? (
+          <div className="text-xs text-text-secondary py-4">
+            Verifying session...
           </div>
-        ) : null}
+        ) : (
+          <>
+            {error ? (
+              <div className="mb-6 p-3 bg-red-50 border border-red-100 text-red-600 text-xs text-left">
+                {error}
+              </div>
+            ) : null}
 
-        <button
-          type="button"
-          onClick={() => {
-            setError('');
-            void startLogin().catch(() => {
-              setError('Could not start OIDC sign-in. Verify Keycloak is running and try again.');
-            });
-          }}
-          className="w-full mt-6 btn btn-primary py-2.5 font-bold"
-        >
-          Sign In with OIDC
-        </button>
+            <button
+              type="button"
+              onClick={() => {
+                setError('');
+                void startLogin().catch(() => {
+                  setError('Could not start OIDC sign-in. Verify Keycloak is running and try again.');
+                });
+              }}
+              className="w-full btn btn-primary py-2 font-bold"
+            >
+              Sign In
+            </button>
+          </>
+        )}
       </div>
     </div>
   );

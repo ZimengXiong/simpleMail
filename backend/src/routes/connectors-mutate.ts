@@ -328,4 +328,73 @@ export const registerConnectorMutatingRoutes = async (app: FastifyInstance) => {
   });
 
   app.patch('/api/connectors/outgoing/:connectorId', async (req, reply) => {
+    const userId = getUserId(req);
+    const connectorId = String((req.params as any).connectorId);
+    const body = req.body as any;
+
+    if (!body || typeof body !== 'object') {
+      return reply.code(400).send({ error: 'request body required' });
+    }
+    if (body.authConfig !== undefined && body.authConfig !== null && !isPlainObject(body.authConfig)) {
+      return reply.code(400).send({ error: 'authConfig must be an object' });
+    }
+
+    let normalizedFromAddress: string | undefined;
+    try {
+      if (body.fromAddress !== undefined) {
+        normalizedFromAddress = normalizeSingleEmailAddress(body.fromAddress, 'fromAddress');
+      }
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : 'invalid fromAddress' });
+    }
+
+    const existing = await getOutgoingConnector(userId, connectorId);
+    if (!existing) {
+      return reply.code(404).send({ error: 'connector not found' });
+    }
+
+    let parsedPort: number | null | undefined;
+    let normalizedTlsMode: 'ssl' | 'starttls' | 'none' | undefined;
+    try {
+      parsedPort = body.port === undefined
+        ? undefined
+        : (body.port === null || body.port === '' ? null : parseOptionalPort(body.port, 'outgoing connector port') ?? null);
+      normalizedTlsMode = body.tlsMode
+        ? normalizeTlsMode(body.tlsMode, 'tlsMode')
+        : existing.tlsMode ?? existing.tls_mode;
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : 'invalid outgoing connector config' });
+    }
+    if (normalizedTlsMode === 'none' && !insecureMailTransportAllowed) {
+      return reply.code(400).send({ error: 'unencrypted SMTP is disabled on this server' });
+    }
+
+    const mergedAuthConfig = body.authConfig !== undefined
+      ? body.authConfig
+      : (existing.authConfig ?? existing.auth_config ?? {});
+    const mergedAuthType = mergedAuthConfig?.authType ?? 'password';
+    if (String(mergedAuthType).toLowerCase() === 'oauth2' && String(existing.provider ?? '').toLowerCase() !== 'gmail') {
+      return reply.code(400).send({ error: 'oauth2 is only supported for provider=gmail for outgoing connectors' });
+    }
+    const mergedHost = body.host !== undefined ? body.host : (existing.host ?? null);
+    if (mergedHost !== undefined && mergedHost !== null && String(mergedHost).trim()) {
+      await assertSafeOutboundHost(String(mergedHost), { context: 'outgoing connector host' });
+    }
+
+    await updateOutgoingConnector(userId, connectorId, {
+      name: body.name,
+      fromAddress: normalizedFromAddress ?? body.fromAddress,
+      host: body.host,
+      port: parsedPort,
+      tlsMode: normalizedTlsMode,
+      authConfig: body.authConfig,
+      fromEnvelopeDefaults: body.fromEnvelopeDefaults,
+      sentCopyBehavior: body.sentCopyBehavior,
+    });
+    const updated = await getOutgoingConnector(userId, connectorId);
+    if (!updated) {
+      return reply.code(404).send({ error: 'connector not found' });
+    }
+    return sanitizeConnectorForResponse(updated);
+  });
 };
