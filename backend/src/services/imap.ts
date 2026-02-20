@@ -16,115 +16,21 @@ import {
   syncSystemLabelsForMessage,
 } from './labels.js';
 import { assertSafeOutboundHost } from './networkGuard.js';
-
-const getConnectorAuth = (connector: any) => connector?.auth_config ?? {};
-
-const isGmailImapConnector = (connector: any): boolean => {
-  if (!connector) {
-    return false;
-  }
-  if (connector.provider === 'gmail') {
-    return true;
-  }
-  return (
-    connector.provider === 'imap' &&
-    Boolean(
-      connector.sync_settings?.gmailImap ||
-      connector.syncSettings?.gmailImap,
-    )
-  );
-};
-
-const MAX_MAILBOX_PATH_CHARS = 512;
-const MAX_WATCH_MAILBOXES = 32;
-const MAX_WATCH_MAILBOX_SANITIZE_SCAN_ITEMS = MAX_WATCH_MAILBOXES * 8;
-const MAILBOX_CONTROL_CHAR_PATTERN = /[\u0000-\u001F\u007F]/;
-
-const normalizeWatchMailboxInput = (value: unknown): string => {
-  const normalized = String(value ?? '').trim();
-  if (!normalized) {
-    throw new Error('mailbox is required');
-  }
-  if (normalized.length > MAX_MAILBOX_PATH_CHARS) {
-    throw new Error(`mailbox exceeds ${MAX_MAILBOX_PATH_CHARS} characters`);
-  }
-  if (MAILBOX_CONTROL_CHAR_PATTERN.test(normalized)) {
-    throw new Error('mailbox contains invalid control characters');
-  }
-  return normalized;
-};
-
-const sanitizeConfiguredWatchMailboxes = (
-  value: unknown,
-  isGmailLike: boolean,
-): string[] => {
-  const entries = Array.isArray(value) ? value : [];
-  const normalized: string[] = [];
-  const dedupe = new Set<string>();
-  const scanLimit = Math.min(entries.length, MAX_WATCH_MAILBOX_SANITIZE_SCAN_ITEMS);
-  for (let index = 0; index < scanLimit && normalized.length < MAX_WATCH_MAILBOXES; index += 1) {
-    let mailbox: string;
-    try {
-      mailbox = normalizeWatchMailboxInput(entries[index]);
-    } catch {
-      continue;
-    }
-    const canonicalMailbox = isGmailLike
-      ? normalizeGmailMailboxPath(mailbox)
-      : mailbox;
-    if (dedupe.has(canonicalMailbox)) {
-      continue;
-    }
-    dedupe.add(canonicalMailbox);
-    normalized.push(canonicalMailbox);
-  }
-  return normalized;
-};
-
-type SyncMailboxStatus = 'idle' | 'queued' | 'syncing' | 'cancel_requested' | 'cancelled' | 'completed' | 'error';
-
-type SyncProgressSnapshot = {
-  inserted: number;
-  updated: number;
-  reconciledRemoved: number;
-  metadataRefreshed: number;
-};
-
-type SyncStatePatch = {
-  status?: SyncMailboxStatus | null;
-  syncStartedAt?: string | Date | null;
-  syncCompletedAt?: string | Date | null;
-  syncError?: string | null;
-  syncProgress?: SyncProgressSnapshot | Record<string, any> | null;
-  lastSeenUid?: number | null;
-  highestUid?: number | null;
-  lastFullReconcileAt?: string | Date | null;
-  mailboxUidValidity?: string | null;
-  modseq?: string | null;
-};
-
-const normalizeSyncProgress = (progress: SyncProgressSnapshot | Record<string, any> | null | undefined) =>
-  progress && typeof progress === 'object' ? progress : {};
-
-let syncStateColumnCache: Set<string> | null = null;
-
-const getSyncStateColumns = async () => {
-  if (syncStateColumnCache) {
-    return syncStateColumnCache;
-  }
-
-  const result = await query<{ column_name: string }>(`
-    SELECT column_name
-    FROM information_schema.columns
-    WHERE table_schema = 'public'
-      AND table_name = 'sync_states'
-  `);
-
-  syncStateColumnCache = new Set(
-    result.rows.map((row) => row.column_name.toLowerCase()),
-  );
-  return syncStateColumnCache;
-};
+import {
+  getConnectorAuth,
+  getSyncStateColumns,
+  isGmailImapConnector,
+  normalizeSyncProgress,
+  normalizeWatchMailboxInput,
+  normalizeWatchMailboxList,
+  SyncMailboxStatus,
+  SyncProgressSnapshot,
+  SyncStatePatch,
+  toBigInt,
+  toNumberUid,
+  toNumberUidList,
+  chunkArray,
+} from './imap/utils.js';
 
 export const setSyncState = async (
   connectorId: string,
@@ -210,67 +116,6 @@ export const setSyncState = async (
   );
 };
 
-const toBigInt = (value: any): bigint | null => {
-  if (value === null || value === undefined || value === '') {
-    return null;
-  }
-  if (typeof value === 'bigint') {
-    return value;
-  }
-  if (typeof value === 'number') {
-    return BigInt(value);
-  }
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed)) {
-    return null;
-  }
-  return BigInt(parsed);
-};
-
-const toNumber = (value: unknown): number | null => {
-  if (value === null || value === undefined || value === '') {
-    return null;
-  }
-  if (typeof value === 'number') {
-    return Number.isFinite(value) ? value : null;
-  }
-  if (typeof value === 'bigint') {
-    if (value < 0n || value > BigInt(Number.MAX_SAFE_INTEGER)) {
-      return null;
-    }
-    return Number(value);
-  }
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed) || parsed < 0) {
-    return null;
-  }
-  return parsed;
-};
-
-const toNumberUid = (value: unknown): number | null => {
-  const numeric = toNumber(value);
-  if (numeric === null) {
-    return null;
-  }
-  return Number.isInteger(numeric) ? numeric : Math.trunc(numeric);
-};
-
-const toNumberUidList = (uids: Array<bigint | number | string>): number[] =>
-  uids
-    .map((uid) => toNumberUid(uid))
-    .filter((uid): uid is number => uid !== null);
-
-const chunkArray = <T>(values: T[], chunkSize: number): T[][] => {
-  if (values.length === 0) {
-    return [];
-  }
-  const size = Number.isFinite(chunkSize) && chunkSize > 0 ? Math.floor(chunkSize) : values.length;
-  const chunks: T[][] = [];
-  for (let index = 0; index < values.length; index += size) {
-    chunks.push(values.slice(index, index + size));
-  }
-  return chunks;
-};
 
 export const ensureIncomingConnectorState = async (connectorId: string, mailbox: string) => {
   await query(
@@ -1217,10 +1062,10 @@ const tryClaimMailboxSync = async (
 
 const fetchUidsInRange = async (client: ImapFlow, range: string) => {
   const uids = await client.search({ uid: range }, { uid: true });
-  if (uids === false || uids.length === 0) {
+  if (!Array.isArray(uids) || uids.length === 0) {
     return [];
   }
-  return Array.from(new Set(toNumberUidList(uids))).sort((left, right) => left - right);
+  return Array.from(new Set(toNumberUidList(uids as Array<bigint | number | string>))).sort((left: number, right: number) => left - right);
 };
 
 const reconcileMailboxState = async (connectorId: string, mailbox: string, seenUids: number[]) => {
@@ -3697,9 +3542,14 @@ export const resumeConfiguredIdleWatches = async () => {
 
   let resumed = 0;
   for (const connector of connectors.rows) {
-    const watchMailboxes = sanitizeConfiguredWatchMailboxes(
+    const watchMailboxes = normalizeWatchMailboxList(
       connector.sync_settings?.watchMailboxes,
-      isGmailImapConnector(connector),
+      {
+        isGmailLike: isGmailImapConnector(connector),
+        mailboxNormalizer: isGmailImapConnector(connector)
+          ? normalizeGmailMailboxPath
+          : (value: string) => value,
+      },
     );
     for (const mailbox of watchMailboxes) {
       try {
