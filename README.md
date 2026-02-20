@@ -25,22 +25,12 @@ Set these values:
 - `VITE_OIDC_ISSUER_URL`
 - `VITE_OIDC_CLIENT_ID`
 
-No internal infrastructure variables are required for first boot. Seaweed and other internal defaults are prewired.
-
-Image settings are already defaulted to Docker Hub:
-
-- `SIMPLEMAIL_BACKEND_REPOSITORY=docker.io/zimengxiong/simplemail-backend`
-- `SIMPLEMAIL_CLIENT_REPOSITORY=docker.io/zimengxiong/simplemail-client`
-- `SIMPLEMAIL_VERSION=latest` (or pin to a release like `v1.2.3`)
-
 ### 3. Start the stack
 
 ```bash
 docker compose pull
 docker compose up -d
 ```
-
-That is the full deployment flow.
 
 ### 4. Verify
 
