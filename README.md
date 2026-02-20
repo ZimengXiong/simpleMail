@@ -4,11 +4,13 @@
 
 simpleMail is a self-hosted mail app stack (UI + API + worker). It is intentionally a simple email system focused on core workflows. Built with Fastify, Graphile Worker for background jobs, and PostgreS and SeaweedFS for storage.
 
+![](readme-assets/screenshot.png)
+
 ## Features
 
 What it supports now:
 
-- Gmail connector support
+- Gmail connector support w/ pub sub
 - Generic IMAP/SMTP connector support
 - Basic mailbox sync, threading, reading, composing, sending, starring, and replying
 
@@ -157,3 +159,9 @@ Where to find key config docs:
 - CI/release pipeline: `.github/workflows/release.yml`
 
 </details>
+
+## Screenshots
+
+![](readme-assets/threading.png)
+![](readme-assets/settings.png)
+![](readme-assets/appearance.png)
