@@ -39,16 +39,20 @@ Set these values:
 - `VITE_OIDC_BASE_URL`
 - `VITE_OIDC_REALM`
 - `VITE_OIDC_CLIENT_ID`
+- `SIMPLEMAIL_BACKEND_REPOSITORY` (default `docker.io/zimengxiong/simplemail-backend`)
+- `SIMPLEMAIL_CLIENT_REPOSITORY` (default `docker.io/zimengxiong/simplemail-client`)
 
 Default single-host Docker values can stay as-is:
 
 - `POSTGRES_PASSWORD`
 - `DATABASE_URL`
+- `SIMPLEMAIL_VERSION` (`latest` or a pinned release like `1.2.3`)
 
 ### 3. Start stack
 
 ```bash
-docker compose up -d --build
+docker compose pull
+docker compose up -d
 ```
 
 ### 4. OIDC provider setup
@@ -228,5 +232,32 @@ scripts/dev.sh attach
 scripts/dev.sh restart
 scripts/dev.sh stop
 ```
+
+### 8. Maintainer release flow
+
+This repository ships images from GitHub Actions on version tags.
+
+Prerequisites:
+
+- Repo secrets: `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`
+- Optional repo vars:
+  - `DOCKERHUB_NAMESPACE` (defaults to repository owner)
+  - `DOCKERHUB_BACKEND_IMAGE` (defaults to `simplemail-backend`)
+  - `DOCKERHUB_CLIENT_IMAGE` (defaults to `simplemail-client`)
+
+Create a release:
+
+```bash
+scripts/release.sh
+```
+
+The script asks for `patch/minor/major`, bumps backend/client versions, commits, tags (`vX.Y.Z`), and pushes.
+
+On tag push, GitHub Actions:
+
+- runs backend/client verification
+- builds multi-arch Docker images with Buildx (`linux/amd64`, `linux/arm64`)
+- pushes image tags (`X.Y.Z`, `X.Y`, `X`, `sha-*`, and `latest` for stable tags)
+- creates the GitHub Release with generated notes
 
 </details>

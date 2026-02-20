@@ -70,9 +70,7 @@ services:
     restart: unless-stopped
 
   api:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
+    image: ${SIMPLEMAIL_BACKEND_REPOSITORY:?SIMPLEMAIL_BACKEND_REPOSITORY is required}:${SIMPLEMAIL_VERSION:-latest}
     container_name: simplemail-api
     environment:
       DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
@@ -105,9 +103,7 @@ services:
     restart: unless-stopped
 
   client:
-    build:
-      context: ./client
-      dockerfile: Dockerfile
+    image: ${SIMPLEMAIL_CLIENT_REPOSITORY:?SIMPLEMAIL_CLIENT_REPOSITORY is required}:${SIMPLEMAIL_VERSION:-latest}
     container_name: simplemail-client
     environment:
       VITE_OIDC_BASE_URL: ${VITE_OIDC_BASE_URL:?VITE_OIDC_BASE_URL is required}
@@ -121,9 +117,7 @@ services:
     restart: unless-stopped
 
   worker:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
+    image: ${SIMPLEMAIL_BACKEND_REPOSITORY:?SIMPLEMAIL_BACKEND_REPOSITORY is required}:${SIMPLEMAIL_VERSION:-latest}
     container_name: simplemail-worker
     command: ["node", "dist/worker/run.js"]
     environment:
@@ -147,9 +141,7 @@ services:
     restart: unless-stopped
 
   worker-migrate:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
+    image: ${SIMPLEMAIL_BACKEND_REPOSITORY:?SIMPLEMAIL_BACKEND_REPOSITORY is required}:${SIMPLEMAIL_VERSION:-latest}
     container_name: simplemail-worker-migrate
     command: ["node", "dist/worker/migrate.js"]
     environment:
@@ -160,9 +152,7 @@ services:
     restart: 'no'
 
   migrate:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
+    image: ${SIMPLEMAIL_BACKEND_REPOSITORY:?SIMPLEMAIL_BACKEND_REPOSITORY is required}:${SIMPLEMAIL_VERSION:-latest}
     container_name: simplemail-migrate
     command: ["node", "dist/scripts/migrate.js"]
     environment:

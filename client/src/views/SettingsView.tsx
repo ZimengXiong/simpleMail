@@ -17,7 +17,8 @@ import {
   Sun,
   Palette,
   ShieldCheck,
-  LogOut
+  LogOut,
+  Info
 } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import EmptyState from '../components/EmptyState';
@@ -39,7 +40,7 @@ const persistLayoutModePreference = (mode: 'columns' | 'list') => {
 const SettingsView = () => {
   const queryClient = useQueryClient();
   const { theme, setTheme, accentColor, setAccentColor } = useTheme();
-  const [activeTab, setActiveTab] = useState<'accounts' | 'identities' | 'appearance'>('accounts');
+  const [activeTab, setActiveTab] = useState<'accounts' | 'identities' | 'appearance' | 'advanced'>('accounts');
   const [isIdentityModalOpen, setIsIdentityModalOpen] = useState(false);
   const [editingIdentity, setEditingIdentity] = useState<IdentityRecord | null>(null);
   const [gmailPushErrors, setGmailPushErrors] = useState<Record<string, string>>({});
@@ -151,6 +152,7 @@ const SettingsView = () => {
     { name: 'Rose', value: '#e11d48' },
     { name: 'Amber', value: '#f59e0b' },
   ];
+  const appVersion = __APP_VERSION__;
 
   return (
     <div className="flex-1 flex flex-col h-full bg-bg-app overflow-y-auto">
@@ -160,13 +162,13 @@ const SettingsView = () => {
 
       <div className="max-w-4xl mx-auto w-full p-4 md:p-8 pb-32">
         <div className="flex gap-1 mb-6 md:mb-8 overflow-x-auto pb-2 scrollbar-hide">
-          {(['accounts', 'identities', 'appearance'] as const).map((tab) => (
+          {(['accounts', 'identities', 'appearance', 'advanced'] as const).map((tab) => (
             <button
               key={tab}
               onClick={() => setActiveTab(tab)}
               className={`px-3 py-1.5 rounded-md text-xs font-medium transition-colors capitalize whitespace-nowrap ${activeTab === tab ? 'bg-black/5 dark:bg-white/10 text-text-primary' : 'text-text-secondary hover:bg-black/5 dark:hover:bg-white/5'}`}
             >
-              {tab === 'accounts' ? 'Accounts & Connectors' : tab}
+              {tab === 'accounts' ? 'Accounts & Connectors' : tab === 'advanced' ? 'Advanced' : tab}
             </button>
           ))}
         </div>
@@ -472,6 +474,31 @@ const SettingsView = () => {
                     ))}
                   </div>
                 )}
+              </div>
+            )}
+
+            {activeTab === 'advanced' && (
+              <div className="space-y-10 md:space-y-12 animate-in fade-in duration-300">
+                <section>
+                  <h2 className="text-base font-semibold text-text-primary mb-4 border-b border-border pb-2 flex items-center gap-2">
+                    <Info className="w-4 h-4 text-accent" />
+                    About
+                  </h2>
+                  <div className="rounded-md border border-border bg-bg-card p-4">
+                    <p className="text-size-xs text-text-secondary">Version</p>
+                    <p className="text-size-sm font-semibold text-text-primary mt-1 font-mono">
+                      {appVersion}
+                    </p>
+                    <a
+                      href="https://github.com/ZimengXiong/simpleMail"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex mt-3 text-size-xs text-accent hover:underline"
+                    >
+                      View source on GitHub
+                    </a>
+                  </div>
+                </section>
               </div>
             )}
 
