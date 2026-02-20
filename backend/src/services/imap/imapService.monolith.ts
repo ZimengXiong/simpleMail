@@ -238,7 +238,8 @@ type IdleWatch = {
 };
 
 const activeIdleWatchers = new Map<string, IdleWatch>();
-const scheduledMailboxSyncRetries = new Map<string, NodeJS.Timeout>();
+const scheduledMailboxSyncRetries = new Map<string, { timer: NodeJS.Timeout; runAtMs: number }>();
+const gmailRateLimitCooldownUntil = new Map<string, number>();
 const MAILBOX_SYNC_RETRY_DELAY_MS = 5_000;
 const IMAP_TIMEOUT_SENTINEL = 'IMAP_OPERATION_TIMEOUT';
 const SYNC_CANCELLED_SENTINEL = 'SYNC_CANCELLED';
@@ -2940,8 +2941,10 @@ const runMailboxSync = async (connector: any, mailbox: string, options: GetImapC
 };
 
 const syncMailbox = async (connector: any, mailbox: string, options: GetImapClientOptions = {}) => {
+  const cooldownKey = createWatcherKey(String(connector.id), mailbox);
   try {
     const progress = await runMailboxSync(connector, mailbox, options);
+    gmailRateLimitCooldownUntil.delete(cooldownKey);
     await setSyncState(connector.id, mailbox, {
       status: 'completed',
       syncCompletedAt: new Date(),
@@ -2975,6 +2978,36 @@ const syncMailbox = async (connector: any, mailbox: string, options: GetImapClie
         syncProgress: snapshotProgress,
       });
       await emitSyncEvent(connector.id, 'sync_cancelled', { mailbox, progress: snapshotProgress });
+      return snapshotProgress;
+    }
+
+    const retryAtMs = extractGmailRateLimitRetryAtMs(error);
+    if (retryAtMs !== null) {
+      const retryDelayMs = Math.max(MAILBOX_SYNC_RETRY_DELAY_MS, retryAtMs - Date.now());
+      const cooldownUntilMs = Date.now() + retryDelayMs;
+      const retryAtIso = new Date(cooldownUntilMs).toISOString();
+      gmailRateLimitCooldownUntil.set(cooldownKey, cooldownUntilMs);
+      const snapshot = await getMailboxState(connector.id, mailbox).catch(() => null);
+      const snapshotProgress = snapshot?.syncProgress ?? {
+        inserted: 0,
+        updated: 0,
+        reconciledRemoved: 0,
+        metadataRefreshed: 0,
+      };
+      await setSyncState(connector.id, mailbox, {
+        status: 'queued',
+        syncStartedAt: new Date(),
+        syncCompletedAt: null,
+        syncError: `Gmail API rate limit reached. Auto-retrying at ${retryAtIso}.`,
+        syncProgress: snapshotProgress,
+      });
+      await emitSyncEvent(connector.id, 'sync_info', {
+        mailbox,
+        phase: 'gmail-rate-limit-backoff',
+        retryAt: retryAtIso,
+        retryDelayMs,
+      }).catch(() => undefined);
+      scheduleMailboxSyncRetry(String(connector.user_id ?? ''), String(connector.id), mailbox, error, retryDelayMs);
       return snapshotProgress;
     }
 
@@ -3028,8 +3061,22 @@ export const syncIncomingConnector = async (
   const normalizedMailbox = isGmailImapConnector(connector)
     ? normalizeGmailMailboxPath(mailbox)
     : mailbox;
-  await ensureSystemLabelsForUser(userId);
   await ensureIncomingConnectorState(connectorId, normalizedMailbox);
+  const rateLimitCooldownKey = createWatcherKey(connectorId, normalizedMailbox);
+  const rateLimitCooldownUntil = gmailRateLimitCooldownUntil.get(rateLimitCooldownKey) ?? 0;
+  if (rateLimitCooldownUntil > Date.now()) {
+    await setSyncState(connectorId, normalizedMailbox, {
+      status: 'queued',
+      syncStartedAt: new Date(),
+      syncCompletedAt: null,
+      syncError: `Gmail API rate limit reached. Auto-retrying at ${new Date(rateLimitCooldownUntil).toISOString()}.`,
+    });
+    return;
+  }
+  if (rateLimitCooldownUntil > 0) {
+    gmailRateLimitCooldownUntil.delete(rateLimitCooldownKey);
+  }
+  await ensureSystemLabelsForUser(userId);
   await syncMailbox(connector, normalizedMailbox, options);
 };
 
@@ -3120,6 +3167,21 @@ export const requestSyncCancellation = async (
 
 const createWatcherKey = (connectorId: string, mailbox: string) => `${connectorId}:${mailbox}`;
 
+const extractGmailRateLimitRetryAtMs = (error: unknown) => {
+  const message = String(error ?? '');
+  if (!/429|resource_exhausted|rate.?limit/i.test(message)) {
+    return null;
+  }
+  const retryAfterMatch = message.match(/retry after ([0-9]{4}-[0-9]{2}-[0-9]{2}T[^"'\s,}]+)/i);
+  if (retryAfterMatch?.[1]) {
+    const parsed = Date.parse(retryAfterMatch[1]);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+  return Date.now() + 60_000;
+};
+
 const shouldScheduleMailboxRetry = (error: unknown) => {
   const message = String(error ?? '').toLowerCase();
   if (!message) {
@@ -3137,23 +3199,41 @@ const shouldScheduleMailboxRetry = (error: unknown) => {
   return true;
 };
 
-const scheduleMailboxSyncRetry = (userId: string, connectorId: string, mailbox: string, error: unknown) => {
+const scheduleMailboxSyncRetry = (
+  userId: string,
+  connectorId: string,
+  mailbox: string,
+  error: unknown,
+  delayMs = MAILBOX_SYNC_RETRY_DELAY_MS,
+) => {
   const normalizedUserId = String(userId ?? '').trim();
   if (!normalizedUserId || !shouldScheduleMailboxRetry(error)) {
     return;
   }
 
+  const boundedDelayMs = Number.isFinite(delayMs) && delayMs > 0
+    ? Math.floor(delayMs)
+    : MAILBOX_SYNC_RETRY_DELAY_MS;
   const key = createWatcherKey(connectorId, mailbox);
-  if (scheduledMailboxSyncRetries.has(key)) {
-    return;
+  const requestedRunAtMs = Date.now() + boundedDelayMs;
+  const existing = scheduledMailboxSyncRetries.get(key);
+  if (existing) {
+    if (existing.runAtMs >= requestedRunAtMs) {
+      return;
+    }
+    clearTimeout(existing.timer);
+    scheduledMailboxSyncRetries.delete(key);
   }
 
   const timer = setTimeout(() => {
     scheduledMailboxSyncRetries.delete(key);
     void syncIncomingConnector(normalizedUserId, connectorId, mailbox).catch(() => undefined);
-  }, MAILBOX_SYNC_RETRY_DELAY_MS);
+  }, boundedDelayMs);
   timer.unref?.();
-  scheduledMailboxSyncRetries.set(key, timer);
+  scheduledMailboxSyncRetries.set(key, {
+    timer,
+    runAtMs: requestedRunAtMs,
+  });
 };
 
 const getConnectorAuthToken = (connectorAuth: any) => connectorAuth?.accessToken ?? connectorAuth?.password;
