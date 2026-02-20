@@ -13,6 +13,7 @@ const AppBrand = ({ variant = 'default', className = '', accent, showText = true
   const textClass = isCompact ? 'text-base' : 'text-lg';
   const accentColor = accent ?? 'var(--accent-color)';
   const textColorClass = accent ? '' : 'text-accent';
+  const shellFillColor = 'var(--brand-shell-fill)';
 
   return (
     <div className={`flex items-center gap-2 ${textColorClass} ${className}`} style={accent ? { color: accentColor } : undefined}>
@@ -23,15 +24,9 @@ const AppBrand = ({ variant = 'default', className = '', accent, showText = true
         viewBox="0 0 100 100"
         aria-hidden="true"
       >
-        <defs>
-          <linearGradient id="mail-shell" x1="0%" y1="0%" x2="0%" y2="100%">
-            <stop offset="0%" stopColor="#ffffff" stopOpacity="0.95" />
-            <stop offset="100%" stopColor="#ffffff" stopOpacity="0.7" />
-          </linearGradient>
-        </defs>
         <path
           d="M10 30 L90 30 L80 80 L20 80 Z"
-          fill="url(#mail-shell)"
+          fill={shellFillColor}
           stroke={accentColor}
           strokeWidth={isCompact ? '2' : '2.5'}
           strokeLinejoin="miter"

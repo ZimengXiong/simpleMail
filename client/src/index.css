@@ -30,6 +30,7 @@
   --accent-color: #10b981;
   --accent-contrast: #ffffff;
   --accent-hover: #0f9f72;
+  --brand-shell-fill: #ffffff;
 }
 
 [data-theme='dark'] {
@@ -42,6 +43,7 @@
   --accent-color: #10b981;
   --accent-contrast: #ffffff;
   --accent-hover: #34d399;
+  --brand-shell-fill: #000000;
 }
 
 @layer base {
