@@ -130,9 +130,9 @@ services:
     image: ${SIMPLEMAIL_CLIENT_REPOSITORY:?SIMPLEMAIL_CLIENT_REPOSITORY is required}:${SIMPLEMAIL_VERSION:-latest}
     container_name: simplemail-client
     environment:
-      VITE_OIDC_BASE_URL: ${VITE_OIDC_BASE_URL:?VITE_OIDC_BASE_URL is required}
-      VITE_OIDC_REALM: ${VITE_OIDC_REALM:?VITE_OIDC_REALM is required}
+      VITE_OIDC_ISSUER_URL: ${VITE_OIDC_ISSUER_URL:?VITE_OIDC_ISSUER_URL is required}
       VITE_OIDC_CLIENT_ID: ${VITE_OIDC_CLIENT_ID:?VITE_OIDC_CLIENT_ID is required}
+      VITE_OIDC_SCOPES: ${VITE_OIDC_SCOPES:-openid profile email}
     depends_on:
       api:
         condition: service_started

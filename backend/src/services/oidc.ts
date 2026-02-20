@@ -27,16 +27,42 @@ const toNonEmptyString = (value: unknown): string => {
   return value.trim();
 };
 
-const resolveJwksUri = () => {
+const resolveConfiguredJwksUri = () => {
   const configured = toNonEmptyString(env.oidc.jwksUri);
   if (configured) {
     return configured;
+  }
+  return '';
+};
+
+const resolveJwksUri = async () => {
+  const configured = resolveConfiguredJwksUri();
+  if (configured) {
+    return configured;
+  }
+  const discoveryUrl = `${normalizeIssuer(env.oidc.issuerUrl)}/.well-known/openid-configuration`;
+  try {
+    const response = await fetch(discoveryUrl);
+    if (response.ok) {
+      const payload = await response.json() as { jwks_uri?: unknown };
+      const discovered = toNonEmptyString(payload.jwks_uri);
+      if (discovered) {
+        return discovered;
+      }
+    }
+  } catch {
   }
   return `${normalizeIssuer(env.oidc.issuerUrl)}/protocol/openid-connect/certs`;
 };
 
 const oidcIssuer = normalizeIssuer(env.oidc.issuerUrl);
-const jwks = createRemoteJWKSet(new URL(resolveJwksUri()));
+let jwksPromise: Promise<ReturnType<typeof createRemoteJWKSet>> | null = null;
+const getJwks = async () => {
+  if (!jwksPromise) {
+    jwksPromise = resolveJwksUri().then((uri) => createRemoteJWKSet(new URL(uri)));
+  }
+  return jwksPromise;
+};
 const allowedAlgorithms = (env.oidc.allowedAlgs.length > 0 ? env.oidc.allowedAlgs : ['RS256'])
   .map((value) => value.trim())
   .filter((value) => /^(RS|PS|ES|EdDSA)/.test(value));
@@ -93,6 +119,7 @@ export const verifyOidcAccessToken = async (token: string): Promise<VerifiedOidc
     throw new Error('missing OIDC token');
   }
 
+  const jwks = await getJwks();
   const { payload } = await jwtVerify<OidcPayload>(normalizedToken, jwks, {
     issuer: oidcIssuer,
     algorithms: allowedAlgorithms,

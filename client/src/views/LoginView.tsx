@@ -112,7 +112,7 @@ const LoginView = () => {
               onClick={() => {
                 setError('');
                 void startLogin().catch(() => {
-                  setError('Could not start OIDC sign-in. Verify Keycloak is running and try again.');
+                  setError('Could not start OIDC sign-in. Verify your OIDC provider settings and try again.');
                 });
               }}
               className="w-full btn btn-primary py-2 font-bold"

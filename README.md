@@ -22,8 +22,7 @@ Set these values:
 - `OIDC_ISSUER_URL`
 - `OIDC_CLIENT_ID`
 - `OIDC_ALLOWED_EMAILS` (exactly one email)
-- `VITE_OIDC_BASE_URL`
-- `VITE_OIDC_REALM`
+- `VITE_OIDC_ISSUER_URL`
 - `VITE_OIDC_CLIENT_ID`
 
 No internal infrastructure variables are required for first boot. Seaweed and other internal defaults are prewired.

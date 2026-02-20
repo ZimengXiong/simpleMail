@@ -33,7 +33,7 @@ void initOidcAuth()
         <div className="max-w-lg">
           <h1 className="text-xl font-bold mb-2">Authentication bootstrap failed</h1>
           <p className="text-sm text-text-secondary">
-            Ensure Keycloak is running and reachable at the configured OIDC URL, then refresh.
+            Ensure your OIDC provider is reachable at the configured issuer URL, then refresh.
           </p>
         </div>
       </div>,
