@@ -10,13 +10,13 @@ simpleMail is a self-hosted mail app stack (UI + API + worker) with OIDC login.
 
 ```bash
 cp .env.docker.example .env
+scripts/bootstrap-env.sh .env
 ```
 
 ### 2. Set required env vars in `.env`
 
 Set these values:
 
-- `API_ADMIN_TOKEN`
 - `APP_BASE_URL`
 - `FRONTEND_BASE_URL`
 - `OIDC_ISSUER_URL`
